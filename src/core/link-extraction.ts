@@ -373,9 +373,12 @@ export async function extractPageLinks(
     // narrative prose where a partner's investment verbs appear once and
     // then portfolio companies are listed in subsequent sentences.
     const context = idx >= 0 ? excerpt(content, idx, 240) : ref.name;
+    // For bare wikilinks (dir=''), resolve the display name to a slug via resolver.
+    // For directory-prefixed wikilinks (dir!=''), use ref.slug directly.
+    const targetSlug = ref.dir ? ref.slug : (await resolver.resolve(ref.name) ?? ref.slug);
     candidates.push({
-      targetSlug: ref.slug,
-      linkType: inferLinkType(pageType, context, content, ref.slug),
+      targetSlug,
+      linkType: inferLinkType(pageType, context, content, targetSlug),
       context,
       linkSource: 'markdown',
     });
@@ -672,8 +675,12 @@ export function makeResolver(
       const trimmed = name.trim();
       if (!trimmed) return null;
 
-      const cacheKey = `${trimmed}\u0000${Array.isArray(dirHint) ? dirHint.join(',') : (dirHint || '')}`;
-      if (cache.has(cacheKey)) return cache.get(cacheKey)!;
+const cacheKey = `${trimmed}\u0000${Array.isArray(dirHint) ? dirHint.join(',') : (dirHint || '')}`;
+      if (cache.has(cacheKey)) {
+        if (trimmed.includes('Claude Code')) {
+        }
+        return cache.get(cacheKey)!;
+      }
 
       const hints = Array.isArray(dirHint) ? dirHint : (dirHint ? [dirHint] : []);
 
@@ -683,6 +690,19 @@ export function makeResolver(
         if (page) {
           cache.set(cacheKey, trimmed);
           return trimmed;
+        }
+        // Slug path didn't exist — try resolving by exact title match (case-insensitive).
+        // This handles bare wikilinks like [[Claude Code 概述]] whose slug path differs from title.
+        if (!hints.length) {
+          const titleMatch = await engine.db.query(
+            'SELECT slug FROM pages WHERE LOWER(title) = LOWER($1) LIMIT 1',
+            [trimmed],
+          );
+          if (titleMatch.rows.length > 0) {
+            const found = (titleMatch.rows[0] as { slug: string }).slug;
+            cache.set(cacheKey, found);
+            return found;
+          }
         }
       }
 

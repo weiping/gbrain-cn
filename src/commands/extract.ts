@@ -767,7 +767,7 @@ async function extractLinksFromDB(
     // --include-frontmatter default OFF in v0.13 (codex tension 5, back-compat).
     // Migration orchestrator explicitly enables it for the one-time backfill;
     // user-invoked `gbrain extract links` stays outgoing-only.
-    const activeResolver = includeFrontmatter ? resolver : nullResolver;
+    const activeResolver = resolver;
     const extracted = await extractPageLinks(
       slug, fullContent, page.frontmatter, page.type, activeResolver,
     );
