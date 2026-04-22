@@ -2111,8 +2111,8 @@ export class PGLiteEngine implements BrainEngine {
     // most_connected). Both coexist: master's brain_score is the composite
     // dashboard, v0.10.3 metrics give entity-page-level granularity.
     const { rows: [h] } = await this.db.query(`
-      WITH entity_pages AS (
-        SELECT id, slug FROM pages WHERE type IN ('person', 'company')
+      WITH all_pages AS (
+        SELECT id, slug FROM pages
       )
       SELECT
         (SELECT count(*) FROM pages) as page_count,
@@ -2133,12 +2133,13 @@ export class PGLiteEngine implements BrainEngine {
         (SELECT count(*) FROM content_chunks WHERE embedded_at IS NULL) as missing_embeddings,
         (SELECT count(*) FROM links) as link_count,
         (SELECT count(DISTINCT page_id) FROM timeline_entries) as pages_with_timeline,
-        (SELECT count(*) FROM entity_pages e
+        -- Extended to all pages (not just person/company) for broader graph coverage insight.
+        (SELECT count(*) FROM all_pages e
          WHERE EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = e.id))::float /
-          GREATEST((SELECT count(*) FROM entity_pages), 1)::float as link_coverage,
-        (SELECT count(*) FROM entity_pages e
+          GREATEST((SELECT count(*) FROM all_pages), 1)::float as link_coverage,
+        (SELECT count(*) FROM all_pages e
          WHERE EXISTS (SELECT 1 FROM timeline_entries te WHERE te.page_id = e.id))::float /
-          GREATEST((SELECT count(*) FROM entity_pages), 1)::float as timeline_coverage
+          GREATEST((SELECT count(*) FROM all_pages), 1)::float as timeline_coverage
     `);
 
     // Top 5 most connected entities by total link count (in + out).
@@ -2146,9 +2147,8 @@ export class PGLiteEngine implements BrainEngine {
       SELECT p.slug,
              (SELECT count(*) FROM links l WHERE l.from_page_id = p.id OR l.to_page_id = p.id)::int as link_count
       FROM pages p
-      WHERE p.type IN ('person', 'company')
       ORDER BY link_count DESC
-      LIMIT 5
+      LIMIT 10
     `);
 
     const r = h as Record<string, unknown>;
