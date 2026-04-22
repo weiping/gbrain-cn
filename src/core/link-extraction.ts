@@ -14,6 +14,7 @@
 
 import type { BrainEngine } from './engine.ts';
 import type { PageType } from './types.ts';
+import { embed } from './embedding.ts';
 
 // ─── Entity references ──────────────────────────────────────────
 
@@ -747,6 +748,26 @@ const cacheKey = `${trimmed}\u0000${Array.isArray(dirHint) ? dirHint.join(',') :
             }
           }
         } catch { /* search errors are non-fatal; fall through to null */ }
+      }
+
+      // Step 5: live-mode ONLY — vector search fallback for Chinese wikilinks.
+      // Chinese display names (e.g. "Claude Code 概述") often differ substantially
+      // from their pinyin-derived slugs (e.g. "archive/claude-code"). When the
+      // wikilink contains CJK characters, fall back to semantic embedding search.
+      if (opts.mode === 'live' && /[\u4e00-\u9fa5]/.test(trimmed)) {
+        try {
+          const embedding = await embed(trimmed);
+          const vectorResults = await engine.searchVector(embedding, { limit: 3 });
+          if (vectorResults.length > 0 && vectorResults[0].score >= 0.75) {
+            const top = hints.length > 0
+              ? vectorResults.find(r => hints.some(h => r.slug.startsWith(`${h}/`)))
+              : vectorResults[0];
+            if (top) {
+              cache.set(cacheKey, top.slug);
+              return top.slug;
+            }
+          }
+        } catch { /* embedding errors are non-fatal; fall through to null */ }
       }
 
       // Null = unresolvable. Caller records for the unresolved report.
