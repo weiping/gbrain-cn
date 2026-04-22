@@ -135,6 +135,71 @@ describe('extractTimelineFromContent', () => {
     const entries = extractTimelineFromContent(content, 'test');
     expect(entries).toHaveLength(1);
   });
+
+  // Frontmatter date (Format 3) tests
+  it('extracts date from frontmatter date: field', () => {
+    const content = `---\ndate: 2026-04-22\n---\n\n# My Post\n\nSome body text.`;
+    const entries = extractTimelineFromContent(content, 'notes/my-post');
+    expect(entries).toHaveLength(1);
+    expect(entries[0].date).toBe('2026-04-22');
+    expect(entries[0].source).toBe('frontmatter');
+    expect(entries[0].summary).toBe('My Post');
+    expect(entries[0].slug).toBe('notes/my-post');
+  });
+
+  it('extracts date from frontmatter with ISO-8601 datetime', () => {
+    const content = `---\ndate: 2026-04-22T00:00:00.000Z\n---\n\n# ISO Post`;
+    const entries = extractTimelineFromContent(content, 'notes/iso-post');
+    expect(entries).toHaveLength(1);
+    expect(entries[0].date).toBe('2026-04-22');
+    expect(entries[0].source).toBe('frontmatter');
+  });
+
+  it('extracts date from frontmatter with slash separators', () => {
+    const content = `---\ndate: 2026/04/22\n---\n\n# Slash Post`;
+    const entries = extractTimelineFromContent(content, 'notes/slash-post');
+    expect(entries).toHaveLength(1);
+    expect(entries[0].date).toBe('2026-04-22');
+  });
+
+  it('extracts date from frontmatter created field as fallback', () => {
+    const content = `---\ncreated: 2025-12-01\n---\n\n# Created Post`;
+    const entries = extractTimelineFromContent(content, 'notes/created-post');
+    expect(entries).toHaveLength(1);
+    expect(entries[0].date).toBe('2025-12-01');
+    expect(entries[0].source).toBe('frontmatter');
+  });
+
+  it('uses slug basename as title when no # heading found', () => {
+    const content = `---\ndate: 2026-01-01\n---\n\nNo heading here.`;
+    const entries = extractTimelineFromContent(content, 'notes/my-slug');
+    expect(entries).toHaveLength(1);
+    expect(entries[0].summary).toBe('my-slug');
+  });
+
+  it('ignores frontmatter with invalid date', () => {
+    const content = `---\ndate: not-a-date\n---\n\n# Bad Date`;
+    const entries = extractTimelineFromContent(content, 'notes/bad');
+    expect(entries).toHaveLength(0);
+  });
+
+  it('does not produce duplicate entries when frontmatter and timeline section both present', () => {
+    const content = `---\ndate: 2026-04-22\n---\n\n# My Post\n\n## Timeline\n- **2026-04-22** | Event — Something happened`;
+    const entries = extractTimelineFromContent(content, 'notes/combined');
+    // frontmatter entry + bullet entry both present (different source fields)
+    expect(entries).toHaveLength(2);
+    const sources = entries.map(e => e.source);
+    expect(sources).toContain('frontmatter');
+    expect(sources).toContain('Event');
+  });
+
+  it('extracts date from published field', () => {
+    const content = `---\npublished: 2025-06-15\n---\n\n# Published Post`;
+    const entries = extractTimelineFromContent(content, 'blog/published-post');
+    expect(entries).toHaveLength(1);
+    expect(entries[0].date).toBe('2025-06-15');
+    expect(entries[0].source).toBe('frontmatter');
+  });
 });
 
 describe('walkMarkdownFiles', () => {

@@ -21,6 +21,7 @@ import { join, relative, dirname } from 'path';
 import type { BrainEngine, LinkBatchInput, TimelineBatchInput } from '../core/engine.ts';
 import type { PageType } from '../core/types.ts';
 import { parseMarkdown } from '../core/markdown.ts';
+import { parse as parseYaml } from '../core/yaml-lite.ts';
 import {
   extractPageLinks, parseTimelineEntries, inferLinkType, makeResolver,
   extractFrontmatterLinks,
@@ -279,6 +280,34 @@ export function extractTimelineFromContent(content: string, slug: string): Extra
     );
     const detail = content.slice(afterIdx, endIdx).trim();
     entries.push({ slug, date: match[1], source: 'markdown', summary: match[2].trim(), detail: detail || undefined });
+  }
+
+  // Format 3: Frontmatter date — date: YYYY-MM-DD (or date: YYYY/MM/DD, YYYY.MM.DD, ISO-8601 datetime)
+  const frontmatterMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (frontmatterMatch) {
+    const fm = parseYaml(frontmatterMatch[1]);
+    const rawDate = fm['date'] || fm['Date'] || fm['created'] || fm['created_at'] || fm['publish-date'] || fm['published'];
+    if (rawDate) {
+      // Strip quotes from YAML-quoted values (e.g. '2026-04-22T00:00:00.000Z')
+      const stripped = rawDate.replace(/['"]/g, '');
+      // Normalize to YYYY-MM-DD: handle ISO-8601 datetime, slash/dot separators
+      let normalized: string | null = null;
+      const isoMatch = stripped.match(/^(\d{4})-(\d{2})-(\d{2})T/);
+      if (isoMatch) {
+        normalized = `${isoMatch[1]}-${isoMatch[2]}-${isoMatch[3]}`;
+      } else {
+        const m = stripped.match(/^(\d{4})[./-](\d{2})[./-](\d{2})/);
+        if (m) normalized = `${m[1]}-${m[2]}-${m[3]}`;
+      }
+      if (normalized && /^\d{4}-\d{2}-\d{2}$/.test(normalized)) {
+        // Extract title from first # heading in content (skip frontmatter block)
+        const bodyStart = frontmatterMatch[0].length;
+        const bodyAfterFrontmatter = content.slice(bodyStart).trimStart();
+        const titleMatch = bodyAfterFrontmatter.match(/^#\s+(.+)$/m);
+        const title = titleMatch ? titleMatch[1].trim() : slug.split('/').pop() || slug;
+        entries.push({ slug, date: normalized, source: 'frontmatter', summary: title });
+      }
+    }
   }
 
   return entries;
