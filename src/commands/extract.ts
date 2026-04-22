@@ -595,7 +595,11 @@ async function extractLinksFromDir(
   async function flush() {
     if (batch.length === 0) return;
     try {
-      created += await engine.addLinksBatch(batch);
+      const written = await engine.addLinksBatch(batch);
+      created += written;
+      if (written < batch.length && !jsonMode) {
+        process.stderr.write(`  note: ${batch.length - written}/${batch.length} links skipped (page not yet in brain)\n`);
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       if (jsonMode) {
@@ -653,7 +657,11 @@ async function extractTimelineFromDir(
   async function flush() {
     if (batch.length === 0) return;
     try {
-      created += await engine.addTimelineEntriesBatch(batch);
+      const written = await engine.addTimelineEntriesBatch(batch);
+      created += written;
+      if (written < batch.length && !jsonMode) {
+        process.stderr.write(`  note: ${batch.length - written}/${batch.length} entries skipped (page not yet in brain)\n`);
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       if (jsonMode) {
@@ -768,7 +776,11 @@ async function extractLinksFromDB(
   async function flush() {
     if (batch.length === 0) return;
     try {
-      created += await engine.addLinksBatch(batch);
+      const written = await engine.addLinksBatch(batch);
+      created += written;
+      if (written < batch.length && !jsonMode) {
+        process.stderr.write(`  note: ${batch.length - written}/${batch.length} links skipped (page not yet in brain)\n`);
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       if (jsonMode) {
@@ -883,7 +895,11 @@ async function extractTimelineFromDB(
   async function flush() {
     if (batch.length === 0) return;
     try {
-      created += await engine.addTimelineEntriesBatch(batch);
+      const written = await engine.addTimelineEntriesBatch(batch);
+      created += written;
+      if (written < batch.length && !jsonMode) {
+        process.stderr.write(`  note: ${batch.length - written}/${batch.length} entries skipped (page not yet in brain)\n`);
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       if (jsonMode) {
