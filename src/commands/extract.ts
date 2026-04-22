@@ -29,6 +29,7 @@ import {
 } from '../core/link-extraction.ts';
 import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
+import { pathToSlug } from '../core/sync.ts';
 
 // Batch size for addLinksBatch / addTimelineEntriesBatch.
 // Postgres bind-parameter limit is 65535. Links use 4 cols/row → 16K hard ceiling;
@@ -677,7 +678,7 @@ async function extractTimelineFromDir(
   for (let i = 0; i < files.length; i++) {
     try {
       const content = readFileSync(files[i].path, 'utf-8');
-      const slug = files[i].relPath.replace('.md', '');
+      const slug = pathToSlug(files[i].relPath);
       for (const entry of extractTimelineFromContent(content, slug)) {
         if (dryRunSeen) {
           const key = `${entry.slug}::${entry.date}::${entry.summary}`;
