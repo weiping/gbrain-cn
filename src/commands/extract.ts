@@ -923,8 +923,21 @@ async function extractTimelineFromDB(
       if (Number.isFinite(sinceMs) && updatedMs <= sinceMs) continue;
     }
 
-    const fullContent = page.compiled_truth + '\n' + page.timeline;
-    const entries = parseTimelineEntries(fullContent);
+    // Reconstruct full markdown with frontmatter so extractTimelineFromContent
+    // can see the date field. Frontmatter is stored as JSON in the DB.
+    const fm = page.frontmatter || {};
+    const fmLines: string[] = ['---'];
+    for (const [k, v] of Object.entries(fm)) {
+      if (Array.isArray(v)) {
+        fmLines.push(`${k}:`);
+        for (const item of v) fmLines.push(`  - ${item}`);
+      } else if (v !== undefined && v !== null) {
+        fmLines.push(`${k}: ${typeof v === 'number' ? v : JSON.stringify(String(v))}`);
+      }
+    }
+    fmLines.push('---', '');
+    const fullContent = fmLines.join('\n') + (page.compiled_truth || '') + '\n' + (page.timeline || '');
+    const entries = extractTimelineFromContent(fullContent, slug);
 
     for (const entry of entries) {
       if (dryRunSeen) {
