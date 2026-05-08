@@ -636,6 +636,60 @@ export class PostgresEngine implements BrainEngine {
     }
 
     const detailLow = opts?.detail === 'low';
+    const innerLimit = Math.min(limit * 3, MAX_SEARCH_LIMIT * 3);
+
+    // Source-aware ranking (v0.22): boost curated content (originals/,
+    // concepts/, writing/) and dampen bulk content (chat/, daily/, media/x/)
+    // by multiplying the chunk-grain ts_rank with a source-factor CASE.
+    const boostMap = resolveBoostMap();
+    const sourceFactorCase = buildSourceFactorCase('p.slug', boostMap, opts?.detail);
+    const hardExcludePrefixes = resolveHardExcludes(opts?.exclude_slug_prefixes, opts?.include_slug_prefixes);
+    const hardExcludeClause = buildHardExcludeClause('p.slug', hardExcludePrefixes);
+
+    // v0.26.5: visibility filter hides soft-deleted pages and pages from
+    // archived sources. Joined `sources s` lets the predicate compile to a
+    // column lookup. NOT bypassed by detail=high — soft-delete is a contract,
+    // not a temporal preference.
+    const visibilityClause = buildVisibilityClause('p', 's');
+
+    const params: unknown[] = [query];
+    let typeClause = '';
+    if (type) {
+      params.push(type);
+      typeClause = `AND p.type = $${params.length}`;
+    }
+    let excludeSlugsClause = '';
+    if (excludeSlugs?.length) {
+      params.push(excludeSlugs);
+      excludeSlugsClause = `AND p.slug != ALL($${params.length}::text[])`;
+    }
+    let languageClause = '';
+    if (language) {
+      params.push(language);
+      languageClause = `AND cc.language = $${params.length}`;
+    }
+    let symbolKindClause = '';
+    if (symbolKind) {
+      params.push(symbolKind);
+      symbolKindClause = `AND cc.symbol_type = $${params.length}`;
+    }
+    // v0.27.0: date filtering support
+    let afterDateClause = '';
+    if (opts?.afterDate) {
+      params.push(opts.afterDate);
+      afterDateClause = `AND COALESCE(p.updated_at, p.created_at) > $${params.length}::timestamptz`;
+    }
+    let beforeDateClause = '';
+    if (opts?.beforeDate) {
+      params.push(opts.beforeDate);
+      beforeDateClause = `AND COALESCE(p.updated_at, p.created_at) < $${params.length}::timestamptz`;
+    }
+    params.push(innerLimit);
+    const innerLimitParam = `$${params.length}`;
+    params.push(limit);
+    const limitParam = `$${params.length}`;
+    params.push(offset);
+    const offsetParam = `$${params.length}`;
 
     // v0.30+ CJK search: detect Chinese and use jieba FTS config or ILIKE fallback
     const queryHasChinese = hasChinese(query);
@@ -740,67 +794,8 @@ export class PostgresEngine implements BrainEngine {
     }
 
     // English/non-CJK path: existing FTS search
-    // Fetch headroom for dedup: if we only fetch `limit` chunks, a cluster of
-    // co-occurring terms in one page can eat the entire result set and we'd
-    // ship < limit pages. 3x gives dedup enough to pick top N distinct pages.
-    const innerLimit = Math.min(limit * 3, MAX_SEARCH_LIMIT * 3);
-
-    // Source-aware ranking (v0.22): boost curated content (originals/,
-    // concepts/, writing/) and dampen bulk content (chat/, daily/, media/x/)
-    // by multiplying the chunk-grain ts_rank with a source-factor CASE.
-    // Detail-gated — disabled for `detail='high'` (temporal queries) so
-    // chat surfaces normally for date-framed lookups. Hard-exclude prefixes
-    // (test/, archive/, attachments/, .raw/ by default) filter at the
-    // chunk-rank stage so they never enter the candidate set.
-    const boostMap = resolveBoostMap();
-    const sourceFactorCase = buildSourceFactorCase('p.slug', boostMap, opts?.detail);
-    const hardExcludePrefixes = resolveHardExcludes(opts?.exclude_slug_prefixes, opts?.include_slug_prefixes);
-    const hardExcludeClause = buildHardExcludeClause('p.slug', hardExcludePrefixes);
-
-    const params: unknown[] = [query];
-    let typeClause = '';
-    if (type) {
-      params.push(type);
-      typeClause = `AND p.type = $${params.length}`;
-    }
-    let excludeSlugsClause = '';
-    if (excludeSlugs?.length) {
-      params.push(excludeSlugs);
-      excludeSlugsClause = `AND p.slug != ALL($${params.length}::text[])`;
-    }
-    let languageClause = '';
-    if (language) {
-      params.push(language);
-      languageClause = `AND cc.language = $${params.length}`;
-    }
-    let symbolKindClause = '';
-    if (symbolKind) {
-      params.push(symbolKind);
-      symbolKindClause = `AND cc.symbol_type = $${params.length}`;
-    }
-    // v0.27.0: date filtering support
-    let afterDateClause = '';
-    if (opts?.afterDate) {
-      params.push(opts.afterDate);
-      afterDateClause = `AND COALESCE(p.updated_at, p.created_at) > $${params.length}::timestamptz`;
-    }
-    let beforeDateClause = '';
-    if (opts?.beforeDate) {
-      params.push(opts.beforeDate);
-      beforeDateClause = `AND COALESCE(p.updated_at, p.created_at) < $${params.length}::timestamptz`;
-    }
-    params.push(innerLimit);
-    const innerLimitParam = `$${params.length}`;
-    params.push(limit);
-    const limitParam = `$${params.length}`;
-    params.push(offset);
-    const offsetParam = `$${params.length}`;
-
-    // v0.26.5: visibility filter hides soft-deleted pages and pages from
-    // archived sources. Joined `sources s` lets the predicate compile to a
-    // column lookup. NOT bypassed by detail=high — soft-delete is a contract,
-    // not a temporal preference.
-    const visibilityClause = buildVisibilityClause('p', 's');
+    // Note: all variables (params, clauses, etc.) are already declared above
+    // before the CJK check for use by both paths.
 
     const rawQuery = `
       WITH ranked_chunks AS (
