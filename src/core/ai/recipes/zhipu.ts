@@ -4,8 +4,18 @@ import type { Recipe } from '../types.ts';
  * Zhipu AI (智谱 AI) — Chinese AI provider with OpenAI-compatible API.
  *
  * Zhipu provides embedding models optimized for Chinese text and GLM chat models.
- * Their embedding-3 model returns 1024-dimensional vectors, well-suited for
- * multilingual semantic search.
+ *
+ * IMPORTANT: embedding-3 supports variable dimensions (1024-2048).
+ * The API accepts an `dimensions` parameter to control output size. This allows
+ * maintaining compatibility with existing databases that use 1536-dim vectors (e.g.,
+ * from OpenAI text-embedding-3-large) without re-embedding.
+ *
+ * Dimension options: 1024, 1536, 2048
+ * - 1024: Fastest, lowest cost
+ * - 1536: Compatible with OpenAI text-embedding-3-large
+ * - 2048: Highest quality
+ *
+ * Chat models: glm-4.7 is the latest flagship model with strong CJK understanding.
  *
  * API docs: https://open.bigmodel.cn/dev/api
  */
@@ -22,8 +32,8 @@ export const zhipu: Recipe = {
   touchpoints: {
     embedding: {
       models: ['embedding-2', 'embedding-3'],
-      default_dims: 1024,
-      dims_options: [1024],
+      default_dims: 1536,  // 兼容 OpenAI text-embedding-3-large
+      dims_options: [1024, 1536, 2048],  // Zhipu 支持可变维数
       cost_per_1m_tokens_usd: 0.02, // embedding-3 pricing
       price_last_verified: '2026-04-22',
       // Zhipu embedding API handles ~8K tokens per request. Chinese text is
@@ -33,7 +43,7 @@ export const zhipu: Recipe = {
       safety_factor: 0.7,
     },
     chat: {
-      models: ['glm-4', 'glm-4-flash', 'glm-4-plus', 'glm-4-air'],
+      models: ['glm-4', 'glm-4-flash', 'glm-4-plus', 'glm-4-air', 'glm-4.7'],
       supports_tools: true,
       supports_subagent_loop: true,
       supports_prompt_cache: false,
@@ -43,7 +53,7 @@ export const zhipu: Recipe = {
       price_last_verified: '2026-04-22',
     },
     expansion: {
-      models: ['glm-4-flash'],
+      models: ['glm-4-flash', 'glm-4.7'],
       cost_per_1m_tokens_usd: 0.5,
       price_last_verified: '2026-04-22',
     },

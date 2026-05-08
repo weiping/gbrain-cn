@@ -2170,6 +2170,7 @@ export const MIGRATIONS: Migration[] = [
   {
     version: 45,
     name: 'cjk_search_support',
+    sql: '', // Engine-agnostic SQL not needed; sqlFor provides engine-specific DDL
     // v0.30+ CJK (Chinese/Japanese/Korean) search support.
     //
     // Adds chinese_search_vector column to pages table for Chinese bigram-based

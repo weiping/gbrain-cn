@@ -21,6 +21,11 @@ const VOYAGE_OUTPUT_DIMENSION_MODELS = new Set([
   'voyage-code-3',
 ]);
 
+const ZHIPU_EMBEDDING_MODELS = new Set([
+  'embedding-2',
+  'embedding-3',
+]);
+
 /**
  * Build the providerOptions blob for embedMany() that pins output dimensions.
  *
@@ -55,6 +60,10 @@ export function dimsProviderOptions(
       // Most openai-compatible providers (Ollama, LM Studio, vLLM, LiteLLM)
       // do not expose a standard dimensions knob. Voyage's compat endpoint is
       // the exception: it accepts output_dimension and defaults to 1024 dims.
+      // Zhipu AI embedding-2/3 also support variable dimensions (1024-2048).
+      if (ZHIPU_EMBEDDING_MODELS.has(modelId)) {
+        return { openaiCompatible: { dimensions: dims } };
+      }
       if (VOYAGE_OUTPUT_DIMENSION_MODELS.has(modelId)) {
         return { openaiCompatible: { output_dimension: dims } };
       }
