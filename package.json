@@ -29,6 +29,7 @@
   "scripts": {
     "dev": "bun run src/cli.ts",
     "build": "bun build --compile --outfile bin/gbrain src/cli.ts",
+    "build:wrapper": "cp scripts/gbrain-wrapper.sh ~/.bun/bin/gbrain && chmod +x ~/.bun/bin/gbrain && echo 'Wrapper installed: ~/.bun/bin/gbrain'",
     "build:all": "bun build --compile --target=bun-darwin-arm64 --outfile bin/gbrain-darwin-arm64 src/cli.ts && bun build --compile --target=bun-linux-x64 --outfile bin/gbrain-linux-x64 src/cli.ts",
     "build:admin": "cd admin && bun run build",
     "build:schema": "bash scripts/build-schema.sh",
@@ -75,6 +76,7 @@
     "@dqbd/tiktoken": "^1.0.22",
     "@electric-sql/pglite": "0.4.3",
     "@jsquash/avif": "^2.1.1",
+    "@jsquash/png": "^3.1.1",
     "@modelcontextprotocol/sdk": "1.29.0",
     "ai": "^6.0.168",
     "cookie-parser": "^1.4.7",
@@ -84,6 +86,7 @@
     "express": "^5.1.0",
     "express-rate-limit": "^7.5.0",
     "gray-matter": "^4.0.3",
+    "heic-decode": "^2.1.0",
     "marked": "^18.0.0",
     "openai": "^4.0.0",
     "pgvector": "^0.2.0",
