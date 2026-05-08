@@ -41,6 +41,43 @@ import { buildSourceFactorCase, buildHardExcludeClause, buildVisibilityClause, b
 
 type PGLiteDB = PGlite;
 
+// ---- CJK Search Support (v0.30+) ----
+
+/**
+ * Chinese bigram tokenizer for CJK search.
+ *
+ * Generates single-character and bigram tokens from Chinese text to enable
+ * effective full-text search without pinyin conversion or pg_trgm (which has
+ * bugs in PGLite 0.4.3).
+ *
+ * Example: "人工智能" → "人 工 智 能 人工 工智 智能"
+ * - Single chars: 人 工 智 能
+ * - Bigrams: 人工 工智 智能
+ *
+ * This approach enables precise multi-character matching while maintaining
+ * single-character recall. Bigram matching ensures that "人工" matches the
+ * full term but not partial occurrences, while single-character matching allows
+ * flexible queries.
+ */
+function chineseBigram(text: string): string {
+  if (!text) return '';
+  // Extract CJK characters, ASCII alphanumerics, and numbers
+  const chars = [...text.replace(/[^\u4e00-\u9fa5a-zA-Z0-9]/g, ' ')];
+  const single = chars.join(' ');
+  const bigrams: string[] = [];
+  for (let i = 0; i < chars.length - 1; i++) {
+    bigrams.push(chars[i] + chars[i + 1]);
+  }
+  return single + (bigrams.length > 0 ? ' ' + bigrams.join(' ') : '');
+}
+
+/**
+ * Detect if text contains CJK characters.
+ */
+function hasChinese(text: string): boolean {
+  return /[\u4e00-\u9fa5]/.test(text);
+}
+
 // Tier 3 snapshot fast-restore. Reads a tar dump produced by
 // `bun run scripts/build-pglite-snapshot.ts`. Snapshot is matched against
 // the current MIGRATIONS hash via a sidecar `.version` file; on mismatch we
@@ -477,9 +514,18 @@ export class PGLiteEngine implements BrainEngine {
       : (page.effective_date ?? null);
     const effectiveDateSource = page.effective_date_source ?? null;
     const importFilename = page.import_filename ?? null;
+
+    // v0.30+ CJK search: precompute bigram tokens for Chinese text
+    const titleBigram = chineseBigram(page.title || '');
+    const compiledBigram = chineseBigram(page.compiled_truth || '');
+    const timelineBigram = chineseBigram(page.timeline || '');
+    const chineseSearchVector = titleBigram +
+      (compiledBigram ? ' ' + compiledBigram : '') +
+      (timelineBigram ? ' ' + timelineBigram : '');
+
     const { rows } = await this.db.query(
-      `INSERT INTO pages (slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename)
-       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, now(), $9::timestamptz, $10, $11)
+      `INSERT INTO pages (slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename, chinese_search_vector)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, now(), $9::timestamptz, $10, $11, to_tsvector('simple', $12))
        ON CONFLICT (source_id, slug) DO UPDATE SET
          type = EXCLUDED.type,
          page_kind = EXCLUDED.page_kind,
@@ -491,9 +537,10 @@ export class PGLiteEngine implements BrainEngine {
          updated_at = now(),
          effective_date        = COALESCE(EXCLUDED.effective_date,        pages.effective_date),
          effective_date_source = COALESCE(EXCLUDED.effective_date_source, pages.effective_date_source),
-         import_filename       = COALESCE(EXCLUDED.import_filename,       pages.import_filename)
+         import_filename       = COALESCE(EXCLUDED.import_filename,       pages.import_filename),
+         chinese_search_vector = to_tsvector('simple', EXCLUDED.chinese_search_vector)
        RETURNING id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, effective_date, effective_date_source, import_filename`,
-      [slug, page.type, pageKind, page.title, page.compiled_truth, page.timeline || '', JSON.stringify(frontmatter), hash, effectiveDate, effectiveDateSource, importFilename]
+      [slug, page.type, pageKind, page.title, page.compiled_truth, page.timeline || '', JSON.stringify(frontmatter), hash, effectiveDate, effectiveDateSource, importFilename, chineseSearchVector]
     );
     return rowToPage(rows[0] as Record<string, unknown>);
   }
@@ -653,7 +700,10 @@ export class PGLiteEngine implements BrainEngine {
     const hardExcludePrefixes = resolveHardExcludes(opts?.exclude_slug_prefixes, opts?.include_slug_prefixes);
     const hardExcludeClause = buildHardExcludeClause('p.slug', hardExcludePrefixes);
 
-    // v0.20.0 Cathedral II Layer 10 C1/C2: language + symbol-kind filters.
+    // v0.30+ CJK search: detect Chinese characters and use bigram-based search
+    const queryHasChinese = hasChinese(query);
+
+    // v0.20.0 Cathedral II Layer 10 C1/C2: language + symbol_kind filters.
     const params: unknown[] = [query, innerLimit, limit, offset];
     let extraFilter = '';
     if (opts?.language) {
@@ -680,38 +730,96 @@ export class PGLiteEngine implements BrainEngine {
     // v0.26.5: visibility filter (soft-deleted + archived-source).
     const visibilityClause = buildVisibilityClause('p', 's');
 
-    const { rows } = await this.db.query(
-      `WITH ranked AS (
-         SELECT
-           p.slug, p.id as page_id, p.title, p.type, p.source_id,
-           cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
-           ts_rank(cc.search_vector, websearch_to_tsquery('english', $1)) * ${sourceFactorCase} AS score,
-           CASE WHEN p.updated_at < (
-             SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = p.id
-           ) THEN true ELSE false END AS stale
-         FROM content_chunks cc
-         JOIN pages p ON p.id = cc.page_id
-         JOIN sources s ON s.id = p.source_id
-         WHERE cc.search_vector @@ websearch_to_tsquery('english', $1) ${detailFilter}${extraFilter} ${hardExcludeClause} ${visibilityClause}
-           -- v0.27.1: hide image rows from default text-keyword search so
-           -- OCR text doesn't drown text-page hits. Image-similarity queries
-           -- run a separate vector path on embedding_image.
-           AND cc.modality = 'text'
-         ORDER BY score DESC
-         LIMIT $2
-       ),
-       best_per_page AS (
-         SELECT DISTINCT ON (slug) *
-         FROM ranked
-         ORDER BY slug, score DESC
-       )
-       SELECT * FROM best_per_page
-       ORDER BY score DESC
-       LIMIT $3 OFFSET $4`,
-      params
-    );
+    let rows: Record<string, unknown>[];
 
-    return (rows as Record<string, unknown>[]).map(rowToSearchResult);
+    if (queryHasChinese) {
+      // CJK search path: use bigram-based ILIKE matching on chinese_search_vector
+      // For multi-character CJK queries, require ALL bigrams to match (AND logic).
+      // For single CJK character, use simple ILIKE.
+      const cjkChars = [...query.replace(/[^\u4e00-\u9fa5]/g, '')];
+
+      if (cjkChars.length >= 2) {
+        // Multi-char CJK query: build bigram clauses
+        const bigramClauses: string[] = [];
+        for (let i = 0; i < cjkChars.length - 1; i++) {
+          bigramClauses.push(`p.chinese_search_vector::text ILIKE '%${cjkChars[i]}${cjkChars[i + 1]}%'`);
+        }
+        // All bigrams must match for precision
+        const chineseClause = bigramClauses.join(' AND ');
+
+        const { rows: chineseRows } = await this.db.query(
+          `SELECT
+            p.slug, p.id as page_id, p.title, p.type, p.source_id,
+            cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
+            0.5 AS score,
+            CASE WHEN p.updated_at < (
+              SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = p.id
+            ) THEN true ELSE false END AS stale
+           FROM content_chunks cc
+           JOIN pages p ON p.id = cc.page_id
+           JOIN sources s ON s.id = p.source_id
+           WHERE ${chineseClause} ${detailFilter}${extraFilter} ${hardExcludeClause} ${visibilityClause}
+             AND cc.modality = 'text'
+           ORDER BY p.updated_at DESC
+           LIMIT $2`,
+          [query, innerLimit]
+        );
+        rows = chineseRows;
+      } else {
+        // Single CJK char: simple ILIKE
+        const singleClause = `p.chinese_search_vector::text ILIKE '%${cjkChars[0]}%'`;
+        const { rows: chineseRows } = await this.db.query(
+          `SELECT
+            p.slug, p.id as page_id, p.title, p.type, p.source_id,
+            cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
+            0.5 AS score,
+            CASE WHEN p.updated_at < (
+              SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = p.id
+            ) THEN true ELSE false END AS stale
+           FROM content_chunks cc
+           JOIN pages p ON p.id = cc.page_id
+           JOIN sources s ON s.id = p.source_id
+           WHERE ${singleClause} ${detailFilter}${extraFilter} ${hardExcludeClause} ${visibilityClause}
+             AND cc.modality = 'text'
+           ORDER BY p.updated_at DESC
+           LIMIT $2`,
+          [query, innerLimit]
+        );
+        rows = chineseRows;
+      }
+    } else {
+      // English/non-CJK path: use existing FTS search
+      const { rows: ftsRows } = await this.db.query(
+        `WITH ranked AS (
+           SELECT
+             p.slug, p.id as page_id, p.title, p.type, p.source_id,
+             cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
+             ts_rank(cc.search_vector, websearch_to_tsquery('english', $1)) * ${sourceFactorCase} AS score,
+             CASE WHEN p.updated_at < (
+               SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = p.id
+             ) THEN true ELSE false END AS stale
+           FROM content_chunks cc
+           JOIN pages p ON p.id = cc.page_id
+           JOIN sources s ON s.id = p.source_id
+           WHERE cc.search_vector @@ websearch_to_tsquery('english', $1) ${detailFilter}${extraFilter} ${hardExcludeClause} ${visibilityClause}
+             AND cc.modality = 'text'
+           ORDER BY score DESC
+           LIMIT $2
+         ),
+         best_per_page AS (
+           SELECT DISTINCT ON (slug) *
+           FROM ranked
+           ORDER BY slug, score DESC
+         )
+         SELECT * FROM best_per_page
+         ORDER BY score DESC
+         LIMIT $3 OFFSET $4`,
+        params
+      );
+      rows = ftsRows;
+    }
+
+    return rows.map(rowToSearchResult);
   }
 
   /**

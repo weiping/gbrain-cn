@@ -42,6 +42,36 @@ function escapeSqlStringLiteral(value: string): string {
   return value.replace(/'/g, "''");
 }
 
+// ---- CJK Search Support (v0.30+) ----
+
+/**
+ * Chinese bigram tokenizer for CJK search.
+ *
+ * Generates single-character and bigram tokens from Chinese text to enable
+ * effective full-text search without pinyin conversion.
+ *
+ * For Postgres with pg_jieba: this function is a fallback when the extension
+ * is not available. The jieba FTS config handles CJK tokenization natively.
+ */
+function chineseBigram(text: string): string {
+  if (!text) return '';
+  // Extract CJK characters, ASCII alphanumerics, and numbers
+  const chars = [...text.replace(/[^\u4e00-\u9fa5a-zA-Z0-9]/g, ' ')];
+  const single = chars.join(' ');
+  const bigrams: string[] = [];
+  for (let i = 0; i < chars.length - 1; i++) {
+    bigrams.push(chars[i] + chars[i + 1]);
+  }
+  return single + (bigrams.length > 0 ? ' ' + bigrams.join(' ') : '');
+}
+
+/**
+ * Detect if text contains CJK characters.
+ */
+function hasChinese(text: string): boolean {
+  return /[\u4e00-\u9fa5]/.test(text);
+}
+
 export function getPostgresSchema(dims: number = 1536, model: string = 'text-embedding-3-large'): string {
   const parsedDims = Number(dims);
   if (!Number.isInteger(parsedDims) || parsedDims <= 0) {
@@ -444,9 +474,18 @@ export class PostgresEngine implements BrainEngine {
     const effectiveDate = page.effective_date ?? null;
     const effectiveDateSource = page.effective_date_source ?? null;
     const importFilename = page.import_filename ?? null;
+
+    // v0.30+ CJK search: precompute bigram tokens for Chinese text
+    const titleBigram = chineseBigram(page.title || '');
+    const compiledBigram = chineseBigram(page.compiled_truth || '');
+    const timelineBigram = chineseBigram(page.timeline || '');
+    const chineseSearchVector = titleBigram +
+      (compiledBigram ? ' ' + compiledBigram : '') +
+      (timelineBigram ? ' ' + timelineBigram : '');
+
     const rows = await sql`
-      INSERT INTO pages (slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename)
-      VALUES (${slug}, ${page.type}, ${pageKind}, ${page.title}, ${page.compiled_truth}, ${page.timeline || ''}, ${sql.json(frontmatter as Parameters<typeof sql.json>[0])}, ${hash}, now(), ${effectiveDate}, ${effectiveDateSource}, ${importFilename})
+      INSERT INTO pages (slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename, chinese_search_vector)
+      VALUES (${slug}, ${page.type}, ${pageKind}, ${page.title}, ${page.compiled_truth}, ${page.timeline || ''}, ${sql.json(frontmatter as Parameters<typeof sql.json>[0])}, ${hash}, now(), ${effectiveDate}, ${effectiveDateSource}, ${importFilename}, to_tsvector('simple', ${chineseSearchVector}))
       ON CONFLICT (source_id, slug) DO UPDATE SET
         type = EXCLUDED.type,
         page_kind = EXCLUDED.page_kind,
@@ -458,7 +497,8 @@ export class PostgresEngine implements BrainEngine {
         updated_at = now(),
         effective_date        = COALESCE(EXCLUDED.effective_date,        pages.effective_date),
         effective_date_source = COALESCE(EXCLUDED.effective_date_source, pages.effective_date_source),
-        import_filename       = COALESCE(EXCLUDED.import_filename,       pages.import_filename)
+        import_filename       = COALESCE(EXCLUDED.import_filename,       pages.import_filename),
+        chinese_search_vector = to_tsvector('simple', EXCLUDED.chinese_search_vector)
       RETURNING id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, effective_date, effective_date_source, import_filename
     `;
     return rowToPage(rows[0]);
@@ -596,6 +636,110 @@ export class PostgresEngine implements BrainEngine {
     }
 
     const detailLow = opts?.detail === 'low';
+
+    // v0.30+ CJK search: detect Chinese and use jieba FTS config or ILIKE fallback
+    const queryHasChinese = hasChinese(query);
+
+    // For Chinese queries, try jieba FTS first, fall back to ILIKE if extension not available
+    if (queryHasChinese) {
+      try {
+        // Try using jieba FTS config for Chinese tokenization
+        const jiebQuery = `
+          WITH ranked_chunks AS (
+            SELECT
+              p.slug, p.id as page_id, p.title, p.type, p.source_id,
+              cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
+              ts_rank(p.chinese_search_vector, websearch_to_tsquery('jieba', $1)) * ${sourceFactorCase} AS score
+            FROM pages p
+            JOIN content_chunks cc ON p.id = cc.page_id
+            JOIN sources s ON s.id = p.source_id
+            WHERE p.chinese_search_vector @@ websearch_to_tsquery('jieba', $1)
+              ${typeClause}
+              ${excludeSlugsClause}
+              ${detailLow ? `AND cc.chunk_source = 'compiled_truth'` : ''}
+              ${languageClause}
+              ${symbolKindClause}
+              ${afterDateClause}
+              ${beforeDateClause}
+              ${hardExcludeClause}
+              ${visibilityClause}
+              AND cc.modality = 'text'
+            ORDER BY score DESC
+            LIMIT ${innerLimitParam}
+          ),
+          best_per_page AS (
+            SELECT DISTINCT ON (slug) *
+            FROM ranked_chunks
+            ORDER BY slug, score DESC
+          )
+          SELECT slug, page_id, title, type, source_id,
+            chunk_id, chunk_index, chunk_text, chunk_source, score,
+            false AS stale
+          FROM best_per_page
+          ORDER BY score DESC
+          LIMIT ${limitParam}
+          OFFSET ${offsetParam}
+        `;
+        const rows = await sql.begin(async sql => {
+          await sql`SET LOCAL statement_timeout = '8s'`;
+          return await sql.unsafe(jiebQuery, params as Parameters<typeof sql.unsafe>[1]);
+        });
+        return rows.map(rowToSearchResult);
+      } catch (err: unknown) {
+        // jieba extension not available, fall back to ILIKE
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        if (!errorMsg.includes('jieba') && !errorMsg.includes('text search configuration')) {
+          throw err; // Re-throw if it's not a jieba-related error
+        }
+        // ILIKE fallback path
+        const cjkChars = [...query.replace(/[^\u4e00-\u9fa5]/g, '')];
+        let ilikeClause = '';
+        if (cjkChars.length >= 2) {
+          // Multi-char: require ALL bigrams to match
+          const bigramClauses: string[] = [];
+          for (let i = 0; i < cjkChars.length - 1; i++) {
+            bigramClauses.push(`p.chinese_search_vector::text ILIKE '%${cjkChars[i]}${cjkChars[i + 1]}%'`);
+          }
+          ilikeClause = bigramClauses.join(' AND ');
+        } else {
+          // Single char: simple ILIKE
+          ilikeClause = `p.chinese_search_vector::text ILIKE '%${cjkChars[0]}%'`;
+        }
+
+        const ilikeParams = [...params];
+        const ilikeQuery = `
+          SELECT
+            p.slug, p.id as page_id, p.title, p.type, p.source_id,
+            cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
+            0.5 AS score,
+            false AS stale
+          FROM pages p
+          JOIN content_chunks cc ON p.id = cc.page_id
+          JOIN sources s ON s.id = p.source_id
+          WHERE ${ilikeClause}
+            ${typeClause}
+            ${excludeSlugsClause}
+            ${detailLow ? `AND cc.chunk_source = 'compiled_truth'` : ''}
+            ${languageClause}
+            ${symbolKindClause}
+            ${afterDateClause}
+            ${beforeDateClause}
+            ${hardExcludeClause}
+            ${visibilityClause}
+            AND cc.modality = 'text'
+          ORDER BY p.updated_at DESC
+          LIMIT ${limitParam}
+          OFFSET ${offsetParam}
+        `;
+        const rows = await sql.begin(async sql => {
+          await sql`SET LOCAL statement_timeout = '8s'`;
+          return await sql.unsafe(ilikeQuery, ilikeParams as Parameters<typeof sql.unsafe>[1]);
+        });
+        return rows.map(rowToSearchResult);
+      }
+    }
+
+    // English/non-CJK path: existing FTS search
     // Fetch headroom for dedup: if we only fetch `limit` chunks, a cluster of
     // co-occurring terms in one page can eat the entire result set and we'd
     // ship < limit pages. 3x gives dedup enough to pick top N distinct pages.
