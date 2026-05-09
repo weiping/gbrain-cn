@@ -538,7 +538,7 @@ export class PGLiteEngine implements BrainEngine {
          effective_date        = COALESCE(EXCLUDED.effective_date,        pages.effective_date),
          effective_date_source = COALESCE(EXCLUDED.effective_date_source, pages.effective_date_source),
          import_filename       = COALESCE(EXCLUDED.import_filename,       pages.import_filename),
-         chinese_search_vector = to_tsvector('simple', EXCLUDED.chinese_search_vector)
+         chinese_search_vector = EXCLUDED.chinese_search_vector
        RETURNING id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, effective_date, effective_date_source, import_filename`,
       [slug, page.type, pageKind, page.title, page.compiled_truth, page.timeline || '', JSON.stringify(frontmatter), hash, effectiveDate, effectiveDateSource, importFilename, chineseSearchVector]
     );

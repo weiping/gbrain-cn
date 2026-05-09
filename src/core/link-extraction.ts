@@ -44,8 +44,9 @@ export type LinkResolutionType = 'qualified' | 'unqualified';
  *   - Gbrain canonical: people, companies, meetings, concepts, deal, civic, project, source, media, yc, projects
  *   - Our domain extensions: tech, finance, personal, openclaw (domain-organized wikis)
  *   - Our entity prefix: entities (we kept some legacy entities/projects/ pages)
+ *   - Content organization: inbox, daily, illustrations (navigation and content hubs)
  */
-const DIR_PATTERN = '(?:people|companies|meetings|concepts|deal|civic|project|projects|source|media|yc|tech|finance|personal|openclaw|entities)';
+const DIR_PATTERN = '(?:people|companies|meetings|concepts|deal|civic|project|projects|source|media|yc|tech|finance|personal|openclaw|entities|inbox|daily|illustrations)';
 
 /**
  * Match `[Name](path)` markdown links pointing to entity directories.
