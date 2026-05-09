@@ -16,6 +16,46 @@ GBrain is those patterns, generalized. 34 skills. Install in 30 minutes. Your ag
 
 > **LLMs:** fetch [`llms.txt`](llms.txt) for the documentation map, or [`llms-full.txt`](llms-full.txt) for the same map with core docs inlined in one fetch. **Agents:** start with [`AGENTS.md`](AGENTS.md) (or [`CLAUDE.md`](CLAUDE.md) if you're Claude Code).
 
+## gbrain-cn: Zhipu AI & CJK Support
+
+> This is the **gbrain-cn** fork. It adds native Chinese AI provider support and CJK full-text search on top of upstream gbrain. 中文文档: [README.zh-CN.md](README.zh-CN.md)
+
+### What's added
+
+| Feature | Detail |
+|---|---|
+| **Zhipu AI (智谱 AI)** | `embedding-3` (1024 / 1536 / 2048 dims), `glm-4.7` for chat + query expansion |
+| **CJK search** | Native bigram tokenization — no external deps, full PGLite + Postgres support |
+| **Nodejieba (optional)** | Professional-grade Chinese segmentation for technical/domain corpora |
+| **Chinese wikilink resolution** | `[[中文标题]]` wikilinks resolve via vector search fallback |
+| **Variable embedding dims** | `embedding-3` supports 1024 / 1536 / 2048; set via `EMBEDDING_DIMENSIONS` |
+
+### Quick setup
+
+```bash
+# 1. Set environment variables (~/.zshrc)
+export ZHIPU_API_KEY="your_key_here"
+export EMBEDDING_MODEL="zhipu:embedding-3"
+export EMBEDDING_DIMENSIONS="1536"
+export EMBEDDING_BASE_URL="https://open.bigmodel.cn/api/paas/v4"
+export CHAT_MODEL="zhipu:glm-4.7"
+export EXPANSION_MODEL="zhipu:glm-4.7"
+
+# 2. Init brain
+gbrain init
+
+# 3. Sync and embed your vault
+gbrain sync --repo ~/your-vault
+gbrain embed --stale
+
+# 4. Verify
+gbrain doctor
+```
+
+Get your API key at [open.bigmodel.cn](https://open.bigmodel.cn/usercenter/apikeys).
+
+Full guides: [Zhipu AI setup](docs/guides/zhipu-ai-setup.md) · [Variable dimensions](docs/guides/zhipu-ai-dimensions.md) · [CJK search](docs/cjk-enhancement.md)
+
 ## Install
 
 ### On an agent platform (recommended)
