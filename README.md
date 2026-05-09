@@ -56,6 +56,33 @@ Get your API key at [open.bigmodel.cn](https://open.bigmodel.cn/usercenter/apike
 
 Full guides: [Zhipu AI setup](docs/guides/zhipu-ai-setup.md) · [Variable dimensions](docs/guides/zhipu-ai-dimensions.md) · [CJK search](docs/cjk-enhancement.md)
 
+### Nodejieba: professional Chinese segmentation (optional)
+
+By default gbrain-cn uses a **native bigram tokenizer** — no dependencies, works everywhere. For technical corpora (AI papers, product docs, domain-specific terms), enable [nodejieba](https://github.com/yanyiwu/nodejieba) for word-boundary-aware segmentation:
+
+```bash
+# Install
+npm install nodejieba --legacy-peer-deps
+
+# Enable
+export GBRAIN_USE_NODEJIEBA=true
+
+# Rebuild tsvector indexes for existing pages
+gbrain sync --force
+```
+
+Tokenization comparison on real text:
+
+| Text | Native bigram (tokens) | Nodejieba (words) |
+|---|---|---|
+| 人工智能大语言模型 | 人、工、智、能、大、语、言… (17) | **人工智能**、大、语言、模型 (4) |
+| 知识图谱与向量检索 | 知、识、图、谱、与… (17) | **知识**、**图谱**、与、**向量**、**检索** (5) |
+| 我今天参加了技术分享会议 | 23 single/bigram tokens | 我、今天、参加、了、技术、分享、**会议** (7) |
+
+**When to use nodejieba:** technical documentation, academic papers, domain-specific corpora where compound terms (人工智能, 知识图谱) must be matched as units. For everyday notes, the native bigram tokenizer gives excellent recall without the installation overhead.
+
+> Note: brand names mixing Chinese + English (e.g. `智谱AI`) are split character-by-character by nodejieba since they're not in the default dictionary. Add custom words via `nodejieba.addWord('智谱AI')` if needed.
+
 ## Install
 
 ### On an agent platform (recommended)

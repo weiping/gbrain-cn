@@ -34,6 +34,34 @@ GBrain 是这些模式的通用化实现。34 个技能。30 分钟安装完毕�
 | **中文 Wikilink 解析** | `[[中文标题]]` 通过向量搜索兜底，精确匹配失败时自动降级 |
 | **可变嵌入维度** | `embedding-3` 支持 1024 / 1536 / 2048，通过 `EMBEDDING_DIMENSIONS` 配置 |
 
+### Nodejieba：专业中文分词（可选）
+
+gbrain-cn 默认使用**内置双字（bigram）切分器**——无依赖，开箱即用。对于技术文档、学术资料、专业领域语料，可启用 [nodejieba](https://github.com/yanyiwu/nodejieba) 获得词边界感知的分词能力：
+
+```bash
+# 安装
+npm install nodejieba --legacy-peer-deps
+
+# 启用
+export GBRAIN_USE_NODEJIEBA=true
+
+# 重建现有页面的 tsvector 索引
+gbrain sync --force
+```
+
+实测分词对比：
+
+| 文本 | 双字切分（token 数） | nodejieba 分词 |
+|---|---|---|
+| 人工智能大语言模型 | 人、工、智、能… (17个) | **人工智能**、大、语言、模型 (4词) |
+| 知识图谱与向量检索 | 知、识、图、谱… (17个) | **知识**、**图谱**、与、**向量**、**检索** (5词) |
+| 我今天参加了技术分享会议 | 23个 token | 我、今天、参加、了、技术、分享、**会议** (7词) |
+| 智谱AI嵌入模型支持1536维 | 混合 token | 智、谱、A、I、嵌入、模型、支持、1、5、3、6、维 |
+
+**何时使用 nodejieba：** 含大量专业复合词（人工智能、知识图谱）的技术文档、学术论文，需要将复合词作为整体匹配。日常笔记用原生双字切分即可，召回率高且无安装负担。
+
+> **注意：** 中英混合品牌词（如"智谱AI"）在 nodejieba 中会被逐字切分，因为默认词典不含此类词。如有需要，可通过 `nodejieba.addWord('智谱AI')` 添加自定义词。
+
 ### 快速配置
 
 ```bash
@@ -520,8 +548,16 @@ gbrain extract timeline --source db     # 从 Markdown 时间线提取日期事�
 ```
 
 CJK 特有增强：
-- **双字切分器**：中文文本被切分为双字（bigram）供 tsvector 索引，无需外部依赖
+- **双字切分器（默认）**：中文文本切分为双字（bigram）供 tsvector 索引，无需外部依赖，PGLite + Postgres 均支持
+- **nodejieba（可选）**：设置 `GBRAIN_USE_NODEJIEBA=true` 后升级为词边界感知分词，将"人工智能"作为整体词匹配而非逐字切分
 - **向量兜底**：`[[中文标题]]` Wikilink 精确匹配失败时，自动降级为向量相似度搜索
+
+两种模式下，`enhancedChineseBigram()` 函数均会同时输出完整词和字级 bigram，兼顾精度与召回率：
+
+```
+nodejieba 模式：知识图谱 → "知识 知 识 图谱 图 谱"（词 + 字内 bigram）
+原生模式：  知识图谱 → "知 识 图 谱 知识 识图 图谱"（单字 + bigram）
+```
 
 ---
 
