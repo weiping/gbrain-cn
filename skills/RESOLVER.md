@@ -109,12 +109,12 @@ These apply to ALL brain-writing skills:
 
 | Trigger | Skill |
 |---------|-------|
-| "personalized version of this book", "personalized version", "mirror this book", "two-column book", "chapter-by-chapter" | `skills/book-mirror/SKILL.md` |
-| "enrich this article", "batch enrich", "enriching the article", "enrich brain pages" | `skills/article-enrichment/SKILL.md` |
-| "strategic reading", "through the lens of", "apply this to my problem", "what can I learn from this", "extract a playbook" | `skills/strategic-reading/SKILL.md` |
-| "concept synthesis", "synthesize my concepts", "patterns across my notes", "intellectual map", "idea evolution" | `skills/concept-synthesis/SKILL.md` |
-| "perplexity research", "perplexity-research", "brain doesn't already cover", "yc w26", "focus on the delta", "what changed about this funding" | `skills/perplexity-research/SKILL.md` |
-| "crawl my archive", "archive crawler", "archive of old", "scan my dropbox", "mine my old files" | `skills/archive-crawler/SKILL.md` |
-| "verify this academic claim", "academic verify", "check this study", "validate citation", "retraction watch" | `skills/academic-verify/SKILL.md` |
-| "make pdf from brain", "brain pdf", "brain page to pdf", "page as pdf", "export brain page" | `skills/brain-pdf/SKILL.md` |
-| "voice note", "voice memo", "audio message", "audio note" | `skills/voice-note-ingest/SKILL.md` |
+| "personalized version of this book", "personalized version", "mirror this book", "two-column book", "chapter-by-chapter", "book to my life", "this book apply to me" | `skills/book-mirror/SKILL.md` |
+| "enrich this article", "batch enrich", "enriching the article", "enrich brain pages", "enrich pass", "enrich the article" | `skills/article-enrichment/SKILL.md` |
+| "strategic reading", "through the lens of", "apply this to my problem", "what can I learn from this", "extract a playbook", "read this through the lens", "extract a playbook from this" | `skills/strategic-reading/SKILL.md` |
+| "concept synthesis", "synthesize my concepts", "patterns across my notes", "intellectual map", "idea evolution", "find patterns across my notes", "trace idea evolution", "canon vs riff" | `skills/concept-synthesis/SKILL.md` |
+| "perplexity research", "perplexity-research", "brain doesn't already cover", "yc w26", "focus on the delta", "what changed about this funding", "what's new about this", "current state of", "web research pass", "surface new developments" | `skills/perplexity-research/SKILL.md` |
+| "crawl my archive", "archive crawler", "archive of old", "scan my dropbox", "mine my old files", "find gold in my archive" | `skills/archive-crawler/SKILL.md` |
+| "verify this academic claim", "academic verify", "check this study", "validate citation", "retraction watch", "Retraction Watch", "is this study real" | `skills/academic-verify/SKILL.md` |
+| "make pdf from brain", "brain pdf", "brain page to pdf", "page as pdf", "export brain page", "convert brain page to pdf", "publish this page as pdf" | `skills/brain-pdf/SKILL.md` |
+| "voice note", "voice memo", "audio message", "audio note", "transcribe and file" | `skills/voice-note-ingest/SKILL.md` |

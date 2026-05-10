@@ -199,7 +199,7 @@ export async function extractLinksFromFile(
   opts?: { includeFrontmatter?: boolean },
 ): Promise<ExtractedLink[]> {
   const links: ExtractedLink[] = [];
-  const slug = relPath.replace('.md', '');
+  const slug = pathToSlug(relPath);
   const fileDir = dirname(relPath);
   const fm = parseFrontmatterFromContent(content, relPath);
 
@@ -384,7 +384,19 @@ export async function runExtractCore(engine: BrainEngine, opts: ExtractOpts): Pr
 export async function runExtract(engine: BrainEngine, args: string[]) {
   const subcommand = args[0];
   const dirIdx = args.indexOf('--dir');
-  const brainDir = (dirIdx >= 0 && dirIdx + 1 < args.length) ? args[dirIdx + 1] : '.';
+  const explicitDir = dirIdx >= 0 && dirIdx + 1 < args.length;
+  // When --dir is not passed, resolve from the configured brain source
+  // BEFORE falling back to '.' (the prior default). The bare `.` default was
+  // a footgun: a user who runs `gbrain extract links` from anywhere outside
+  // their brain dir (e.g., a project checkout with a node_modules tree) had
+  // the recursive walker grab tens of thousands of unrelated .md files,
+  // attempt to extract links between them, then write 0 rows because the
+  // synthetic from_slugs don't match any pages row. The output ("created 0
+  // links from 28989 pages") looks like a no-op, but it walked 28K junk files
+  // first. Resolving from sources(local_path) makes the no-arg invocation
+  // match what `gbrain sync` already does, and keeps cwd-cwd usage available
+  // via explicit `--dir .`.
+  let brainDir = explicitDir ? args[dirIdx + 1] : '.';
   const sourceIdx = args.indexOf('--source');
   const source = (sourceIdx >= 0 && sourceIdx + 1 < args.length) ? args[sourceIdx + 1] : 'fs';
   const typeIdx = args.indexOf('--type');
@@ -420,7 +432,25 @@ export async function runExtract(engine: BrainEngine, args: string[]) {
     process.exit(1);
   }
 
-  // FS source needs a brain dir; DB source ignores --dir.
+  // FS source needs a brain dir. When --dir wasn't passed, resolve from
+  // sources(local_path) — same path `gbrain sync` uses — instead of
+  // silently walking cwd. See the brainDir comment above for the footgun.
+  if (source === 'fs' && !explicitDir) {
+    const { getDefaultSourcePath } = await import('../core/source-resolver.ts');
+    const configured = await getDefaultSourcePath(engine);
+    if (configured) {
+      brainDir = configured;
+    } else {
+      console.error(
+        `No brain directory configured. Pass --dir <path> explicitly, or use --source db ` +
+        `to extract from already-synced pages. To register a brain dir as the default, ` +
+        `run: gbrain sources add default --path <brain-dir>`,
+      );
+      process.exit(1);
+    }
+  }
+
+  // DB source ignores --dir.
   if (source === 'fs' && !existsSync(brainDir)) {
     console.error(`Directory not found: ${brainDir}`);
     process.exit(1);
@@ -483,7 +513,7 @@ async function extractForSlugs(
 ): Promise<{ links_created: number; timeline_created: number; pages: number }> {
   // Build the full slug set for link resolution (fast: just readdir, no file reads)
   const allFiles = walkMarkdownFiles(brainDir);
-  const allSlugs = new Set(allFiles.map(f => f.relPath.replace('.md', '')));
+  const allSlugs = new Set(allFiles.map(f => pathToSlug(f.relPath)));
 
   const doLinks = mode === 'links' || mode === 'all';
   const doTimeline = mode === 'timeline' || mode === 'all';
@@ -579,7 +609,7 @@ async function extractLinksFromDir(
   engine: BrainEngine, brainDir: string, dryRun: boolean, jsonMode: boolean,
 ): Promise<{ created: number; pages: number }> {
   const files = walkMarkdownFiles(brainDir);
-  const allSlugs = new Set(files.map(f => f.relPath.replace('.md', '')));
+  const allSlugs = new Set(files.map(f => pathToSlug(f.relPath)));
 
   // Progress stream on stderr (separate from the action-events --json writes
   // to stdout, which tests grep for). Rate-gated; respects global --quiet /
@@ -706,9 +736,21 @@ async function extractTimelineFromDir(
 
 // --- Sync integration hooks ---
 
-export async function extractLinksForSlugs(engine: BrainEngine, repoPath: string, slugs: string[]): Promise<number> {
+export async function extractLinksForSlugs(
+  engine: BrainEngine,
+  repoPath: string,
+  slugs: string[],
+  opts?: { sourceId?: string },
+): Promise<number> {
   const allFiles = walkMarkdownFiles(repoPath);
-  const allSlugs = new Set(allFiles.map(f => f.relPath.replace('.md', '')));
+  const allSlugs = new Set(allFiles.map(f => pathToSlug(f.relPath)));
+  // v0.18.0+ multi-source: post-sync extract reconciles same-source edges.
+  // Markdown→markdown links within one repo always live in the caller's
+  // sourceId. Cross-source extraction (rare) would need a per-repo source
+  // manifest; not in this PR's scope.
+  const linkOpts = opts?.sourceId
+    ? { fromSourceId: opts.sourceId, toSourceId: opts.sourceId, originSourceId: opts.sourceId }
+    : undefined;
   let created = 0;
   for (const slug of slugs) {
     const filePath = join(repoPath, slug + '.md');
@@ -716,14 +758,23 @@ export async function extractLinksForSlugs(engine: BrainEngine, repoPath: string
     try {
       const content = readFileSync(filePath, 'utf-8');
       for (const link of await extractLinksFromFile(content, slug + '.md', allSlugs)) {
-        try { await engine.addLink(link.from_slug, link.to_slug, link.context, link.link_type); created++; } catch { /* skip */ }
+        try { await engine.addLink(link.from_slug, link.to_slug, link.context, link.link_type, undefined, undefined, undefined, linkOpts); created++; } catch { /* skip */ }
       }
     } catch { /* skip */ }
   }
   return created;
 }
 
-export async function extractTimelineForSlugs(engine: BrainEngine, repoPath: string, slugs: string[]): Promise<number> {
+export async function extractTimelineForSlugs(
+  engine: BrainEngine,
+  repoPath: string,
+  slugs: string[],
+  opts?: { sourceId?: string },
+): Promise<number> {
+  // v0.18.0+ multi-source: source-qualify so timeline rows don't fan out
+  // across every source containing the slug (the addTimelineEntry's
+  // INSERT...SELECT-from-pages fan-out was Data R1's HIGH 2).
+  const entryOpts = opts?.sourceId ? { sourceId: opts.sourceId } : undefined;
   let created = 0;
   for (const slug of slugs) {
     const filePath = join(repoPath, slug + '.md');
@@ -731,7 +782,7 @@ export async function extractTimelineForSlugs(engine: BrainEngine, repoPath: str
     try {
       const content = readFileSync(filePath, 'utf-8');
       for (const entry of extractTimelineFromContent(content, slug)) {
-        try { await engine.addTimelineEntry(entry.slug, { date: entry.date, source: entry.source, summary: entry.summary, detail: entry.detail }); created++; } catch { /* skip */ }
+        try { await engine.addTimelineEntry(entry.slug, { date: entry.date, source: entry.source, summary: entry.summary, detail: entry.detail }, entryOpts); created++; } catch { /* skip */ }
       }
     } catch { /* skip */ }
   }
