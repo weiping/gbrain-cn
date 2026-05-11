@@ -15,6 +15,12 @@
 let nodejiebaLoaded = false;
 let nodejiebaInstance: any = null;
 
+// Test-only: reset nodejieba state for testing
+export function _resetNodejiebaStateForTests() {
+  nodejiebaLoaded = false;
+  nodejiebaInstance = null;
+}
+
 /**
  * Initialize nodejieba if available and enabled.
  *
