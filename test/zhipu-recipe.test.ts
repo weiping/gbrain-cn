@@ -15,30 +15,30 @@ describe('Zhipu AI Recipe', () => {
 
   it('should have correct metadata', () => {
     expect(zhipu.id).toBe('zhipu');
-    expect(zhipu.name).toBe('Zhipu AI');
+    expect(zhipu.name).toBe('Zhipu AI (智谱AI BigModel)');
     expect(zhipu.tier).toBe('openai-compat');
     expect(zhipu.implementation).toBe('openai-compatible');
     expect(zhipu.base_url_default).toBe('https://open.bigmodel.cn/api/paas/v4');
   });
 
   it('should require ZHIPU_API_KEY', () => {
-    expect(zhipu.auth_env.required).toEqual(['ZHIPU_API_KEY']);
-    expect(zhipu.auth_env.setup_url).toBe('https://open.bigmodel.cn/usercenter/apikeys');
+    expect(zhipu.auth_env!.required).toEqual(['ZHIPU_API_KEY']);
+    expect(zhipu.auth_env!.setup_url).toBe('https://open.bigmodel.cn/usercenter/apikeys');
   });
 
   it('should have embedding touchpoint', () => {
-    const embedding = zhipu.touchpoints.embedding;
+    const embedding = zhipu.touchpoints!.embedding!;
     expect(embedding).toBeDefined();
     expect(embedding.models).toContain('embedding-2');
     expect(embedding.models).toContain('embedding-3');
-    expect(embedding.default_dims).toBe(1024);
+    expect(embedding.default_dims).toBe(1536);
     expect(embedding.max_batch_tokens).toBe(8000);
     expect(embedding.chars_per_token).toBe(1.5);
     expect(embedding.safety_factor).toBe(0.7);
   });
 
   it('should have chat touchpoint with GLM models', () => {
-    const chat = zhipu.touchpoints.chat;
+    const chat = zhipu.touchpoints!.chat!;
     expect(chat).toBeDefined();
     expect(chat.models).toContain('glm-4');
     expect(chat.models).toContain('glm-4-flash');
@@ -50,7 +50,7 @@ describe('Zhipu AI Recipe', () => {
   });
 
   it('should have expansion touchpoint', () => {
-    const expansion = zhipu.touchpoints.expansion;
+    const expansion = zhipu.touchpoints!.expansion!;
     expect(expansion).toBeDefined();
     expect(expansion.models).toContain('glm-4-flash');
   });
@@ -61,7 +61,9 @@ describe('Zhipu AI Recipe', () => {
   });
 
   it('should have pricing data', () => {
-    const { embedding, chat, expansion } = zhipu.touchpoints;
+    const embedding = zhipu.touchpoints!.embedding!;
+    const chat = zhipu.touchpoints!.chat!;
+    const expansion = zhipu.touchpoints!.expansion!;
     expect(embedding.cost_per_1m_tokens_usd).toBe(0.02);
     expect(embedding.price_last_verified).toBeDefined();
     expect(chat.cost_per_1m_input_usd).toBe(0.5);

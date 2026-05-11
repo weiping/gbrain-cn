@@ -833,7 +833,7 @@ export class PGLiteEngine implements BrainEngine {
            LIMIT $2`,
           [query, innerLimit]
         );
-        rows = chineseRows;
+        rows = chineseRows as Record<string, unknown>[];
       } else {
         // Single CJK char: simple ILIKE
         const singleClause = `p.chinese_search_vector::text ILIKE '%${cjkChars[0]}%'`;
@@ -854,7 +854,7 @@ export class PGLiteEngine implements BrainEngine {
            LIMIT $2`,
           [query, innerLimit]
         );
-        rows = chineseRows;
+        rows = chineseRows as Record<string, unknown>[];
       }
     } else {
       // English/non-CJK path: use existing FTS search
@@ -885,7 +885,7 @@ export class PGLiteEngine implements BrainEngine {
          LIMIT $3 OFFSET $4`,
         params
       );
-      rows = ftsRows;
+      rows = ftsRows as Record<string, unknown>[];
     }
 
     return rows.map(rowToSearchResult);

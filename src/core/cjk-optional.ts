@@ -39,7 +39,8 @@ export async function initNodejieba(): Promise<boolean> {
 
   try {
     // Try to dynamically import nodejieba (optional dependency)
-    // @ts-expect-error - nodejieba is an optional dependency, may not be installed
+    // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+    // @ts-ignore — nodejieba is an optional dependency, may not be installed
     const module = await import('nodejieba');
     nodejiebaInstance = module.default;
     nodejiebaLoaded = true;

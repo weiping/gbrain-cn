@@ -695,12 +695,12 @@ const cacheKey = `${trimmed}\u0000${Array.isArray(dirHint) ? dirHint.join(',') :
         // Slug path didn't exist — try resolving by exact title match (case-insensitive).
         // This handles bare wikilinks like [[Claude Code 概述]] whose slug path differs from title.
         if (!hints.length) {
-          const titleMatch = await engine.db.query(
-            'SELECT slug FROM pages WHERE LOWER(title) = LOWER($1) LIMIT 1',
+          const titleRows = await engine.executeRaw<{ slug: string }>(
+            `SELECT slug FROM pages WHERE LOWER(title) = LOWER($1) LIMIT 1`,
             [trimmed],
           );
-          if (titleMatch.rows.length > 0) {
-            const found = (titleMatch.rows[0] as { slug: string }).slug;
+          if (titleRows.length > 0) {
+            const found = titleRows[0].slug;
             cache.set(cacheKey, found);
             return found;
           }
