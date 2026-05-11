@@ -1,27 +1,21 @@
 import type { Recipe } from '../types.ts';
 
 /**
- * Zhipu AI (智谱 AI) — Chinese AI provider with OpenAI-compatible API.
+ * Zhipu AI (智谱AI) BigModel Open Platform. OpenAI-compatible /embeddings
+ * endpoint at open.bigmodel.cn. Hosts embedding-2 (1024d) and embedding-3
+ * (Matryoshka 1024/1536/2048d).
  *
- * Zhipu provides embedding models optimized for Chinese text and GLM chat models.
+ * embedding-3 at 2048 dims exceeds pgvector's HNSW cap of 2000 — those
+ * brains fall back to exact vector scans. Default is 1536 for compatibility
+ * with existing OpenAI text-embedding-3-large brains.
  *
- * IMPORTANT: embedding-3 supports variable dimensions (1024-2048).
- * The API accepts an `dimensions` parameter to control output size. This allows
- * maintaining compatibility with existing databases that use 1536-dim vectors (e.g.,
- * from OpenAI text-embedding-3-large) without re-embedding.
- *
- * Dimension options: 1024, 1536, 2048
- * - 1024: Fastest, lowest cost
- * - 1536: Compatible with OpenAI text-embedding-3-large
- * - 2048: Highest quality
- *
- * Chat models: glm-4.7 is the latest flagship model with strong CJK understanding.
+ * Chat models: glm-4.7 is the latest flagship with strong CJK understanding.
  *
  * API docs: https://open.bigmodel.cn/dev/api
  */
 export const zhipu: Recipe = {
   id: 'zhipu',
-  name: 'Zhipu AI',
+  name: 'Zhipu AI (智谱AI BigModel)',
   tier: 'openai-compat',
   implementation: 'openai-compatible',
   base_url_default: 'https://open.bigmodel.cn/api/paas/v4',
@@ -32,12 +26,10 @@ export const zhipu: Recipe = {
   touchpoints: {
     embedding: {
       models: ['embedding-2', 'embedding-3'],
-      default_dims: 1536,  // 兼容 OpenAI text-embedding-3-large
-      dims_options: [1024, 1536, 2048],  // Zhipu 支持可变维数
-      cost_per_1m_tokens_usd: 0.02, // embedding-3 pricing
+      default_dims: 1536,
+      dims_options: [1024, 1536, 2048],
+      cost_per_1m_tokens_usd: 0.02,
       price_last_verified: '2026-04-22',
-      // Zhipu embedding API handles ~8K tokens per request. Chinese text is
-      // denser (~1.5-2 chars per token), so we use a conservative char estimate.
       max_batch_tokens: 8000,
       chars_per_token: 1.5,
       safety_factor: 0.7,
@@ -48,7 +40,7 @@ export const zhipu: Recipe = {
       supports_subagent_loop: true,
       supports_prompt_cache: false,
       max_context_tokens: 128000,
-      cost_per_1m_input_usd: 0.5, // glm-4-flash baseline
+      cost_per_1m_input_usd: 0.5,
       cost_per_1m_output_usd: 0.5,
       price_last_verified: '2026-04-22',
     },

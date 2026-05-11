@@ -2294,6 +2294,8 @@ export const MIGRATIONS: Migration[] = [
                             CHECK (kind IN ('event','preference','commitment','belief','fact')),
           visibility        TEXT        NOT NULL DEFAULT 'private'
                             CHECK (visibility IN ('private','world')),
+          notability        TEXT        NOT NULL DEFAULT 'medium'
+                            CHECK (notability IN ('high','medium','low')),
           context           TEXT,
           valid_from        TIMESTAMPTZ NOT NULL DEFAULT now(),
           valid_until       TIMESTAMPTZ,
@@ -2364,68 +2366,109 @@ export const MIGRATIONS: Migration[] = [
   },
   {
     version: 46,
+    name: 'mcp_request_log_params_jsonb_normalize',
+    idempotent: true,
+    // v0.31.3 wave: mcp_request_log.params was written as JSON-encoded strings
+    // via postgres.js template tag loose typing. This one-shot UPDATE lifts
+    // existing string-shaped rows to real JSONB objects.
+    sql: `
+      UPDATE mcp_request_log
+        SET params = (params #>> '{}')::jsonb
+        WHERE jsonb_typeof(params) = 'string'
+          AND params #>> '{}' LIKE '{%';
+    `,
+  },
+  {
+    version: 47,
+    name: 'facts_notability_alter',
+    // v0.31.2 (B2 ship-blocker fix). facts.notability column shipped via v45's
+    // inline CREATE TABLE on fresh installs, but every brain that ran v45 BEFORE
+    // notability landed is missing the column. This ALTER covers existing brains.
+    sql: `
+      ALTER TABLE facts ADD COLUMN IF NOT EXISTS notability TEXT NOT NULL DEFAULT 'medium';
+
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conname = 'facts_notability_check'
+            AND conrelid = 'facts'::regclass
+        ) THEN
+          ALTER TABLE facts ADD CONSTRAINT facts_notability_check
+            CHECK (notability IN ('high','medium','low'));
+        END IF;
+      END $$;
+    `,
+  },
+  {
+    version: 48,
+    name: 'takes_weight_round_to_grid',
+    // v0.32.0 — Backfill takes.weight to the 0.05 grid the engine now enforces.
+    sql: `
+      UPDATE takes
+         SET weight = (ROUND(weight::numeric * 20) / 20)::real
+       WHERE weight IS NOT NULL
+         AND abs(weight::numeric - ROUND(weight::numeric * 20) / 20) > 0.001;
+    `,
+    transaction: false,
+  },
+  {
+    version: 49,
+    name: 'eval_takes_quality_runs',
+    // v0.32 — DB-authoritative store for takes-quality eval receipts.
+    sql: `
+      CREATE TABLE IF NOT EXISTS eval_takes_quality_runs (
+        id                    BIGSERIAL    PRIMARY KEY,
+        receipt_sha8_corpus   TEXT         NOT NULL,
+        receipt_sha8_prompt   TEXT         NOT NULL,
+        receipt_sha8_models   TEXT         NOT NULL,
+        receipt_sha8_rubric   TEXT         NOT NULL,
+        rubric_version        TEXT         NOT NULL,
+        verdict               TEXT         NOT NULL CHECK (verdict IN ('pass','fail','inconclusive')),
+        overall_score         REAL         NOT NULL,
+        dim_scores            JSONB        NOT NULL,
+        cost_usd              REAL         NOT NULL,
+        receipt_json          JSONB        NOT NULL,
+        receipt_disk_path     TEXT,
+        created_at            TIMESTAMPTZ  NOT NULL DEFAULT now(),
+        UNIQUE (receipt_sha8_corpus, receipt_sha8_prompt, receipt_sha8_models, receipt_sha8_rubric)
+      );
+      CREATE INDEX IF NOT EXISTS eval_takes_quality_runs_trend_idx
+        ON eval_takes_quality_runs (rubric_version, created_at DESC);
+    `,
+  },
+  {
+    version: 50,
+    name: 'ingest_log_source_id',
+    // v0.31.2 — Add source_id to ingest_log for multi-source scoping.
+    sql: `
+      ALTER TABLE ingest_log ADD COLUMN IF NOT EXISTS source_id TEXT NOT NULL DEFAULT 'default';
+
+      CREATE INDEX IF NOT EXISTS idx_ingest_log_source_type_created
+        ON ingest_log (source_id, source_type, created_at DESC);
+    `,
+  },
+  {
+    version: 51,
     name: 'cjk_search_support',
     sql: '', // Engine-agnostic SQL not needed; sqlFor provides engine-specific DDL
-    // v0.30+ CJK (Chinese/Japanese/Korean) search support.
+    // gbrain-cn: CJK (Chinese/Japanese/Korean) search support.
     //
     // Adds chinese_search_vector column to pages table for Chinese bigram-based
     // full-text search. This enables effective CJK search without pinyin
     // conversion or pg_trgm (which has bugs in PGLite 0.4.3).
-    //
-    // For PGLite:
-    // - Column stores precomputed bigram tokens as TSVECTOR
-    // - Populated by putPage() using chineseBigram() function
-    // - searchKeyword() uses ILIKE matching against this column
-    //
-    // For Postgres:
-    // - Column exists but uses jieba FTS config instead
-    // - Falls back to ILIKE when pg_jieba is not installed
     sqlFor: {
       pglite: `
-        -- Add chinese_search_vector column for CJK bigram search
         ALTER TABLE pages ADD COLUMN IF NOT EXISTS chinese_search_vector TSVECTOR;
 
-        -- Create GIN index for efficient bigram search
         CREATE INDEX IF NOT EXISTS idx_pages_chinese_search_vector
           ON pages USING GIN(chinese_search_vector);
       `,
       postgres: `
-        -- Add chinese_search_vector column for CJK search
-        -- Uses jieba FTS config when available, falls back to simple
         ALTER TABLE pages ADD COLUMN IF NOT EXISTS chinese_search_vector TSVECTOR;
 
-        -- Create GIN index for efficient CJK search
         CREATE INDEX IF NOT EXISTS idx_pages_chinese_search_vector
           ON pages USING GIN(chinese_search_vector);
       `,
-    },
-    handler: async (engine) => {
-      // Backfill chinese_search_vector for existing pages
-      const pages = await engine.listPages();
-      let processed = 0;
-
-      for (const page of pages) {
-        const title = page.title || '';
-        const compiled = page.compiled_truth || '';
-        const timeline = page.timeline || '';
-
-        // Generate bigram tokens for CJK text
-        const tokens = [
-          ...title.split(/\s+/),
-          ...compiled.split(/\s+/),
-          ...timeline.split(/\s+/)
-        ].filter(t => t && /[一-龥]/.test(t)); // Only CJK tokens
-
-        if (tokens.length > 0) {
-          // For PGLite, this will be populated by putPage() on next update
-          // For now, just mark that we've processed the page
-          processed++;
-        }
-      }
-
-      if (processed > 0) {
-        console.log(`  CJK search support added. ${processed} pages will be indexed on next update.`);
-      }
     },
   },
 ];

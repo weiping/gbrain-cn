@@ -83,6 +83,8 @@ Tokenization comparison on real text:
 
 > Note: brand names mixing Chinese + English (e.g. `智谱AI`) are split character-by-character by nodejieba since they're not in the default dictionary. Add custom words via `nodejieba.addWord('智谱AI')` if needed.
 
+> **Embedding providers:** OpenAI is the default, but gbrain ships with **14 recipes** covering Voyage, Google Gemini, Azure OpenAI, MiniMax, Alibaba DashScope, Zhipu, Ollama (local), llama.cpp llama-server (local), LiteLLM proxy (universal), and 5 more. Run `gbrain providers list` to see them, or read [`docs/integrations/embedding-providers.md`](docs/integrations/embedding-providers.md) for setup, pricing, and a decision tree. `gbrain doctor` will surface alternative providers whose env vars you already have set.
+
 ## Install
 
 ### On an agent platform (recommended)
@@ -815,6 +817,16 @@ ADMIN
   gbrain doctor --fix [--dry-run]       Auto-fix DRY violations (delegate inlined rules to conventions)
   gbrain doctor --locks                 List idle-in-tx backends (57014 diagnostic, Postgres only)
   gbrain stats                          Brain statistics
+  gbrain models                         Show live model routing (tier defaults,
+                                        per-task overrides, alias map, source-of-truth).
+                                        v0.31.12: tier system + recipe-models merge.
+                                        Power-user override:
+                                          gbrain config set models.default opus
+                                          gbrain config set models.tier.deep opus
+  gbrain models doctor                  1-token reachability probe for each configured
+                                        chat/expansion model. Catches `model_not_found`
+                                        before the next agent run silently degrades.
+                                        [--skip=<provider>] [--json]
   gbrain serve                          MCP server (stdio)
   gbrain serve --http [--port 3131]     HTTP MCP server with OAuth 2.1 + admin dashboard
                                         [--token-ttl 3600] [--enable-dcr]
