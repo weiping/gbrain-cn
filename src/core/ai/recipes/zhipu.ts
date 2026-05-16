@@ -20,14 +20,14 @@ export const zhipu: Recipe = {
   implementation: 'openai-compatible',
   base_url_default: 'https://open.bigmodel.cn/api/paas/v4',
   auth_env: {
-    required: ['ZHIPU_API_KEY'],
+    required: ['ZHIPUAI_API_KEY'],
     setup_url: 'https://open.bigmodel.cn/usercenter/apikeys',
   },
   touchpoints: {
     embedding: {
-      models: ['embedding-2', 'embedding-3'],
-      default_dims: 1536,
-      dims_options: [1024, 1536, 2048],
+      models: ['embedding-3', 'embedding-2'],
+      default_dims: 1024,
+      dims_options: [256, 512, 1024, 2048],
       cost_per_1m_tokens_usd: 0.02,
       price_last_verified: '2026-04-22',
       max_batch_tokens: 8000,
@@ -50,5 +50,5 @@ export const zhipu: Recipe = {
       price_last_verified: '2026-04-22',
     },
   },
-  setup_hint: 'Get an API key at https://open.bigmodel.cn/usercenter/apikeys, then `export ZHIPU_API_KEY=...`',
+  setup_hint: 'Get an API key at https://open.bigmodel.cn/usercenter/apikeys, then `export ZHIPUAI_API_KEY=...`',
 };

@@ -108,8 +108,9 @@ export function dimsProviderOptions(
         }
         return { openaiCompatible: { dimensions: dims } };
       }
-      // Zhipu AI embedding-2/3 support variable dimensions (1024-2048).
-      if (ZHIPU_EMBEDDING_MODELS.has(modelId)) {
+      // Zhipu AI embedding-3 supports variable dimensions (1024-2048).
+      // embedding-2 is fixed at 1024 dims — no passthrough.
+      if (modelId === 'embedding-3') {
         return { openaiCompatible: { dimensions: dims } };
       }
       // OpenAI text-embedding-3 family on the openai-compatible adapter

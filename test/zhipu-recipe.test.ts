@@ -21,8 +21,8 @@ describe('Zhipu AI Recipe', () => {
     expect(zhipu.base_url_default).toBe('https://open.bigmodel.cn/api/paas/v4');
   });
 
-  it('should require ZHIPU_API_KEY', () => {
-    expect(zhipu.auth_env!.required).toEqual(['ZHIPU_API_KEY']);
+  it('should require ZHIPUAI_API_KEY', () => {
+    expect(zhipu.auth_env!.required).toEqual(['ZHIPUAI_API_KEY']);
     expect(zhipu.auth_env!.setup_url).toBe('https://open.bigmodel.cn/usercenter/apikeys');
   });
 
@@ -31,7 +31,7 @@ describe('Zhipu AI Recipe', () => {
     expect(embedding).toBeDefined();
     expect(embedding.models).toContain('embedding-2');
     expect(embedding.models).toContain('embedding-3');
-    expect(embedding.default_dims).toBe(1536);
+    expect(embedding.default_dims).toBe(1024);
     expect(embedding.max_batch_tokens).toBe(8000);
     expect(embedding.chars_per_token).toBe(1.5);
     expect(embedding.safety_factor).toBe(0.7);
@@ -56,7 +56,7 @@ describe('Zhipu AI Recipe', () => {
   });
 
   it('should provide setup hint', () => {
-    expect(zhipu.setup_hint).toContain('export ZHIPU_API_KEY');
+    expect(zhipu.setup_hint).toContain('export ZHIPUAI_API_KEY');
     expect(zhipu.setup_hint).toContain('open.bigmodel.cn');
   });
 
