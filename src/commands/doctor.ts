@@ -1759,8 +1759,10 @@ export async function runDoctor(engine: BrainEngine | null, args: string[], dbSo
   // 4. pgvector extension
   progress.heartbeat('pgvector');
   try {
-    const sql = db.getConnection();
-    const ext = await sql`SELECT extname FROM pg_extension WHERE extname = 'vector'`;
+    type ExtRow = { extname: string };
+    const ext = await engine.executeRaw<ExtRow>(
+      `SELECT extname FROM pg_extension WHERE extname = 'vector'`
+    );
     if (ext.length > 0) {
       checks.push({ name: 'pgvector', status: 'ok', message: 'Extension installed' });
     } else {
@@ -2375,22 +2377,22 @@ export async function runDoctor(engine: BrainEngine | null, args: string[], dbSo
   // repair target, per #254/Codex review).
   progress.heartbeat('jsonb_integrity');
   try {
-    const sql = db.getConnection();
-    const targets: Array<{ table: string; col: string; expected: 'object' | 'array' }> = [
-      { table: 'pages',         col: 'frontmatter',    expected: 'object' },
-      { table: 'raw_data',      col: 'data',           expected: 'object' },
-      { table: 'ingest_log',    col: 'pages_updated',  expected: 'array'  },
-      { table: 'files',         col: 'metadata',       expected: 'object' },
-      { table: 'page_versions', col: 'frontmatter',    expected: 'object' },
+    const targets: Array<{ table: string; col: string }> = [
+      { table: 'pages',         col: 'frontmatter'   },
+      { table: 'raw_data',      col: 'data'          },
+      { table: 'ingest_log',    col: 'pages_updated' },
+      { table: 'files',         col: 'metadata'      },
+      { table: 'page_versions', col: 'frontmatter'   },
     ];
     let totalBad = 0;
     const breakdown: string[] = [];
     for (const { table, col } of targets) {
       progress.heartbeat(`jsonb_integrity.${table}.${col}`);
-      const rows = await sql.unsafe(
+      type CountRow = { n: number };
+      const rows = await engine.executeRaw<CountRow>(
         `SELECT count(*)::int AS n FROM ${table} WHERE jsonb_typeof(${col}) = 'string'`,
       );
-      const n = Number((rows as any)[0]?.n ?? 0);
+      const n = Number(rows[0]?.n ?? 0);
       if (n > 0) { totalBad += n; breakdown.push(`${table}.${col}=${n}`); }
     }
     if (totalBad === 0) {
