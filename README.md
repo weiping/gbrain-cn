@@ -34,7 +34,7 @@ GBrain is those patterns, generalized. Install in 30 minutes. Your agent does th
 
 ```bash
 # 1. Set environment variables (~/.zshrc)
-export ZHIPU_API_KEY="your_key_here"
+export ZHIPUAI_API_KEY="your_key_here"
 export EMBEDDING_MODEL="zhipu:embedding-3"
 export EMBEDDING_DIMENSIONS="1536"
 export EMBEDDING_BASE_URL="https://open.bigmodel.cn/api/paas/v4"

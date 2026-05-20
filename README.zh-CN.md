@@ -66,7 +66,7 @@ gbrain sync --force
 
 ```bash
 # 1. 在 ~/.zshrc 中设置环境变量
-export ZHIPU_API_KEY="your_key_here"
+export ZHIPUAI_API_KEY="your_key_here"
 export EMBEDDING_MODEL="zhipu:embedding-3"
 export EMBEDDING_DIMENSIONS="1536"
 export EMBEDDING_BASE_URL="https://open.bigmodel.cn/api/paas/v4"
@@ -158,7 +158,7 @@ GBrain 通过 stdio 暴露 30+ 个 MCP 工具：
       "command": "gbrain",
       "args": ["serve"],
       "env": {
-        "ZHIPU_API_KEY": "your_key",
+        "ZHIPUAI_API_KEY": "your_key",
         "EMBEDDING_MODEL": "zhipu:embedding-3",
         "EMBEDDING_DIMENSIONS": "1536",
         "EMBEDDING_BASE_URL": "https://open.bigmodel.cn/api/paas/v4",
