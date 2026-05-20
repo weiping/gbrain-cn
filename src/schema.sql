@@ -99,6 +99,11 @@ CREATE TABLE IF NOT EXISTS pages (
   effective_date_source TEXT,
   import_filename       TEXT,
   salience_touched_at   TIMESTAMPTZ,
+  -- v0.37.0 (migration v79): real stale-page signal for `gbrain lsd`. Bumped
+  -- by op-layer write-back inside `search`/`query`/`get_page` op handlers
+  -- (NOT inside engine methods — internal callers must not pollute the
+  -- signal). NULL = never retrieved (LSD prioritizes these first).
+  last_retrieved_at     TIMESTAMPTZ,
   CONSTRAINT pages_source_slug_key UNIQUE (source_id, slug)
 );
 
@@ -116,6 +121,13 @@ CREATE INDEX IF NOT EXISTS idx_pages_source_id ON pages(source_id);
 -- stays low. Don't add a regular `(deleted_at)` index without measuring.
 CREATE INDEX IF NOT EXISTS pages_deleted_at_purge_idx
   ON pages (deleted_at) WHERE deleted_at IS NOT NULL;
+-- v0.37.0: full B-tree index on last_retrieved_at supports LSD's stale-page
+-- query `WHERE last_retrieved_at IS NULL OR last_retrieved_at < NOW() -
+-- INTERVAL '90 days'`. Postgres handles NULL in B-tree indexes (sorted to
+-- one end) so one index covers both branches. A partial WHERE NOT NULL
+-- would miss the NULL branch that LSD prioritizes (codex round 2 #6).
+CREATE INDEX IF NOT EXISTS pages_last_retrieved_at_idx
+  ON pages (last_retrieved_at);
 -- v0.29.1: expression index used by since/until date-range filters that read
 -- COALESCE(effective_date, updated_at). A partial index on effective_date
 -- alone would NOT help — the planner can't use it for the negative side of
@@ -155,7 +167,10 @@ CREATE TABLE IF NOT EXISTS content_chunks (
   -- mixed-provider brains (e.g. OpenAI 1536 text + Voyage 1024 images) keep
   -- both columns populated with distinct dim spaces.
   modality              TEXT NOT NULL DEFAULT 'text',
-  embedding_image       vector(1024)
+  embedding_image       vector(1024),
+  -- v0.36 Phase 3 cross-modal: unified column populated by reindex.
+  -- Migration v75 also adds it for upgrade paths.
+  embedding_multimodal  vector(1024)
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_chunks_page_index ON content_chunks(page_id, chunk_index);
@@ -465,6 +480,26 @@ CREATE TABLE IF NOT EXISTS oauth_codes (
 -- Composite indexes for admin dashboard request log queries
 CREATE INDEX IF NOT EXISTS idx_mcp_log_time_agent ON mcp_request_log(created_at, token_name);
 CREATE INDEX IF NOT EXISTS idx_mcp_log_agent_time ON mcp_request_log(agent_name, created_at DESC);
+
+-- ============================================================
+-- op_checkpoints: shared checkpoint table for long-running ops
+-- ============================================================
+-- v0.36+ autonomous-remediation wave (migration v67). Pre-fix each op
+-- carried its own file-backed checkpoint (or none); that broke on
+-- Postgres multi-worker hosts and fingerprint-collided across param
+-- variations. Fingerprint = sha8 of canonical-JSON of relevant params
+-- per op (mode, source, chunker_version, embedding_model+dims, etc.).
+-- completed_keys = op-defined string array. GC: cycle purge phase
+-- drops rows older than 7 days.
+CREATE TABLE IF NOT EXISTS op_checkpoints (
+  op             TEXT NOT NULL,
+  fingerprint    TEXT NOT NULL,
+  completed_keys JSONB NOT NULL DEFAULT '[]'::jsonb,
+  updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (op, fingerprint)
+);
+CREATE INDEX IF NOT EXISTS op_checkpoints_updated_at_idx
+  ON op_checkpoints (updated_at);
 
 -- ============================================================
 -- files: binary attachments stored in Supabase Storage

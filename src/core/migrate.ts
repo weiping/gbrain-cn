@@ -3074,6 +3074,87 @@ export const MIGRATIONS: Migration[] = [
     `,
   },
   {
+    version: 78,
+    name: 'embedding_multimodal_column',
+    // D20 Phase 3: add the unified-multimodal vector column to content_chunks.
+    //
+    // Column-only migration — the HNSW partial index is built AFTER the first
+    // bulk reindex completes (via `gbrain reindex --multimodal --build-index`
+    // or auto-built at completion). pgvector docs explicitly note that HNSW
+    // build is faster after data load, and per-row index maintenance during
+    // bulk reindex would slow the operation 2-3x.
+    //
+    // Operator class will be vector_cosine_ops to match the existing
+    // embedding_image index for ranking parity.
+    //
+    // The column ships at 1024 dims to match Voyage multimodal-3 output.
+    // Operators wanting a different dim (Cohere multimodal at 1408d, etc.)
+    // need a column rebuild — surfaced by the `multimodal_column_dim_match`
+    // doctor check (D20 model+dim pin).
+    idempotent: true,
+    sql: `
+      ALTER TABLE content_chunks ADD COLUMN IF NOT EXISTS embedding_multimodal vector(1024);
+    `,
+    sqlFor: {
+      pglite: `
+        ALTER TABLE content_chunks ADD COLUMN IF NOT EXISTS embedding_multimodal vector(1024);
+      `,
+    },
+  },
+  {
+    version: 77,
+    name: 'mcp_spend_log',
+    // D23-#6: per-OAuth-client paid-API spend tracking. search_by_image
+    // (Phase 2 of cross-modal wave) makes paid Voyage calls on behalf of
+    // remote OAuth clients. The existing v0.22.7 limiter caps requests/min
+    // but not spend. A 100-req/min attacker can burn ~$3/hour at Voyage
+    // rates. This table aggregates spend so the daily-budget check can
+    // refuse new calls when a client crosses
+    // search.image_query.daily_budget_usd_per_client (default $5).
+    //
+    // Indexed for the hot read: (client_id, day) lookup, summed.
+    // Row count is bounded by O(clients × days) — tiny.
+    idempotent: true,
+    sql: `
+      CREATE TABLE IF NOT EXISTS mcp_spend_log (
+        id SERIAL PRIMARY KEY,
+        client_id TEXT,
+        token_name TEXT,
+        operation TEXT NOT NULL,
+        spend_cents NUMERIC(12, 4) NOT NULL DEFAULT 0,
+        provider TEXT,
+        model TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      -- BTREE on (client_id, created_at) covers the per-day rollup query
+      -- (SELECT SUM ... WHERE client_id = $ AND created_at >= today_start) via
+      -- range scan on created_at. date_trunc in an index expression would
+      -- require IMMUTABLE — TIMESTAMPTZ truncation depends on session timezone.
+      CREATE INDEX IF NOT EXISTS idx_mcp_spend_log_client_time
+        ON mcp_spend_log (client_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_mcp_spend_log_token_time
+        ON mcp_spend_log (token_name, created_at);
+    `,
+    sqlFor: {
+      pglite: `
+        CREATE TABLE IF NOT EXISTS mcp_spend_log (
+          id SERIAL PRIMARY KEY,
+          client_id TEXT,
+          token_name TEXT,
+          operation TEXT NOT NULL,
+          spend_cents NUMERIC(12, 4) NOT NULL DEFAULT 0,
+          provider TEXT,
+          model TEXT,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        CREATE INDEX IF NOT EXISTS idx_mcp_spend_log_client_time
+          ON mcp_spend_log (client_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_mcp_spend_log_token_time
+          ON mcp_spend_log (token_name, created_at);
+      `,
+    },
+  },
+  {
     version: 66,
     name: 'embed_stale_partial_index',
     // Renumbered v58→v59→v60→v66 across merge waves:
@@ -3517,6 +3598,145 @@ export const MIGRATIONS: Migration[] = [
           ADD COLUMN IF NOT EXISTS embedding_column TEXT;
       `,
     },
+  },
+  {
+    version: 75,
+    name: 'op_checkpoints_table',
+    // v0.36+ autonomous-remediation wave (renumbered v67→v75 during master
+    // merge — master's v0.36.1.0 calibration + v0.36.3.0 captured v67-v74).
+    // Shared checkpoint table for long-running ops (embed, extract, lint,
+    // backlinks, reindex, integrity). Pre-fix, each op had its own
+    // file-backed checkpoint (or none), which broke on Postgres multi-worker
+    // hosts and silently fingerprint-collided across param variations
+    // (extract links vs extract timeline shared one file). DB-backed primary;
+    // PGLite engine falls back to file-backed at
+    // ~/.gbrain/checkpoints/<op>-<fingerprint>.json because it's single-host
+    // by construction.
+    //
+    // Fingerprint = sha8 of canonical-JSON of relevant params per op
+    // (chunker_version + embedding_model for embed, mode for extract, etc.).
+    // completed_keys are op-defined strings: chunk ids for embed, file paths
+    // for extract/lint/backlinks/reindex, page slugs for integrity.
+    //
+    // GC: cycle's purge phase drops rows older than 7 days.
+    idempotent: true,
+    sql: `
+      CREATE TABLE IF NOT EXISTS op_checkpoints (
+        op TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        completed_keys JSONB NOT NULL DEFAULT '[]'::jsonb,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (op, fingerprint)
+      );
+      CREATE INDEX IF NOT EXISTS op_checkpoints_updated_at_idx
+        ON op_checkpoints (updated_at);
+    `,
+  },
+  {
+    version: 76,
+    name: 'minion_jobs_doctor_run_id_index',
+    // v0.36+ autonomous-remediation wave (renumbered v68→v76 during master
+    // merge). Partial GIN on minion_jobs.data for `data ? 'doctor_run_id'`.
+    // Lets `gbrain doctor --remediate` runs be queried by run id for audit
+    // trail without sequential-scanning months of cron history. Partial so
+    // only doctor-submitted jobs are indexed; ordinary cron submissions
+    // don't bloat the index.
+    //
+    // PGLite skips via empty sqlFor — JSONB GIN partial indexes aren't
+    // supported the same way; audit query falls through to sequential
+    // scan, which is fine for PGLite's single-host scope.
+    idempotent: true,
+    sql: '',
+    sqlFor: {
+      postgres: `
+        CREATE INDEX IF NOT EXISTS minion_jobs_doctor_run_id_idx
+          ON minion_jobs USING GIN (data jsonb_path_ops)
+          WHERE data ? 'doctor_run_id';
+      `,
+      pglite: '',
+    },
+  },
+  {
+    version: 79,
+    name: 'pages_last_retrieved_at',
+    // v0.37.1.0 brainstorm/lsd wave (D15 + D11 + D12):
+    // Originally planned as v77 but v77 + v78 were claimed by the v0.37.0.0
+    // skillpack-registry + cross-modal waves landing on master first.
+    //
+    // Adds `pages.last_retrieved_at TIMESTAMPTZ NULL` — the real stale-page
+    // signal for `gbrain lsd`'s "your brain at 3am noticing what it forgot"
+    // mode. Bumped by op-layer write-back inside the `search` / `query` /
+    // `get_page` op handlers AFTER results return (NOT inside the engine
+    // methods — internal callers like sync / migrations / tests must not
+    // pollute the signal per codex round 2 #3).
+    //
+    // Full index, no partial WHERE per D12 + codex round 2 #6: LSD's primary
+    // query is `WHERE last_retrieved_at IS NULL OR last_retrieved_at < NOW()
+    // - INTERVAL '90 days'`. Postgres B-tree indexes handle NULL (sorted to
+    // one end), so one index supports both branches. A partial `WHERE NOT
+    // NULL` would miss LSD's prioritized never-retrieved branch.
+    //
+    // ADD COLUMN with no DEFAULT (NULL) is metadata-only on Postgres 11+
+    // and PGLite 17.5; instant on tables of any size.
+    idempotent: true,
+    sql: `
+      ALTER TABLE pages ADD COLUMN IF NOT EXISTS last_retrieved_at TIMESTAMPTZ NULL;
+      CREATE INDEX IF NOT EXISTS pages_last_retrieved_at_idx
+        ON pages (last_retrieved_at);
+    `,
+  },
+  {
+    version: 80,
+    name: 'takes_unresolvable_quality_v0_37_2_0',
+    // v0.37.2.0 hotfix — accepts quality='unresolvable' as a 4th valid
+    // resolution state. Unblocks production grading scripts that write the
+    // 4th verdict type (the judge in grade-takes returns
+    // correct|incorrect|partial|unresolvable, but v37's CHECKs only allowed
+    // the first three).
+    //
+    // Two CHECKs to widen:
+    //   (a) Table-level `takes_resolution_consistency` enumerates valid
+    //       (quality, outcome) pairs. We add ('unresolvable', NULL).
+    //   (b) Column-level CHECK on resolved_quality enumerates valid string
+    //       values. Postgres auto-names this `takes_resolved_quality_check`
+    //       when it's attached via ADD COLUMN ... CHECK. We drop it and
+    //       re-add with the wider value list (named explicitly this time
+    //       so future widening targets a known name).
+    //
+    // Existing rows with (NULL, NULL), ('correct', true), ('incorrect',
+    // false), ('partial', NULL) all satisfy both new CHECKs unchanged.
+    //
+    // ALTER TABLE ADD CONSTRAINT acquires AccessExclusiveLock while it
+    // validates existing rows. On a 36K-row takes table this is sub-second;
+    // larger tables would want NOT VALID + VALIDATE CONSTRAINT, deferred.
+    //
+    // Renumbered v74→v79→v80 during successive master merges: master's
+    // v0.36.1.0 calibration + v0.36.3.0 + autonomous-remediation claimed
+    // v68-v78, then v0.37.1.0 claimed v79.
+    idempotent: true,
+    sql: `
+      -- (b) Drop both possible names for the column-level CHECK:
+      -- v37's auto-generated takes_resolved_quality_check (Postgres default
+      -- for inline ADD COLUMN CHECK) and the explicit
+      -- takes_resolved_quality_values name we re-add below (idempotent on
+      -- re-run).
+      ALTER TABLE takes DROP CONSTRAINT IF EXISTS takes_resolved_quality_check;
+      ALTER TABLE takes DROP CONSTRAINT IF EXISTS takes_resolved_quality_values;
+      ALTER TABLE takes ADD CONSTRAINT takes_resolved_quality_values CHECK (
+        resolved_quality IS NULL
+        OR resolved_quality IN ('correct', 'incorrect', 'partial', 'unresolvable')
+      );
+
+      -- (a) Widen the (quality, outcome) consistency CHECK.
+      ALTER TABLE takes DROP CONSTRAINT IF EXISTS takes_resolution_consistency;
+      ALTER TABLE takes ADD CONSTRAINT takes_resolution_consistency CHECK (
+        (resolved_quality IS NULL             AND resolved_outcome IS NULL)
+        OR (resolved_quality = 'correct'      AND resolved_outcome = true)
+        OR (resolved_quality = 'incorrect'    AND resolved_outcome = false)
+        OR (resolved_quality = 'partial'      AND resolved_outcome IS NULL)
+        OR (resolved_quality = 'unresolvable' AND resolved_outcome IS NULL)
+      );
+    `,
   },
 ];
 

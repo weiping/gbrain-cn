@@ -4,11 +4,25 @@ import { LATEST_VERSION, getIdleBlockers } from '../core/migrate.ts';
 import { checkResolvable } from '../core/check-resolvable.ts';
 import { autoFixDryViolations, type AutoFixReport, type FixOutcome } from '../core/dry-fix.ts';
 import { autoDetectSkillsDirReadOnly } from '../core/repo-root.ts';
+import { loadOrDeriveManifest } from '../core/skill-manifest.ts';
+import { parseSkillFrontmatter } from '../core/skill-frontmatter.ts';
+import {
+  analyzeSkillBrainFirst,
+  buildBrainFirstSummaryLine,
+  type BrainFirstAnalysis,
+} from '../core/skill-brain-first.ts';
+import {
+  loadSnapshot,
+  writeSnapshotAtomically,
+  diffAgainstSnapshot,
+  appendAuditEventsForTransitions,
+} from '../core/audit-skill-brain-first.ts';
 import { loadCompletedMigrations } from '../core/preferences.ts';
 import { compareVersions } from './migrations/index.ts';
 import { createProgress, startHeartbeat, type ProgressReporter } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
 import type { DbUrlSource } from '../core/config.ts';
+import { gbrainPath } from '../core/config.ts';
 import { dirname, isAbsolute, join, resolve as resolvePath } from 'path';
 import { fileURLToPath } from 'url';
 import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
@@ -18,6 +32,26 @@ export interface Check {
   status: 'ok' | 'warn' | 'fail';
   message: string;
   issues?: Array<{ type: string; skill: string; action: string; fix?: any }>;
+  /**
+   * v0.36+ brain-health-100: structured remediation jobs per check.
+   * Populated by the recommendation generator; consumed by
+   * `gbrain doctor --remediation-plan` / `--remediate`. Optional and
+   * additive — schema_version stays at 2 (D4).
+   */
+  remediation?: Array<{
+    id: string;
+    job: string;
+    params: Record<string, unknown>;
+    idempotency_key: string;
+    severity: 'critical' | 'high' | 'medium' | 'low';
+    est_seconds: number;
+    est_usd_cost?: number;
+    depends_on?: string[];
+    rationale: string;
+    protected?: boolean;
+  }>;
+  /** Top-level triage state per D13. */
+  remediation_status?: 'remediable' | 'human_only' | 'blocked';
 }
 
 /**
@@ -552,6 +586,13 @@ export async function doctorReportRemote(engine: BrainEngine): Promise<DoctorRep
   // things when reranker is on vs off.
   checks.push(await checkRerankerHealth(engine));
 
+  // 9b. v0.37.0 brainstorm_health: surfaces three brainstorm/lsd readiness
+  // signals: (a) migration v79 applied (last_retrieved_at column exists),
+  // (b) calibration cold-start status (active_bias_tags empty), (c)
+  // search.track_retrieval enabled/disabled. Each surfaces a paste-ready
+  // fix hint.
+  checks.push(await checkBrainstormHealth(engine));
+
   // 10. v0.36.1.0 Hindsight calibration wave (T12) — four new checks:
   //   - abandoned_threads: high-conviction takes never revisited
   //   - calibration_freshness: profile is older than 7 days
@@ -812,6 +853,112 @@ export async function checkRerankerHealth(engine: BrainEngine): Promise<Check> {
       name: 'reranker_health',
       status: 'warn',
       message: `Could not check reranker audit: ${msg}`,
+    };
+  }
+}
+
+/**
+ * v0.37.0 brainstorm_health doctor check.
+ *
+ * Surfaces three readiness signals for `gbrain brainstorm` / `gbrain lsd`:
+ *
+ *   1. Migration v79 applied — the `pages.last_retrieved_at` column exists.
+ *      If missing, LSD's stale-page signal degrades silently (corpus-sampling
+ *      fallback only). Fix: `gbrain apply-migrations --yes`.
+ *
+ *   2. search.track_retrieval — when explicitly off, LSD never accumulates
+ *      stale signal (every page stays at NULL last_retrieved_at). Default-on
+ *      is fine; explicit-off is a warning so the user notices the setting.
+ *      Fix: `gbrain config set search.track_retrieval true`.
+ *
+ *   3. Calibration cold-start — the latest calibration profile has empty
+ *      `active_bias_tags`. brainstorm + LSD judge fall back to no-anti-bias
+ *      mode with a stderr warning at run time; this surfaces it earlier.
+ *      Fix: `gbrain calibration --regenerate` once enough takes are resolved.
+ *
+ * Returns the FIRST non-ok signal as the status — column-missing dominates,
+ * then disabled-tracking, then cold-start. All three are non-blocking warnings;
+ * brainstorm + LSD still work, just with degraded signal.
+ */
+export async function checkBrainstormHealth(engine: BrainEngine): Promise<Check> {
+  // (1) Column probe — fast, single-query.
+  try {
+    const probeRows = await engine.executeRaw<{ exists: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM information_schema.columns
+         WHERE table_name = 'pages' AND column_name = 'last_retrieved_at'
+       ) AS exists`,
+      []
+    );
+    const columnPresent = probeRows[0]?.exists === true;
+    if (!columnPresent) {
+      return {
+        name: 'brainstorm_health',
+        status: 'warn',
+        message: `pages.last_retrieved_at column missing. LSD stale-bias degraded to corpus-sampling. Fix: \`gbrain apply-migrations --yes\``,
+      };
+    }
+  } catch (e) {
+    // Information schema may not be queryable on every engine variant.
+    // Don't fail the doctor over this — degrade to skip.
+    const msg = e instanceof Error ? e.message : String(e);
+    return {
+      name: 'brainstorm_health',
+      status: 'warn',
+      message: `Could not probe pages.last_retrieved_at (${msg}); brainstorm/lsd may run with degraded signal.`,
+    };
+  }
+
+  // (2) search.track_retrieval — explicit-off surfaces as a warning.
+  try {
+    const trackCfg = await engine.getConfig('search.track_retrieval');
+    if (trackCfg === 'false' || trackCfg === '0' || trackCfg === 'off' || trackCfg === 'no') {
+      return {
+        name: 'brainstorm_health',
+        status: 'warn',
+        message: `search.track_retrieval is explicitly off — LSD's stale-page signal never accumulates. Fix: \`gbrain config set search.track_retrieval true\` (or accept and use brainstorm only).`,
+      };
+    }
+  } catch {
+    // Config read miss is benign; default-on applies.
+  }
+
+  // (3) Calibration cold-start — empty active_bias_tags.
+  try {
+    const calibRows = await engine.executeRaw<{ active_bias_tags: string[] | null }>(
+      `SELECT active_bias_tags
+         FROM calibration_profiles
+         ORDER BY generated_at DESC
+         LIMIT 1`,
+      []
+    );
+    if (calibRows.length === 0) {
+      return {
+        name: 'brainstorm_health',
+        status: 'ok',
+        message: `Migration v79 applied; tracking enabled. Calibration profile not yet generated — brainstorm/lsd will run unbiased until enough takes are resolved.`,
+      };
+    }
+    const tags = calibRows[0].active_bias_tags;
+    if (!Array.isArray(tags) || tags.length === 0) {
+      return {
+        name: 'brainstorm_health',
+        status: 'ok',
+        message: `Migration v79 applied; tracking enabled. Calibration cold-start (no active_bias_tags) — judge runs unbiased. Fix when ready: \`gbrain calibration --regenerate\`.`,
+      };
+    }
+    return {
+      name: 'brainstorm_health',
+      status: 'ok',
+      message: `Migration v79 applied; tracking enabled; calibration profile with ${tags.length} bias tag(s) loaded.`,
+    };
+  } catch {
+    // Pre-v0.36.1 brain (no calibration_profiles table). Brainstorm/lsd still
+    // work without anti-bias context — orchestrator stderr-warns at run time.
+    return {
+      name: 'brainstorm_health',
+      status: 'ok',
+      message: `Migration v79 applied; tracking enabled. calibration_profiles table missing (pre-v0.36.1 brain) — judge runs unbiased.`,
     };
   }
 }
@@ -1332,6 +1479,21 @@ export async function runDoctor(engine: BrainEngine | null, args: string[], dbSo
     checks.push(conformanceResult);
   }
 
+  // 2b. Skill brain-first compliance (v0.36.x, supersedes PR #1206).
+  // Scans every SKILL.md for external-lookup tools (web_search, exa,
+  // perplexity, etc.) and warns when the skill doesn't declare
+  // `brain_first: exempt` AND doesn't carry a canonical Convention
+  // callout / Phase 1 brain heading / position-relative brain-first
+  // reference. Motivated by the 2026-05-19 tweet-shield incident.
+  //
+  // Audit trail: snapshot+diff at ~/.gbrain/audit/skill-brain-first-
+  // snapshot.json. Writes one detected/resolved JSONL line per state
+  // transition + one fixed line per applied --fix. Stable brain → zero
+  // audit writes per doctor run.
+  if (skillsDir) {
+    checks.push(skillBrainFirstCheck(skillsDir));
+  }
+
   // 3. Half-migrated Minions detection (filesystem-only).
   // If completed.jsonl has any status:"partial" entry with no later
   // status:"complete" for the same version, the install is mid-migration.
@@ -1612,6 +1774,69 @@ export async function runDoctor(engine: BrainEngine | null, args: string[], dbSo
     }
   } catch {
     // Best-effort; audit-log read failure shouldn't stop doctor.
+  }
+
+  // 3e. home_dir_in_worktree (v0.35.8.0). Walks up from `gbrainPath()`
+  // looking for a `.git` directory OR file. If found, warns: `~/.gbrain/`
+  // lives inside a git worktree, so an accidental `git add` from the
+  // worktree root could stage the brain. Pairs with the retroactive
+  // `~/.gbrain/.gitignore` (single-line `*`) laid down by saveConfig +
+  // post-upgrade. Honest scope: the .gitignore covers casual `git add`
+  // but NOT already-tracked files, screenshots, backups, or `git add -f`.
+  //
+  // Walk termination: stops at $HOME (don't keep walking into / on a user
+  // who set GBRAIN_HOME=/tmp/something). Handles `.git` as both a directory
+  // (main repo) and a file (linked worktree pointing at parent's worktrees/).
+  // Honors GBRAIN_HOME via gbrainPath().
+  try {
+    const gbrainHome = gbrainPath();
+    const home = process.env.HOME || '';
+    let worktreeRoot: string | null = null;
+    if (gbrainHome && home && gbrainHome.startsWith(home + '/')) {
+      // Walk up from gbrainHome's parent toward $HOME, stopping at $HOME.
+      // We don't check gbrainHome itself: a `.git` directly inside ~/.gbrain
+      // isn't a containing-worktree, it would be a brain repo cloned there.
+      let cur = dirname(gbrainHome);
+      while (cur && cur.length >= home.length) {
+        const gitPath = join(cur, '.git');
+        try {
+          const st = statSync(gitPath);
+          // Either a directory (main repo) or a file (linked worktree pointer).
+          if (st.isDirectory() || st.isFile()) {
+            worktreeRoot = cur;
+            break;
+          }
+        } catch {
+          // No .git at this level; continue.
+        }
+        if (cur === home) break;
+        const parent = dirname(cur);
+        if (parent === cur) break;
+        cur = parent;
+      }
+    }
+    if (worktreeRoot) {
+      const homeEnvHint = process.env.GBRAIN_HOME
+        ? `# Or move \`~/.gbrain\` outside the worktree by setting GBRAIN_HOME elsewhere.`
+        : `# Fix: \`export GBRAIN_HOME=/some/path/outside/the/worktree\` (gbrain appends \`.gbrain\`).`;
+      checks.push({
+        name: 'home_dir_in_worktree',
+        status: 'warn',
+        message:
+          `~/.gbrain lives inside git worktree at ${worktreeRoot}. ` +
+          `Config + brain DB could be committed by accident. ` +
+          `A retroactive ~/.gbrain/.gitignore blocks casual \`git add\`, but does NOT cover ` +
+          `already-tracked files, screenshots, backups, or \`git add -f\`. ${homeEnvHint}`,
+      });
+    } else {
+      checks.push({
+        name: 'home_dir_in_worktree',
+        status: 'ok',
+        message: 'gbrain home is outside any enclosing git worktree.',
+      });
+    }
+  } catch {
+    // Best-effort filesystem-hygiene check; never block doctor.
   }
 
   // 3b-multi-source. Multi-source drift (v0.31.8 — D8 + D17 + OV12 + OV13).
@@ -2437,6 +2662,124 @@ export async function runDoctor(engine: BrainEngine | null, args: string[], dbSo
   progress.heartbeat('whoknows_health');
   checks.push(await whoknowsHealthCheck(engine));
 
+  // v0.36 cross-modal wave: modality column cleanup.
+  //
+  // Historical brains that imported image assets before v0.27.1's
+  // `modality='image'` default-set may have image chunks where
+  // embedding_image is populated but modality wasn't tagged. The cross-modal
+  // search routing in v0.36 depends on `modality` for keyword filtering;
+  // surface the gap so operators can run `gbrain backfill modality`.
+  progress.heartbeat('cross_modal_modality_backfill');
+  try {
+    const mismatchRows = await engine.executeRaw<{ count: string | number }>(
+      `SELECT COUNT(*)::text AS count FROM content_chunks
+       WHERE embedding_image IS NOT NULL
+         AND chunk_source = 'image_asset'
+         AND (modality IS NULL OR modality != 'image')`,
+    );
+    const mismatch = parseInt(String(mismatchRows[0]?.count ?? '0'), 10);
+    if (mismatch === 0) {
+      checks.push({
+        name: 'cross_modal_modality_backfill',
+        status: 'ok',
+        message: 'All image-asset chunks have modality=image',
+      });
+    } else {
+      checks.push({
+        name: 'cross_modal_modality_backfill',
+        status: 'warn',
+        message:
+          `${mismatch} image-asset chunk(s) have embedding_image populated but modality != 'image'. ` +
+          `Fix: \`gbrain backfill modality\``,
+      });
+    }
+  } catch {
+    // Engine probably doesn't have the modality column (pre-v0.27.1 brain) —
+    // skip silently. Auto-migration will land it on next upgrade.
+    checks.push({
+      name: 'cross_modal_modality_backfill',
+      status: 'ok',
+      message: 'modality column not present (pre-v0.27.1 brain); skipped',
+    });
+  }
+
+  // v0.36 Phase 3 — unified_multimodal coverage (D21 source-aware).
+  //
+  // Only meaningful when search.unified_multimodal is on. Reports the
+  // percentage of content_chunks with embedding_multimodal populated.
+  // Source-aware: a global 95% can hide 0% coverage for a specific source.
+  progress.heartbeat('unified_multimodal_coverage');
+  try {
+    const unifiedFlag = await engine.getConfig('search.unified_multimodal').catch(() => null);
+    const unifiedOnlyFlag = await engine.getConfig('search.unified_multimodal_only').catch(() => null);
+    const unifiedOn = unifiedFlag === 'true' || unifiedFlag === '1';
+    const unifiedOnlyOn = unifiedOnlyFlag === 'true' || unifiedOnlyFlag === '1';
+
+    if (!unifiedOn) {
+      checks.push({
+        name: 'unified_multimodal_coverage',
+        status: 'ok',
+        message: 'search.unified_multimodal is off; coverage check N/A',
+      });
+    } else {
+      // D21 source-aware: report per-source coverage so multi-source brains
+      // can't hide 0% on one source behind a high global average.
+      const rows = await engine.executeRaw<{ source_id: string | null; total: string; covered: string }>(
+        `SELECT
+           COALESCE(p.source_id, 'default') AS source_id,
+           COUNT(*)::text AS total,
+           SUM(CASE WHEN cc.embedding_multimodal IS NOT NULL THEN 1 ELSE 0 END)::text AS covered
+         FROM content_chunks cc
+         JOIN pages p ON p.id = cc.page_id
+         GROUP BY p.source_id`,
+      );
+      const perSource = rows.map(r => ({
+        source: r.source_id || 'default',
+        total: parseInt(String(r.total), 10),
+        covered: parseInt(String(r.covered), 10),
+      }));
+      const lowestCoverage = perSource.reduce(
+        (acc, r) => Math.min(acc, r.total > 0 ? r.covered / r.total : 1),
+        1,
+      );
+      const summary = perSource.map(r => {
+        const pct = r.total > 0 ? Math.round((r.covered / r.total) * 100) : 0;
+        return `${r.source}:${pct}%`;
+      }).join(', ');
+
+      if (unifiedOnlyOn && lowestCoverage < 0.99) {
+        checks.push({
+          name: 'unified_multimodal_coverage',
+          status: 'fail',
+          message:
+            `unified_multimodal_only is ON but lowest source coverage is ${(lowestCoverage * 100).toFixed(1)}% (${summary}). ` +
+            `Run \`gbrain reindex --multimodal\` to bring coverage to 99%+ or disable strict mode.`,
+        });
+      } else if (lowestCoverage < 0.95) {
+        checks.push({
+          name: 'unified_multimodal_coverage',
+          status: 'warn',
+          message:
+            `unified_multimodal is on but lowest source coverage is ${(lowestCoverage * 100).toFixed(1)}% (${summary}). ` +
+            `Run \`gbrain reindex --multimodal\` to fill the gap.`,
+        });
+      } else {
+        checks.push({
+          name: 'unified_multimodal_coverage',
+          status: 'ok',
+          message: `unified_multimodal coverage: ${summary}`,
+        });
+      }
+    }
+  } catch {
+    // Column probably not present (pre-v0.36 brain pre-migration); skip silently.
+    checks.push({
+      name: 'unified_multimodal_coverage',
+      status: 'ok',
+      message: 'embedding_multimodal column not present yet; skipped',
+    });
+  }
+
   // 11. Markdown body completeness (v0.12.3 reliability wave).
   // v0.12.0's splitBody ate everything after the first `---` horizontal rule,
   // truncating wiki-style pages. Heuristic: pages whose body is <30% of the
@@ -3191,6 +3534,9 @@ export async function runDoctor(engine: BrainEngine | null, args: string[], dbSo
     // v0.35.0.0+ reranker_health — read JSONL audit; warn on auth or volume.
     progress.heartbeat('reranker_health');
     checks.push(await checkRerankerHealth(engine));
+    // v0.37.0 brainstorm_health — migration v79, track_retrieval, calibration cold-start.
+    progress.heartbeat('brainstorm_health');
+    checks.push(await checkBrainstormHealth(engine));
     // v0.36.0.0 (A5): ZE embedding key health + schema/config width consistency.
     progress.heartbeat('ze_embedding_health');
     checks.push(await checkZeEmbeddingHealth(engine));
@@ -3290,6 +3636,149 @@ function checkSkillConformance(skillsDir: string): Check {
   }
 }
 
+/**
+ * v0.36.x skill_brain_first doctor check (supersedes PR #1206).
+ *
+ * Walks the skills manifest, runs the pure `analyzeSkillBrainFirst()`
+ * helper on each, surfaces violators with structured issues[]. Snapshot-
+ * diff against the previous run drives audit JSONL writes (transition-
+ * only) — stable brains produce zero audit churn per doctor invocation.
+ *
+ * Exit shape:
+ *   - 0 violators → status: 'ok', message: '<n> skills compliant or exempt'
+ *   - any violator → status: 'warn', message + per-skill summary lines +
+ *     formerly-EXEMPT_SKILLS hint when applicable (CMT1 replaces the
+ *     dropped upgrade migration with a guided opt-in)
+ *
+ * Test seam: pure function, no `process.exit`. Direct call from tests
+ * with a synthetic skills dir under tempdir.
+ */
+export function skillBrainFirstCheck(skillsDir: string): Check {
+  let manifest: ReturnType<typeof loadOrDeriveManifest>;
+  try {
+    manifest = loadOrDeriveManifest(skillsDir);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return {
+      name: 'skill_brain_first',
+      status: 'warn',
+      message: `Could not load skills manifest from ${skillsDir} (${msg})`,
+    };
+  }
+  if (manifest.skills.length === 0) {
+    return {
+      name: 'skill_brain_first',
+      status: 'ok',
+      message: 'No skills found — skill_brain_first not applicable',
+    };
+  }
+
+  const violators: BrainFirstAnalysis[] = [];
+  const typoSkills: BrainFirstAnalysis[] = [];
+
+  for (const entry of manifest.skills) {
+    const skillPath = join(skillsDir, entry.path);
+    if (!existsSync(skillPath)) continue; // resolver_health already reports
+    let content: string;
+    try {
+      content = readFileSync(skillPath, 'utf-8');
+    } catch {
+      continue; // best-effort; permissions etc.
+    }
+    const fm = parseSkillFrontmatter(content);
+    const result = analyzeSkillBrainFirst(content, entry.name, fm);
+    if (result.typo_hint) typoSkills.push(result);
+    if (result.status === 'warn') violators.push(result);
+  }
+
+  // --- Snapshot + diff audit (A2 contract) ---------------------------------
+  // Best-effort: snapshot/audit failures don't poison the check result.
+  const violatorSlugs = new Set(violators.map(v => v.skill));
+  const patternsBySlug = new Map<string, string[]>();
+  for (const v of violators) {
+    patternsBySlug.set(v.skill, v.external_patterns_matched);
+  }
+  let priorSnapshotPresent = true;
+  try {
+    const snapshot = loadSnapshot();
+    priorSnapshotPresent = snapshot.present;
+    const diff = diffAgainstSnapshot(violatorSlugs, snapshot.violators);
+    const doctorRunId = `${process.pid}-${Date.now()}`;
+    if (snapshot.present) {
+      // Steady-state path: write events only for transitions.
+      appendAuditEventsForTransitions(diff, patternsBySlug, doctorRunId);
+    } else {
+      // First run / corrupt snapshot: bootstrap by writing one
+      // `detected` line per current violator. This is the only path
+      // that writes more than `diff.added.length` lines in a single
+      // doctor invocation.
+      const bootstrapDiff = { added: Array.from(violatorSlugs).sort(), removed: [], unchanged: [] };
+      appendAuditEventsForTransitions(bootstrapDiff, patternsBySlug, doctorRunId);
+    }
+    writeSnapshotAtomically(violatorSlugs);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`[gbrain] skill_brain_first audit step failed (${msg}); check continues\n`);
+  }
+
+  // --- Build the check result ---------------------------------------------
+  if (violators.length === 0) {
+    const typoNote = typoSkills.length > 0
+      ? ` (note: ${typoSkills.length} skill(s) have brain_first typo hints: ${typoSkills.map(t => t.skill).join(', ')})`
+      : '';
+    return {
+      name: 'skill_brain_first',
+      status: 'ok',
+      message: `${manifest.skills.length} skill(s) compliant or exempt${typoNote}`,
+    };
+  }
+
+  // Sort for deterministic message + issues order.
+  violators.sort((a, b) => a.skill.localeCompare(b.skill));
+
+  const formerlyExempt = violators.filter(v => v.formerly_hardcoded_exempt);
+  const summary: string[] = [];
+  summary.push(
+    `${violators.length} skill(s) do external lookups without a brain-first compliance signal. ` +
+    `Fix via 'gbrain doctor --fix' (adds canonical Convention callout) ` +
+    `or set 'brain_first: exempt' in skill frontmatter for genuine infra skills.`,
+  );
+  if (formerlyExempt.length > 0) {
+    summary.push(
+      `Of these, ${formerlyExempt.length} were hardcoded-exempt in PR #1206 (${formerlyExempt.map(v => v.skill).slice(0, 6).join(', ')}${formerlyExempt.length > 6 ? ', ...' : ''}). ` +
+      `These need explicit opt-out now: run 'gbrain doctor --fix' to add the canonical callout, ` +
+      `or add 'brain_first: exempt' to frontmatter for skills that genuinely shouldn't consult the brain.`,
+    );
+  }
+  if (typoSkills.length > 0) {
+    summary.push(
+      `${typoSkills.length} skill(s) have brain_first typo hints: ` +
+      typoSkills.slice(0, 6).map(t => `${t.skill} — ${t.typo_hint}`).join('; ') +
+      (typoSkills.length > 6 ? '; ...' : ''),
+    );
+  }
+
+  return {
+    name: 'skill_brain_first',
+    status: 'warn',
+    message: summary.join(' '),
+    issues: violators.map(v => ({
+      type: 'skill_missing_brain_first',
+      skill: v.skill,
+      action: v.formerly_hardcoded_exempt
+        ? `Add canonical Convention callout OR set 'brain_first: exempt' (was hardcoded-exempt in PR #1206)`
+        : `Add canonical Convention callout OR set 'brain_first: exempt'`,
+      fix: {
+        kind: 'add-convention-callout',
+        external_patterns: v.external_patterns_matched,
+        typo_hint: v.typo_hint,
+        formerly_hardcoded_exempt: v.formerly_hardcoded_exempt,
+        summary_line: buildBrainFirstSummaryLine(v),
+      },
+    })),
+  };
+}
+
 function outputResults(checks: Check[], json: boolean): boolean {
   const hasFail = checks.some(c => c.status === 'fail');
   const hasWarn = checks.some(c => c.status === 'warn');
@@ -3384,4 +3873,294 @@ async function runLocksCheck(engine: BrainEngine | null, jsonOutput: boolean): P
   console.log('These connections may block ALTER TABLE DDL during migration.');
   console.log('After terminating, retry: gbrain apply-migrations --yes');
   process.exit(1);
+}
+
+// ============================================================
+// v0.36+ brain-health-100 wave: --remediation-plan + --remediate
+//
+// Plan: ~/.claude/plans/system-instruction-you-are-working-fluttering-ocean.md
+// Decisions: D1 (per-job re-eval), D3 (sequential submit),
+// D5 (depends_on cascade on failure), D7 (scoped recheck),
+// D9 (content-hash idempotency), D13 (three-state classification),
+// D14 (stable remediation_id), +A (cost-budget gate).
+// ============================================================
+
+/**
+ * Emit ordered Remediation list to drive brain to --target-score.
+ *
+ * Read-only — never enqueues, never mutates. The agent contract:
+ * inspect the plan with --remediation-plan --json before committing
+ * to --remediate. The JSON shape is stable; consumers that parse it
+ * can rely on it across releases.
+ */
+export async function runRemediationPlan(
+  engine: BrainEngine,
+  args: string[],
+): Promise<void> {
+  const { computeRecommendations, classifyChecks, maxReachableScore } =
+    await import('../core/brain-score-recommendations.ts');
+
+  const targetScore = parseIntFlag(args, '--target-score') ?? 90;
+  const jsonOutput = args.includes('--json');
+
+  // Cheap path (D7) — don't run slow doctor checks for the plan surface.
+  // The recommendation generator works from BrainHealth + context alone.
+  const health = await engine.getHealth();
+  const ctx = await loadRecommendationContext(engine);
+  const recs = computeRecommendations(health, ctx);
+  // Synthetic check list for classification — we don't need full doctor
+  // output, just the check names the recommendations care about.
+  const syntheticChecks = [
+    { name: 'brain_score', status: 'ok' as const },
+    { name: 'sync_freshness', status: 'ok' as const },
+    { name: 'missing_embeddings', status: 'ok' as const },
+    { name: 'dead_links', status: 'ok' as const },
+    { name: 'orphan_pages', status: 'ok' as const },
+  ];
+  const classifications = classifyChecks(syntheticChecks, ctx);
+  const ceiling = maxReachableScore(health, classifications);
+
+  const filteredRecs = recs.filter((r) => r.status === 'remediable');
+  const estTotalSeconds = filteredRecs.reduce((sum, r) => sum + r.est_seconds, 0);
+  const estTotalUsd = filteredRecs.reduce((sum, r) => sum + (r.est_usd_cost ?? 0), 0);
+
+  const blocked = classifications
+    .filter((c) => c.status === 'blocked')
+    .map((c) => ({ check: c.check, reason: c.reason ?? 'prerequisite missing' }));
+
+  const plan = {
+    schema_version: 2,
+    brain_score_current: health.brain_score,
+    brain_score_target: targetScore,
+    max_reachable_score: ceiling,
+    target_unreachable: targetScore > ceiling,
+    plan: filteredRecs.map((r, i) => ({ step: i + 1, ...r })),
+    est_total_seconds: estTotalSeconds,
+    est_total_usd_cost: Number(estTotalUsd.toFixed(2)),
+    blocked,
+  };
+
+  if (jsonOutput) {
+    console.log(JSON.stringify(plan, null, 2));
+    return;
+  }
+
+  // Human output
+  console.log(`Brain score: ${health.brain_score}/100 → target ${targetScore}`);
+  if (plan.target_unreachable) {
+    console.log(`Target unreachable: max with autonomous remediation is ${ceiling}/100.`);
+  }
+  if (plan.plan.length === 0) {
+    console.log('No remediations needed. Brain is at target.');
+  } else {
+    console.log(`Plan: ${plan.plan.length} step(s), est ${plan.est_total_seconds}s, est $${plan.est_total_usd_cost.toFixed(2)}`);
+    for (const step of plan.plan) {
+      const protectedMark = step.protected ? ' [PROTECTED]' : '';
+      const costMark = step.est_usd_cost ? ` ($${step.est_usd_cost.toFixed(2)})` : '';
+      console.log(`  ${step.step}. [${step.severity}] ${step.job}${protectedMark} — ${step.rationale}${costMark}`);
+    }
+  }
+  if (blocked.length > 0) {
+    console.log(`\nBlocked checks (prereq missing):`);
+    for (const b of blocked) {
+      console.log(`  - ${b.check}: ${b.reason}`);
+    }
+  }
+}
+
+/**
+ * Submit ordered Remediation jobs sequentially per D3, with D5 cascade
+ * on failure and D7 scoped recheck between steps.
+ *
+ * Default behavior: submit-and-wait per step. --dry-run skips submission.
+ * --max-usd N refuses if est_total_usd_cost > N. --max-jobs N caps the
+ * inner loop.
+ *
+ * PGLite path: synchronous in-process execution (no durable queue).
+ */
+export async function runRemediate(
+  engine: BrainEngine,
+  args: string[],
+): Promise<void> {
+  const targetScore = parseIntFlag(args, '--target-score') ?? 90;
+  const maxJobs = parseIntFlag(args, '--max-jobs') ?? Infinity;
+  const maxUsd = parseFloatFlag(args, '--max-usd');
+  const dryRun = args.includes('--dry-run');
+  const skipConfirm = args.includes('--yes');
+  const jsonOutput = args.includes('--json');
+
+  const { computeRecommendations, classifyChecks, maxReachableScore } =
+    await import('../core/brain-score-recommendations.ts');
+
+  const ctx = await loadRecommendationContext(engine);
+
+  // Pre-flight ceiling check (D13)
+  const initialHealth = await engine.getHealth();
+  const syntheticChecks = [
+    { name: 'brain_score', status: 'ok' as const },
+    { name: 'sync_freshness', status: 'ok' as const },
+    { name: 'missing_embeddings', status: 'ok' as const },
+    { name: 'dead_links', status: 'ok' as const },
+    { name: 'orphan_pages', status: 'ok' as const },
+  ];
+  const classifications = classifyChecks(syntheticChecks, ctx);
+  const ceiling = maxReachableScore(initialHealth, classifications);
+  if (targetScore > ceiling) {
+    console.error(
+      `[remediate] target ${targetScore} unreachable; max autonomous = ${ceiling}/100. ` +
+      `Configure missing prereqs (see --remediation-plan blocked output) or lower --target-score.`,
+    );
+    process.exit(2);
+  }
+
+  // Initial plan
+  let recs = computeRecommendations(initialHealth, ctx).filter((r) => r.status === 'remediable');
+  if (recs.length === 0) {
+    console.log(`Brain at score ${initialHealth.brain_score}/100, target ${targetScore}. Nothing to do.`);
+    return;
+  }
+
+  const estTotalUsd = recs.reduce((sum, r) => sum + (r.est_usd_cost ?? 0), 0);
+  if (maxUsd !== null && estTotalUsd > maxUsd) {
+    console.error(
+      `[remediate] est cost $${estTotalUsd.toFixed(2)} exceeds --max-usd $${maxUsd.toFixed(2)}. Aborting.`,
+    );
+    process.exit(2);
+  }
+
+  if (!skipConfirm && process.stdout.isTTY) {
+    console.log(`About to submit ${recs.length} job(s), est ${Math.round(recs.reduce((s, r) => s + r.est_seconds, 0))}s, est $${estTotalUsd.toFixed(2)}`);
+    console.log('Pass --yes to proceed (cron-friendly).');
+    process.exit(1);
+  }
+
+  if (dryRun) {
+    console.log(`[remediate --dry-run] Would submit ${recs.length} jobs:`);
+    for (const r of recs) console.log(`  - ${r.id} (${r.job})`);
+    return;
+  }
+
+  // Sequential submit per D3, with D5 cascade on failure and D7
+  // scoped recheck between steps.
+  const submitted: Array<{ step: number; id: string; job_id: number | null; status: string }> = [];
+  const abortedIds = new Set<string>();
+  const doctorRunId = crypto.randomUUID();
+
+  const isPGLite = engine.kind === 'pglite';
+  if (isPGLite) {
+    console.error('[remediate] PGLite engine: running inline (no durable queue).');
+  }
+
+  const { MinionQueue } = await import('../core/minions/queue.ts');
+  const { waitForCompletion } = await import('../core/minions/wait-for-completion.ts');
+  const queue = new MinionQueue(engine);
+
+  let stepCount = 0;
+  while (recs.length > 0 && stepCount < maxJobs) {
+    const step = recs[0];
+    if (!step) break;
+    stepCount++;
+
+    // D5: if depends_on intersects aborted, skip + cascade
+    if (step.depends_on && step.depends_on.some((d) => abortedIds.has(d))) {
+      submitted.push({ step: stepCount, id: step.id, job_id: null, status: 'skipped_dep_aborted' });
+      abortedIds.add(step.id);
+      recs.shift();
+      continue;
+    }
+
+    try {
+      const isProtected = !!step.protected;
+      const job = await queue.add(
+        step.job,
+        { ...step.params, doctor_run_id: doctorRunId },
+        {
+          queue: 'default',
+          idempotency_key: step.idempotency_key,
+          max_attempts: 2,
+          maxWaiting: 1,
+        },
+        isProtected ? { allowProtectedSubmit: true } : undefined,
+      );
+      submitted.push({ step: stepCount, id: step.id, job_id: job.id, status: 'submitted' });
+
+      // Wait for terminal state. PGLite is in-process — short poll.
+      const terminal = await waitForCompletion(queue, job.id, {
+        pollMs: isPGLite ? 250 : 1000,
+        timeoutMs: (step.est_seconds + 60) * 1000,
+      });
+      const lastSub = submitted[submitted.length - 1];
+      if (lastSub) lastSub.status = terminal.status;
+
+      if (terminal.status !== 'completed') {
+        abortedIds.add(step.id);
+      }
+    } catch (e) {
+      submitted.push({
+        step: stepCount, id: step.id, job_id: null,
+        status: `error: ${(e as Error).message.slice(0, 100)}`,
+      });
+      abortedIds.add(step.id);
+    }
+
+    recs.shift();
+    // D7: scoped recheck — re-compute plan from fresh health snapshot.
+    // The next plan may drop completed steps and re-introduce failed
+    // steps with bumped retry suffix (D1).
+    if (recs.length === 0 || stepCount >= maxJobs) break;
+    const freshHealth = await engine.getHealth();
+    recs = computeRecommendations(freshHealth, ctx).filter((r) => r.status === 'remediable');
+  }
+
+  const finalHealth = await engine.getHealth();
+  const result = {
+    doctor_run_id: doctorRunId,
+    brain_score_initial: initialHealth.brain_score,
+    brain_score_final: finalHealth.brain_score,
+    brain_score_target: targetScore,
+    target_reached: finalHealth.brain_score >= targetScore,
+    submitted,
+    aborted_count: abortedIds.size,
+  };
+
+  if (jsonOutput) {
+    console.log(JSON.stringify(result, null, 2));
+  } else {
+    console.log(`\nBrain score: ${initialHealth.brain_score} → ${finalHealth.brain_score} (target ${targetScore})`);
+    console.log(`Submitted: ${submitted.length} job(s), ${abortedIds.size} aborted/failed`);
+  }
+
+  const anyFailed = submitted.some((s) => s.status !== 'completed' && s.status !== 'submitted');
+  if (anyFailed) process.exit(1);
+}
+
+/**
+ * Build RecommendationContext from engine + config.
+ * Pure read; no side effects.
+ */
+async function loadRecommendationContext(engine: BrainEngine) {
+  const repoPath = await engine.getConfig('sync.repo_path');
+  const embeddingModel = await engine.getConfig('embedding_model');
+  const embeddingDimensions = await engine.getConfig('embedding_dimensions');
+  return {
+    repoPath: repoPath ?? undefined,
+    embeddingModel: embeddingModel ?? undefined,
+    embeddingDimensions: embeddingDimensions ? Number(embeddingDimensions) : undefined,
+    hasEmbeddingApiKey: !!(process.env.OPENAI_API_KEY || await engine.getConfig('openai_api_key')),
+    hasChatApiKey: !!(process.env.ANTHROPIC_API_KEY || await engine.getConfig('anthropic_api_key')),
+  };
+}
+
+function parseIntFlag(args: string[], flag: string): number | null {
+  const i = args.indexOf(flag);
+  if (i === -1 || i === args.length - 1) return null;
+  const v = parseInt(args[i + 1] ?? '', 10);
+  return isNaN(v) ? null : v;
+}
+
+function parseFloatFlag(args: string[], flag: string): number | null {
+  const i = args.indexOf(flag);
+  if (i === -1 || i === args.length - 1) return null;
+  const v = parseFloat(args[i + 1] ?? '');
+  return isNaN(v) ? null : v;
 }
