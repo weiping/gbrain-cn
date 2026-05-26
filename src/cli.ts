@@ -1645,6 +1645,7 @@ export function buildGatewayConfig(c: GBrainConfig): AIGatewayConfig {
   // server launch — users running both will have two llama-server processes
   // on different ports.
   if (process.env.LLAMA_SERVER_RERANKER_BASE_URL) envBaseUrls['llama-server-reranker'] = process.env.LLAMA_SERVER_RERANKER_BASE_URL;
+  if (process.env.ZHIPUAI_BASE_URL) envBaseUrls['zhipu'] = process.env.ZHIPUAI_BASE_URL;
   if (process.env.OLLAMA_BASE_URL) envBaseUrls['ollama'] = process.env.OLLAMA_BASE_URL;
   if (process.env.LMSTUDIO_BASE_URL) envBaseUrls['lmstudio'] = process.env.LMSTUDIO_BASE_URL;
   if (process.env.LITELLM_BASE_URL) envBaseUrls['litellm'] = process.env.LITELLM_BASE_URL;
