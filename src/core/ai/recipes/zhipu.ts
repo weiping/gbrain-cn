@@ -27,7 +27,7 @@ export const zhipu: Recipe = {
     embedding: {
       models: ['embedding-3', 'embedding-2'],
       default_dims: 1024,
-      dims_options: [256, 512, 1024, 2048],
+      dims_options: [512, 1024, 1536, 2048],
       cost_per_1m_tokens_usd: 0.02,
       price_last_verified: '2026-04-22',
       max_batch_tokens: 8000,
@@ -35,7 +35,7 @@ export const zhipu: Recipe = {
       safety_factor: 0.7,
     },
     chat: {
-      models: ['glm-4', 'glm-4-flash', 'glm-4-plus', 'glm-4-air', 'glm-4.7'],
+      models: ['glm-4.6', 'glm-4.7'],
       supports_tools: true,
       supports_subagent_loop: true,
       supports_prompt_cache: false,
@@ -45,7 +45,7 @@ export const zhipu: Recipe = {
       price_last_verified: '2026-04-22',
     },
     expansion: {
-      models: ['glm-4-flash', 'glm-4.7'],
+      models: ['glm-4.6', 'glm-4.7'],
       cost_per_1m_tokens_usd: 0.5,
       price_last_verified: '2026-04-22',
     },

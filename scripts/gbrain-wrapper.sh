@@ -1,3 +1,5 @@
 #!/bin/bash
 # GBrain wrapper script - avoids PGLite WASM path issues
-cd ~/.bun/install/global/node_modules/gbrain && exec bun run src/cli.ts "$@"
+# Runs from the local development directory so Bun auto-loads .env
+GBRAIN_DIR="/Users/liuweiping/gbrain"
+cd "$GBRAIN_DIR" && exec bun run src/cli.ts "$@"
