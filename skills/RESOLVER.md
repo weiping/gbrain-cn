@@ -16,6 +16,7 @@ This is the dispatcher. Skills are the implementation. **Read the skill file bef
 | "What do we know about", "tell me about", "search for", "who is", "background on", "notes on" | `skills/query/SKILL.md` |
 | "Who knows who", "relationship between", "connections", "graph query" | `skills/query/SKILL.md` (use graph-query) |
 | Creating/enriching a person or company page | `skills/enrich/SKILL.md` |
+| Backfill page.type, find untyped pages | `skills/brain-taxonomist/SKILL.md` |
 | Where does a new file go? Filing rules | `skills/repo-architecture/SKILL.md` |
 | "where does this brain page go", "file this in the brain", "brain taxonomist", "taxonomy check", "refile brain page", "which directory does this page go" | `skills/brain-taxonomist/SKILL.md` |
 | "EIIRP", "everything in its right place", "store this research", "put this in the brain", "make this re-doable", "DRY this up", "file all of this", "organize all of this work", "archive this research thread" | `skills/eiirp/SKILL.md` |
@@ -36,6 +37,7 @@ This is the dispatcher. Skills are the implementation. **Read the skill file bef
 | "watch this video", "process this YouTube link", "ingest this PDF", "save this podcast", "process this book", "summarize this book", "PDF book", "ingest it into my brain", "what's in this screenshot", "check out this repo" | `skills/media-ingest/SKILL.md` |
 | Meeting transcript received | `skills/meeting-ingestion/SKILL.md` |
 | Generic "ingest this" (auto-routes to above) | `skills/ingest/SKILL.md` |
+| "capture this", "save this thought", "remember this" | `skills/capture/SKILL.md` |
 
 ## Thinking skills (from GStack)
 
@@ -78,7 +80,9 @@ This is the dispatcher. Skills are the implementation. **Read the skill file bef
 | "Now what?", "fill my brain", "cold start", "bootstrap", "import my data", "what should I import first" | `skills/cold-start/SKILL.md` |
 | "Migrate from Obsidian/Notion/Logseq" | `skills/migrate/SKILL.md` |
 | Brain health check, maintenance run | `skills/maintain/SKILL.md` |
+| Evolve brain schema, add/remove page types | `skills/schema-author/SKILL.md` |
 | "Extract links", "build link graph", "populate timeline" | `skills/maintain/SKILL.md` (extraction sections) |
+| "everything in its right place", "eiirp", "organize all of this" | `skills/eiirp/SKILL.md` |
 | "Run dream", "process today's session", "synthesize my conversations", "consolidate yesterday's conversations", "what patterns did you see", "did the dream cycle run" | `skills/maintain/SKILL.md` (dream cycle section) |
 | "Brain health", "what features am I missing", "brain score" | Run `gbrain features --json` |
 | "Set up autopilot", "run brain maintenance", "keep brain updated" | Run `gbrain autopilot --install --repo ~/brain` |

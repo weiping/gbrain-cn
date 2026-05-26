@@ -1,12 +1,8 @@
 // v0.38 T7d: facts/eligibility pack-aware parity tests.
 //
 // Pins the contract that extractableTypesFromPack(gbrain-base) returns
-// the configured eligible set declared by gbrain-base.yaml. The pre-v0.38
-// `ELIGIBLE_TYPES` constant from src/core/facts/eligibility.ts was the
-// seed (note/meeting/slack/email/calendar-event/source/writing); v0.41.11
-// promotes concept + conversation into the same set as part of the
-// conversation retrieval upgrade. `atom` is explicitly pinned
-// non-extractable so a future drift fails loudly.
+// the pre-v0.38 ELIGIBLE_TYPES list from src/core/facts/eligibility.ts:
+//   ['note', 'meeting', 'slack', 'email', 'calendar-event', 'source', 'writing']
 
 import { describe, expect, test } from 'bun:test';
 import {
@@ -19,52 +15,28 @@ import { join } from 'node:path';
 
 const GBRAIN_BASE_PATH = join(import.meta.dir, '../src/core/schema-pack/base/gbrain-base.yaml');
 
-// Pre-v0.38 seed ELIGIBLE_TYPES from src/core/facts/eligibility.ts:51.
+// Pre-v0.38 ELIGIBLE_TYPES from src/core/facts/eligibility.ts:51
 const LEGACY_ELIGIBLE = ['note', 'meeting', 'slack', 'email', 'calendar-event', 'source', 'writing'];
 
-// v0.41.11+ additions: concept page bodies define concepts and routinely
-// contain claim-shaped statements; conversation pages carry the imported
-// chat history the batch facts extractor walks. Both flipped to
-// `extractable: true` in gbrain-base.yaml.
-const V0_41_11_ADDED_ELIGIBLE = ['concept', 'conversation'];
-const CURRENT_ELIGIBLE = [...LEGACY_ELIGIBLE, ...V0_41_11_ADDED_ELIGIBLE];
-
 describe('extractableTypesFromPack (T7d) — gbrain-base parity', () => {
-  test('gbrain-base extractable set matches the configured eligible list', () => {
+  test('gbrain-base extractable set matches legacy ELIGIBLE_TYPES exactly', () => {
     const pack = loadPackFromFile(GBRAIN_BASE_PATH);
     const extractable = extractableTypesFromPack(pack);
-    expect(extractable.size).toBe(CURRENT_ELIGIBLE.length);
-    for (const t of CURRENT_ELIGIBLE) {
-      expect(extractable.has(t)).toBe(true);
-    }
-    // Entity-shape + annotation-shape types stay non-extractable in gbrain-base.
-    // `atom` is annotation (and IS the extracted unit), so it must not
-    // be extractable itself — running the extractor on it would loop.
-    expect(extractable.has('person')).toBe(false);
-    expect(extractable.has('company')).toBe(false);
-    expect(extractable.has('deal')).toBe(false);
-    expect(extractable.has('synthesis')).toBe(false);
-    expect(extractable.has('atom')).toBe(false);
-  });
-
-  test('legacy seed types remain extractable (back-compat)', () => {
-    const pack = loadPackFromFile(GBRAIN_BASE_PATH);
-    const extractable = extractableTypesFromPack(pack);
+    expect(extractable.size).toBe(LEGACY_ELIGIBLE.length);
     for (const t of LEGACY_ELIGIBLE) {
       expect(extractable.has(t)).toBe(true);
     }
+    // None of the entity/concept-shape types are extractable in gbrain-base.
+    expect(extractable.has('person')).toBe(false);
+    expect(extractable.has('company')).toBe(false);
+    expect(extractable.has('deal')).toBe(false);
+    expect(extractable.has('concept')).toBe(false);
+    expect(extractable.has('synthesis')).toBe(false);
   });
 
-  test('v0.41.11 additions (concept + conversation) are extractable', () => {
+  test('isExtractableType per-type lookups match legacy', () => {
     const pack = loadPackFromFile(GBRAIN_BASE_PATH);
-    for (const t of V0_41_11_ADDED_ELIGIBLE) {
-      expect(isExtractableType(pack, t)).toBe(true);
-    }
-  });
-
-  test('isExtractableType per-type lookups match the configured set', () => {
-    const pack = loadPackFromFile(GBRAIN_BASE_PATH);
-    for (const t of CURRENT_ELIGIBLE) {
+    for (const t of LEGACY_ELIGIBLE) {
       expect(isExtractableType(pack, t)).toBe(true);
     }
     expect(isExtractableType(pack, 'person')).toBe(false);
