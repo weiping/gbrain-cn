@@ -1,4 +1,16 @@
 /**
+ * v0.41.13.0 T19 retrofit note: extract has TWO sources (fs walk + db
+ * walk) and TWO data kinds (links + timeline). Each combination has its
+ * own buffer-then-flush pattern at BATCH_SIZE. The
+ * `src/core/progressive-batch/` primitive's stage model is a poor fit
+ * here because (a) extraction is pure deterministic regex (no LLM cost
+ * to gate), (b) the cost-cap value-add lives at the embed step that
+ * follows extract, not at extract itself, and (c) wrapping 4 separate
+ * batch sites in the primitive would balloon the diff without
+ * observable operator value. Filed in TODOS.md as v0.41.14.0+ if the
+ * primitive's audit JSONL value justifies the ceremony. No code change
+ * in v0.41.13.0; cost-free extract continues as-is.
+ *
  * gbrain extract — Extract links and timeline entries from brain content.
  *
  * Two data sources:
@@ -32,6 +44,10 @@ import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts'
 import { pathToSlug, pruneDir, isSyncable } from '../core/sync.ts';
 import { isRetryableConnError } from '../core/retry-matcher.ts';
 import { buildGazetteer, findMentionedEntities } from '../core/by-mention.ts';
+// v0.41.15.0 (T7, D9): --workers N for the fs-walk inner loops via the
+// shared sliding-pool helper + PGLite-clamp wrapper.
+import { runSlidingPool } from '../core/worker-pool.ts';
+import { parseWorkers, resolveWorkersWithClamp } from '../core/sync-concurrency.ts';
 
 // Batch size for addLinksBatch / addTimelineEntriesBatch.
 // Postgres bind-parameter limit is 65535. Links use 4 cols/row → 16K hard ceiling;
@@ -387,6 +403,19 @@ export interface ExtractOpts {
    * Pass undefined or omit for a full walk (CLI / first-run path).
    */
   slugs?: string[];
+  /**
+   * v0.41.15.0 (D9): in-process parallel file workers for the fs-walk
+   * loops. Default 1. PGLite engines clamp to 1 (single-writer; though
+   * extract is mostly CPU-bound, the DB batch flush still hits the
+   * write lock). Recommended 4-8 for very large brains where file IO +
+   * regex parsing dominate wallclock.
+   *
+   * Honored by: extractLinksFromDir, extractTimelineFromDir, extractForSlugs.
+   * NOT honored by: extractLinksFromDB, extractTimelineFromDB,
+   * extractMentionsFromDb (DB-source paths) — those use the engine's
+   * own pagination and stay serial in v0.41.15.0.
+   */
+  workers?: number;
 }
 
 /**
@@ -407,6 +436,17 @@ export async function runExtractCore(engine: BrainEngine, opts: ExtractOpts): Pr
   const jsonMode = !!opts.jsonMode;
   const result: ExtractResult = { links_created: 0, timeline_entries_created: 0, pages_processed: 0 };
 
+  // v0.41.15.0 (D9): resolve workers via the PGLite-clamp wrapper.
+  // Page count unknown at this point — pass 0 so the auto-path falls
+  // back to override-or-1 instead of running the >100-files heuristic.
+  const workersResolved = resolveWorkersWithClamp(
+    engine,
+    opts.workers,
+    'extract',
+    0,
+  );
+  const workers = workersResolved.workers;
+
   // Incremental path: if specific slugs provided, only extract from those files.
   // This is the cycle path — sync tells us what changed, we only re-extract those.
   if (opts.slugs !== undefined) {
@@ -414,7 +454,7 @@ export async function runExtractCore(engine: BrainEngine, opts: ExtractOpts): Pr
       // Nothing changed — skip entirely.
       return result;
     }
-    const r = await extractForSlugs(engine, opts.dir, opts.slugs, opts.mode, dryRun, jsonMode);
+    const r = await extractForSlugs(engine, opts.dir, opts.slugs, opts.mode, dryRun, jsonMode, workers);
     result.links_created = r.links_created;
     result.timeline_entries_created = r.timeline_created;
     result.pages_processed = r.pages;
@@ -423,12 +463,12 @@ export async function runExtractCore(engine: BrainEngine, opts: ExtractOpts): Pr
 
   // Full walk path: CLI `gbrain extract` or first-run.
   if (opts.mode === 'links' || opts.mode === 'all') {
-    const r = await extractLinksFromDir(engine, opts.dir, dryRun, jsonMode);
+    const r = await extractLinksFromDir(engine, opts.dir, dryRun, jsonMode, workers);
     result.links_created = r.created;
     result.pages_processed = r.pages;
   }
   if (opts.mode === 'timeline' || opts.mode === 'all') {
-    const r = await extractTimelineFromDir(engine, opts.dir, dryRun, jsonMode);
+    const r = await extractTimelineFromDir(engine, opts.dir, dryRun, jsonMode, workers);
     result.timeline_entries_created = r.created;
     result.pages_processed = Math.max(result.pages_processed, r.pages);
   }
@@ -469,11 +509,33 @@ export async function runExtract(engine: BrainEngine, args: string[]) {
   // v0_13_0 migration orchestrator runs this once under the hood; users
   // opt in for subsequent runs.
   const includeFrontmatter = args.includes('--include-frontmatter');
-  // v0.42.0.0 Part B: --by-mention auto-link body-text entity mentions
+  // v0.41.18.0 Part B: --by-mention auto-link body-text entity mentions
   // via the gazetteer pass. Mode dispatch — when set, run ONLY the
   // mention pass (skip default link extract). DB-source only per D7;
   // FS-source is rejected with a paste-ready fix-hint below.
   const byMention = args.includes('--by-mention');
+  // v0.41.18.0 (A10, T7): --ner is a NER-extraction mode dispatch. Same
+  // DB-source-only posture as --by-mention. Can combine with --by-mention
+  // in a single command for a shared-gazetteer walk (saves one pass).
+  const ner = args.includes('--ner');
+  // v0.41.18.0 (A11, T8): --from-meetings extracts timeline entries from
+  // meeting pages onto each discussed entity. Timeline subcommand only.
+  const fromMeetings = args.includes('--from-meetings');
+  // v0.41.17.0 (T7, D9): --workers N parsed via the shared validator.
+  // Honored on the fs-walk inner loops only; DB-source paths stay
+  // serial in v0.41.17.0 (see ExtractOpts.workers doc).
+  let workers: number | undefined;
+  const workersIdx = args.indexOf('--workers');
+  const concurrencyIdx = args.indexOf('--concurrency');
+  const workersValIdx = workersIdx >= 0 ? workersIdx + 1 : (concurrencyIdx >= 0 ? concurrencyIdx + 1 : -1);
+  if (workersValIdx > 0 && workersValIdx < args.length) {
+    try {
+      workers = parseWorkers(args[workersValIdx]);
+    } catch (e) {
+      console.error((e as Error).message);
+      process.exit(1);
+    }
+  }
 
   // Validate --since upfront. Without this, an invalid date like
   // `--since yesterday` produces NaN which silently passes the filter check
@@ -497,7 +559,7 @@ export async function runExtract(engine: BrainEngine, args: string[]) {
     process.exit(1);
   }
 
-  // v0.42.0.0 D7: --by-mention requires DB-source. Gazetteer construction
+  // v0.41.18.0 D7: --by-mention requires DB-source. Gazetteer construction
   // needs the engine; mixing FS-walk with DB-gazetteer is incoherent
   // (you'd scan files on disk for mentions of entities that may not exist
   // in any synced page). Fail loud with a paste-ready fix-hint.
@@ -516,6 +578,40 @@ export async function runExtract(engine: BrainEngine, args: string[]) {
     console.error(
       `--by-mention is a links-pass only; it does not apply to timeline extraction. ` +
       `Re-run as 'gbrain extract links --by-mention' or 'gbrain extract all --by-mention'.`,
+    );
+    process.exit(2);
+  }
+  // v0.41.18.0 (T7): same gates for --ner.
+  if (ner && source === 'fs') {
+    console.error(
+      `--ner requires --source db (currently --source fs). NER extraction needs the engine ` +
+      `to build the entity gazetteer + read schema-pack link_types. Re-run as:\n\n` +
+      `  gbrain extract ${subcommand} --ner --source db` +
+      (sourceIdFilter ? ` --source-id ${sourceIdFilter}` : '') +
+      (since ? ` --since ${since}` : '') +
+      (dryRun ? ' --dry-run' : '') + '\n',
+    );
+    process.exit(2);
+  }
+  if (ner && subcommand === 'timeline') {
+    console.error(
+      `--ner is a links-pass only; it does not apply to timeline extraction.`,
+    );
+    process.exit(2);
+  }
+  // v0.41.18.0 (T8): --from-meetings is timeline-only + DB-source-only.
+  if (fromMeetings && source === 'fs') {
+    console.error(
+      `--from-meetings requires --source db (currently --source fs). Re-run as:\n\n` +
+      `  gbrain extract timeline --from-meetings --source db` +
+      (sourceIdFilter ? ` --source-id ${sourceIdFilter}` : '') +
+      (dryRun ? ' --dry-run' : '') + '\n',
+    );
+    process.exit(2);
+  }
+  if (fromMeetings && subcommand !== 'timeline' && subcommand !== 'all') {
+    console.error(
+      `--from-meetings is a timeline-pass only. Re-run as 'gbrain extract timeline --from-meetings' or 'gbrain extract all --from-meetings'.`,
     );
     process.exit(2);
   }
@@ -551,16 +647,49 @@ export async function runExtract(engine: BrainEngine, args: string[]) {
       // is fs-only; we keep the dual codepath here so Minions handlers
       // can opt in via mode + source.
       result = { links_created: 0, timeline_entries_created: 0, pages_processed: 0 };
-      // v0.42.0.0: --by-mention is a mode dispatch. When set, run ONLY
+      // v0.41.18.0: --by-mention is a mode dispatch. When set, run ONLY
       // the mention pass and skip the default link/frontmatter extract.
       // The two passes write different link_source values ('mentions' vs
       // 'markdown'/'frontmatter') so they don't conflict, but mixing them
       // in a single CLI invocation is surprising — keep the surfaces
       // separate.
-      if (byMention) {
-        const r = await extractMentionsFromDb(engine, dryRun, jsonMode, typeFilter, since, { sourceIdFilter });
-        result.links_created = r.created;
-        result.pages_processed = r.pages;
+      if (fromMeetings) {
+        // v0.41.18.0 (T8): timeline-from-meetings runs SOLO (doesn't combine
+        // with --by-mention/--ner because those are links passes).
+        const { extractTimelineFromMeetings } = await import('../core/extract-timeline-from-meetings.ts');
+        const r = await extractTimelineFromMeetings(engine, { dryRun, sourceIdFilter });
+        result.timeline_entries_created = r.entries_created;
+        result.pages_processed = r.meetings_scanned;
+        if (!jsonMode) {
+          console.log(`Timeline from meetings: ${r.entries_created} entries on ${r.entities_touched} entity pages from ${r.meetings_scanned} meetings`);
+        }
+      } else if (byMention || ner) {
+        // v0.41.18.0 (T7): combined --by-mention + --ner walk shares one
+        // gazetteer; saves an entire pass on big brains. When only one
+        // flag is set, the other extractor skips silently.
+        const { buildGazetteer: buildGz } = await import('../core/by-mention.ts');
+        const sharedGazetteer = (byMention || ner) ? await buildGz(engine) : undefined;
+        if (byMention) {
+          const r = await extractMentionsFromDb(engine, dryRun, jsonMode, typeFilter, since, { sourceIdFilter });
+          result.links_created += r.created;
+          result.pages_processed += r.pages;
+        }
+        if (ner) {
+          const { extractNerLinks } = await import('../core/extract-ner.ts');
+          const r = await extractNerLinks(engine, {
+            dryRun,
+            sourceIdFilter,
+            typeFilter,
+            since,
+            gazetteer: sharedGazetteer,
+          });
+          if (r.pack_unavailable && !jsonMode) {
+            console.log('Note: no active schema pack with link_types[].inference.regex — NER pass produced 0 links.');
+          }
+          result.links_created += r.created;
+          // pages already counted by by-mention if both ran; else count here.
+          if (!byMention) result.pages_processed += r.pages;
+        }
       } else {
         if (subcommand === 'links' || subcommand === 'all') {
           const r = await extractLinksFromDB(engine, dryRun, jsonMode, typeFilter, since, { includeFrontmatter, sourceIdFilter });
@@ -579,6 +708,7 @@ export async function runExtract(engine: BrainEngine, args: string[]) {
         dir: brainDir,
         dryRun,
         jsonMode,
+        workers,
       });
     }
   } catch (e) {
@@ -610,6 +740,12 @@ async function extractForSlugs(
   mode: 'links' | 'timeline' | 'all',
   dryRun: boolean,
   jsonMode: boolean,
+  // v0.41.15.0 (T7): in-process worker count. Default 1 — back-compat
+  // for every caller that doesn't pass it explicitly. The sliding pool
+  // accumulates per-worker local batches and flushes each via the
+  // shared flush primitive; JS single-threaded event loop makes the
+  // shared counter increments atomic.
+  workers: number = 1,
 ): Promise<{ links_created: number; timeline_created: number; pages: number }> {
   // Build the full slug set for link resolution (fast: just readdir, no file reads)
   const allFiles = walkMarkdownFiles(brainDir);
@@ -661,46 +797,55 @@ async function extractForSlugs(
     }
   }
 
-  for (const slug of slugs) {
-    const relPath = slug + '.md';
-    const fullPath = join(brainDir, relPath);
+  // v0.41.15.0 (T7): sliding-pool fan-out. The shared linkBatch /
+  // timelineBatch arrays + flush functions still serve correctly because
+  // every push + length check + length=0 reset is synchronous JS — no
+  // await between the check and the reset means workers never see a
+  // half-cleared batch. flushLinks/flushTimeline snapshot before await,
+  // so the second worker's pushes during the await land cleanly in the
+  // (now-empty) batch for the next flush.
+  await runSlidingPool({
+    items: slugs,
+    workers,
+    failureLabel: (slug) => slug,
+    onItem: async (slug) => {
+      const relPath = slug + '.md';
+      const fullPath = join(brainDir, relPath);
+      try {
+        if (!existsSync(fullPath)) return; // deleted file — sync already handled removal
+        const content = readFileSync(fullPath, 'utf-8');
 
-    try {
-      if (!existsSync(fullPath)) continue; // deleted file — sync already handled removal
-      const content = readFileSync(fullPath, 'utf-8');
-
-      // Links
-      if (doLinks) {
-        const links = await extractLinksFromFile(content, relPath, allSlugs);
-        for (const link of links) {
-          if (dryRun) {
-            if (!jsonMode) console.log(`  ${link.from_slug} → ${link.to_slug} (${link.link_type})`);
-            linksCreated++;
-          } else {
-            linkBatch.push(link);
-            if (linkBatch.length >= BATCH_SIZE) await flushLinks();
+        if (doLinks) {
+          const links = await extractLinksFromFile(content, relPath, allSlugs);
+          for (const link of links) {
+            if (dryRun) {
+              if (!jsonMode) console.log(`  ${link.from_slug} → ${link.to_slug} (${link.link_type})`);
+              linksCreated++;
+            } else {
+              linkBatch.push(link);
+              if (linkBatch.length >= BATCH_SIZE) await flushLinks();
+            }
           }
         }
-      }
 
-      // Timeline
-      if (doTimeline) {
-        const entries = extractTimelineFromContent(content, slug);
-        for (const entry of entries) {
-          if (dryRun) {
-            if (!jsonMode) console.log(`  ${entry.slug}: ${entry.date} — ${entry.summary}`);
-            timelineCreated++;
-          } else {
-            timelineBatch.push({ slug: entry.slug, date: entry.date, source: entry.source, summary: entry.summary, detail: entry.detail });
-            if (timelineBatch.length >= BATCH_SIZE) await flushTimeline();
+        if (doTimeline) {
+          const entries = extractTimelineFromContent(content, slug);
+          for (const entry of entries) {
+            if (dryRun) {
+              if (!jsonMode) console.log(`  ${entry.slug}: ${entry.date} — ${entry.summary}`);
+              timelineCreated++;
+            } else {
+              timelineBatch.push({ slug: entry.slug, date: entry.date, source: entry.source, summary: entry.summary, detail: entry.detail });
+              if (timelineBatch.length >= BATCH_SIZE) await flushTimeline();
+            }
           }
         }
-      }
 
-      pagesProcessed++;
-    } catch { /* skip unreadable */ }
-    progress.tick(1);
-  }
+        pagesProcessed++;
+      } catch { /* skip unreadable */ }
+      progress.tick(1);
+    },
+  });
 
   await flushLinks();
   await flushTimeline();
@@ -716,6 +861,8 @@ async function extractForSlugs(
 
 async function extractLinksFromDir(
   engine: BrainEngine, brainDir: string, dryRun: boolean, jsonMode: boolean,
+  // v0.41.15.0 (T7): in-process worker count. Default 1.
+  workers: number = 1,
 ): Promise<{ created: number; pages: number }> {
   const files = walkMarkdownFiles(brainDir);
   const allSlugs = new Set(files.map(f => pathToSlug(f.relPath)));
@@ -751,25 +898,30 @@ async function extractLinksFromDir(
     }
   }
 
-  for (let i = 0; i < files.length; i++) {
-    try {
-      const content = readFileSync(files[i].path, 'utf-8');
-      const links = await extractLinksFromFile(content, files[i].relPath, allSlugs);
-      for (const link of links) {
-        if (dryRunSeen) {
-          const key = `${link.from_slug}::${link.to_slug}::${link.link_type}`;
-          if (dryRunSeen.has(key)) continue;
-          dryRunSeen.add(key);
-          if (!jsonMode) console.log(`  ${link.from_slug} → ${link.to_slug} (${link.link_type})`);
-          created++;
-        } else {
-          batch.push(link);
-          if (batch.length >= BATCH_SIZE) await flush();
+  await runSlidingPool({
+    items: files,
+    workers,
+    failureLabel: (f) => f.relPath,
+    onItem: async (file) => {
+      try {
+        const content = readFileSync(file.path, 'utf-8');
+        const links = await extractLinksFromFile(content, file.relPath, allSlugs);
+        for (const link of links) {
+          if (dryRunSeen) {
+            const key = `${link.from_slug}::${link.to_slug}::${link.link_type}`;
+            if (dryRunSeen.has(key)) continue;
+            dryRunSeen.add(key);
+            if (!jsonMode) console.log(`  ${link.from_slug} → ${link.to_slug} (${link.link_type})`);
+            created++;
+          } else {
+            batch.push(link);
+            if (batch.length >= BATCH_SIZE) await flush();
+          }
         }
-      }
-    } catch { /* skip unreadable */ }
-    progress.tick(1);
-  }
+      } catch { /* skip unreadable */ }
+      progress.tick(1);
+    },
+  });
   await flush();
   progress.finish();
 
@@ -782,6 +934,8 @@ async function extractLinksFromDir(
 
 async function extractTimelineFromDir(
   engine: BrainEngine, brainDir: string, dryRun: boolean, jsonMode: boolean,
+  // v0.41.15.0 (T7): in-process worker count. Default 1.
+  workers: number = 1,
 ): Promise<{ created: number; pages: number }> {
   const files = walkMarkdownFiles(brainDir);
 
@@ -812,25 +966,30 @@ async function extractTimelineFromDir(
     }
   }
 
-  for (let i = 0; i < files.length; i++) {
-    try {
-      const content = readFileSync(files[i].path, 'utf-8');
-      const slug = pathToSlug(files[i].relPath);
-      for (const entry of extractTimelineFromContent(content, slug)) {
-        if (dryRunSeen) {
-          const key = `${entry.slug}::${entry.date}::${entry.summary}`;
-          if (dryRunSeen.has(key)) continue;
-          dryRunSeen.add(key);
-          if (!jsonMode) console.log(`  ${entry.slug}: ${entry.date} — ${entry.summary}`);
-          created++;
-        } else {
-          batch.push({ slug: entry.slug, date: entry.date, source: entry.source, summary: entry.summary, detail: entry.detail });
-          if (batch.length >= BATCH_SIZE) await flush();
+  await runSlidingPool({
+    items: files,
+    workers,
+    failureLabel: (f) => f.relPath,
+    onItem: async (file) => {
+      try {
+        const content = readFileSync(file.path, 'utf-8');
+        const slug = pathToSlug(file.relPath);
+        for (const entry of extractTimelineFromContent(content, slug)) {
+          if (dryRunSeen) {
+            const key = `${entry.slug}::${entry.date}::${entry.summary}`;
+            if (dryRunSeen.has(key)) continue;
+            dryRunSeen.add(key);
+            if (!jsonMode) console.log(`  ${entry.slug}: ${entry.date} — ${entry.summary}`);
+            created++;
+          } else {
+            batch.push({ slug: entry.slug, date: entry.date, source: entry.source, summary: entry.summary, detail: entry.detail });
+            if (batch.length >= BATCH_SIZE) await flush();
+          }
         }
-      }
-    } catch { /* skip unreadable */ }
-    progress.tick(1);
-  }
+      } catch { /* skip unreadable */ }
+      progress.tick(1);
+    },
+  });
   await flush();
   progress.finish();
 
@@ -1201,7 +1360,7 @@ async function extractTimelineFromDB(
 }
 
 /**
- * v0.42.0.0 Part B (migration #1 of #1409) — auto-link body-text entity
+ * v0.41.18.0 Part B (migration #1 of #1409) — auto-link body-text entity
  * mentions to known entity pages.
  *
  * Walks every page (respecting --source-id / --type / --since filters),

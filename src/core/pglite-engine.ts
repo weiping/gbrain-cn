@@ -847,6 +847,27 @@ export class PGLiteEngine implements BrainEngine {
     return rowToPage(rows[0] as Record<string, unknown>);
   }
 
+  /**
+   * v0.41.13 (#1309) — identity-based dedup pre-check.
+   * See `BrainEngine.findDuplicatePage` for the contract.
+   */
+  async findDuplicatePage(
+    sourceId: string,
+    opts: { hash: string; frontmatterId?: string | null },
+  ): Promise<{ slug: string; id: number } | null> {
+    const fmId = opts.frontmatterId ?? null;
+    const sql = `SELECT id, slug FROM pages
+       WHERE source_id = $1
+         AND deleted_at IS NULL
+         AND (content_hash = $2 OR (frontmatter->>'id' = $3 AND $3 IS NOT NULL))
+       ORDER BY id
+       LIMIT 1`;
+    const { rows } = await this.db.query(sql, [sourceId, opts.hash, fmId]);
+    if (rows.length === 0) return null;
+    const r = rows[0] as { id: number | string; slug: string };
+    return { slug: r.slug, id: Number(r.id) };
+  }
+
   async putPage(slug: string, page: PageInput, opts?: { sourceId?: string }): Promise<Page> {
     slug = validateSlug(slug);
     const hash = page.content_hash || contentHash(page);
@@ -1318,20 +1339,39 @@ export class PGLiteEngine implements BrainEngine {
     }));
   }
 
-  async resolveSlugs(partial: string): Promise<string[]> {
+  async resolveSlugs(partial: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<string[]> {
+    // v0.41.13 #1436: source scope. When opts.sourceIds is set
+    // (federated_read OAuth tier), filter via `source_id = ANY($N::text[])`.
+    // When opts.sourceId is set (scalar single-source tier), filter via
+    // `source_id = $N`. When neither is set, preserve the pre-fix unscoped
+    // behavior so internal CLI callers (`gbrain query --resolve` etc.)
+    // continue to walk every source.
+    const sources = opts?.sourceIds ?? null;
+    const scalar = opts?.sourceId ?? null;
+    const scopeSql = sources
+      ? ` AND source_id = ANY($${'__N__'}::text[])`
+      : scalar
+        ? ` AND source_id = $${'__N__'}`
+        : '';
+
     // Try exact match first
-    const exact = await this.db.query('SELECT slug FROM pages WHERE slug = $1', [partial]);
+    const exactSql = `SELECT slug FROM pages WHERE slug = $1 AND deleted_at IS NULL${scopeSql.replace('__N__', '2')}`;
+    const exactParams: unknown[] = sources ? [partial, sources] : scalar ? [partial, scalar] : [partial];
+    const exact = await this.db.query(exactSql, exactParams);
     if (exact.rows.length > 0) return [(exact.rows[0] as { slug: string }).slug];
 
     // Fuzzy match via pg_trgm
-    const { rows } = await this.db.query(
-      `SELECT slug, similarity(title, $1) AS sim
+    const fuzzySql = `SELECT slug, similarity(title, $1) AS sim
        FROM pages
-       WHERE title % $1 OR slug ILIKE $2
+       WHERE deleted_at IS NULL AND (title % $1 OR slug ILIKE $2)${scopeSql.replace('__N__', '3')}
        ORDER BY sim DESC
-       LIMIT 5`,
-      [partial, '%' + partial + '%']
-    );
+       LIMIT 5`;
+    const fuzzyParams: unknown[] = sources
+      ? [partial, '%' + partial + '%', sources]
+      : scalar
+        ? [partial, '%' + partial + '%', scalar]
+        : [partial, '%' + partial + '%'];
+    const { rows } = await this.db.query(fuzzySql, fuzzyParams);
     return (rows as { slug: string }[]).map(r => r.slug);
   }
 
@@ -1791,7 +1831,13 @@ export class PGLiteEngine implements BrainEngine {
            SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = hc.page_id
          ) THEN true ELSE false END AS stale
        FROM hnsw_candidates hc
-       ORDER BY score DESC
+       -- v0.41.13: stable tiebreaker. When two chunks share a score (same
+       -- source-prefix boost + same cosine distance, the basis-vector + same-
+       -- source-prefix case in eval fixtures), older page_id wins. Without
+       -- this, planner choice + index presence can flip ordering between
+       -- master and feature branches that add unrelated indexes — see the
+       -- pages_dedup_idx (v95) regression that motivated this.
+       ORDER BY score DESC, hc.page_id ASC, hc.chunk_id ASC
        LIMIT $3
        OFFSET $4`,
       params
@@ -2001,10 +2047,83 @@ export class PGLiteEngine implements BrainEngine {
     afterPageId?: number;
     afterChunkIndex?: number;
     sourceId?: string;
+    orderBy?: 'page_id' | 'updated_desc';
+    afterUpdatedAt?: string | null;
   }): Promise<StaleChunkRow[]> {
     const limit = opts?.batchSize ?? 2000;
     const afterPid = opts?.afterPageId ?? 0;
     const afterIdx = opts?.afterChunkIndex ?? -1;
+    const orderBy = opts?.orderBy ?? 'page_id';
+
+    // v0.41.18.0 (A13, codex #9): --priority recent path. See postgres-engine
+    // sibling for full rationale. Same composite cursor + ORDER BY.
+    if (orderBy === 'updated_desc') {
+      const afterUpdated = opts?.afterUpdatedAt ?? null;
+      const isFirstPage = afterUpdated === null && afterPid === 0;
+      if (opts?.sourceId === undefined) {
+        const { rows } = isFirstPage ? await this.db.query(
+          `SELECT p.slug, cc.chunk_index, cc.chunk_text, cc.chunk_source,
+                  cc.model, cc.token_count, p.source_id, cc.page_id,
+                  p.updated_at
+             FROM content_chunks cc
+             JOIN pages p ON p.id = cc.page_id
+            WHERE cc.embedding IS NULL
+              AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip')
+            ORDER BY p.updated_at DESC NULLS LAST, p.id ASC, cc.chunk_index ASC
+            LIMIT $1`,
+          [limit],
+        ) : await this.db.query(
+          `SELECT p.slug, cc.chunk_index, cc.chunk_text, cc.chunk_source,
+                  cc.model, cc.token_count, p.source_id, cc.page_id,
+                  p.updated_at
+             FROM content_chunks cc
+             JOIN pages p ON p.id = cc.page_id
+            WHERE cc.embedding IS NULL
+              AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip')
+              AND (
+                p.updated_at < $1::timestamptz
+                OR (p.updated_at = $1::timestamptz AND p.id > $2)
+                OR (p.updated_at = $1::timestamptz AND p.id = $2 AND cc.chunk_index > $3)
+              )
+            ORDER BY p.updated_at DESC NULLS LAST, p.id ASC, cc.chunk_index ASC
+            LIMIT $4`,
+          [afterUpdated, afterPid, afterIdx, limit],
+        );
+        return rows as unknown as StaleChunkRow[];
+      }
+      const { rows } = isFirstPage ? await this.db.query(
+        `SELECT p.slug, cc.chunk_index, cc.chunk_text, cc.chunk_source,
+                cc.model, cc.token_count, p.source_id, cc.page_id,
+                p.updated_at
+           FROM content_chunks cc
+           JOIN pages p ON p.id = cc.page_id
+          WHERE cc.embedding IS NULL
+            AND p.source_id = $1
+            AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip')
+          ORDER BY p.updated_at DESC NULLS LAST, p.id ASC, cc.chunk_index ASC
+          LIMIT $2`,
+        [opts.sourceId, limit],
+      ) : await this.db.query(
+        `SELECT p.slug, cc.chunk_index, cc.chunk_text, cc.chunk_source,
+                cc.model, cc.token_count, p.source_id, cc.page_id,
+                p.updated_at
+           FROM content_chunks cc
+           JOIN pages p ON p.id = cc.page_id
+          WHERE cc.embedding IS NULL
+            AND p.source_id = $1
+            AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip')
+            AND (
+              p.updated_at < $2::timestamptz
+              OR (p.updated_at = $2::timestamptz AND p.id > $3)
+              OR (p.updated_at = $2::timestamptz AND p.id = $3 AND cc.chunk_index > $4)
+            )
+          ORDER BY p.updated_at DESC NULLS LAST, p.id ASC, cc.chunk_index ASC
+          LIMIT $5`,
+        [opts.sourceId, afterUpdated, afterPid, afterIdx, limit],
+      );
+      return rows as unknown as StaleChunkRow[];
+    }
+    // orderBy === 'page_id' — legacy stable cursor (unchanged below).
     // D7: optional source-scoped cursor scan. PGLite mirrors postgres-engine
     // so the engine-parity E2E catches drift.
     // v0.41 (D4+D8): NOT (frontmatter ? 'embed_skip') filter for soft-blocked
@@ -2114,17 +2233,19 @@ export class PGLiteEngine implements BrainEngine {
     const fromSourceIds = links.map(l => l.from_source_id || 'default');
     const toSourceIds = links.map(l => l.to_source_id || 'default');
     const originSourceIds = links.map(l => l.origin_source_id || 'default');
+    // v0.41.18.0 (A10): link_kind column (v98). NULL = legacy/plain.
+    const linkKinds = links.map(l => l.link_kind ?? null);
     const result = await this.db.query(
-      `INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source, origin_page_id, origin_field)
-       SELECT f.id, t.id, v.link_type, v.context, v.link_source, o.id, v.origin_field
-       FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::text[], $9::text[], $10::text[])
-         AS v(from_slug, to_slug, link_type, context, link_source, origin_slug, origin_field, from_source_id, to_source_id, origin_source_id)
+      `INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source, link_kind, origin_page_id, origin_field)
+       SELECT f.id, t.id, v.link_type, v.context, v.link_source, v.link_kind, o.id, v.origin_field
+       FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::text[], $9::text[], $10::text[], $11::text[])
+         AS v(from_slug, to_slug, link_type, context, link_source, origin_slug, origin_field, from_source_id, to_source_id, origin_source_id, link_kind)
        JOIN pages f ON f.slug = v.from_slug AND f.source_id = v.from_source_id
        JOIN pages t ON t.slug = v.to_slug AND t.source_id = v.to_source_id
        LEFT JOIN pages o ON o.slug = v.origin_slug AND o.source_id = v.origin_source_id
        ON CONFLICT (from_page_id, to_page_id, link_type, link_source, origin_page_id) DO NOTHING
        RETURNING 1`,
-      [fromSlugs, toSlugs, linkTypes, contexts, linkSources, originSlugs, originFields, fromSourceIds, toSourceIds, originSourceIds]
+      [fromSlugs, toSlugs, linkTypes, contexts, linkSources, originSlugs, originFields, fromSourceIds, toSourceIds, originSourceIds, linkKinds]
     );
     return result.rows.length;
   }
@@ -2502,7 +2623,7 @@ export class PGLiteEngine implements BrainEngine {
     // Initialize all slugs to 0 so callers get a consistent map.
     for (const s of slugs) result.set(s, 0);
 
-    // v0.42.0.0 D12: filter mentions OUT of backlink-count for search
+    // v0.41.18.0 D12: filter mentions OUT of backlink-count for search
     // ranking — parity with postgres-engine.ts. See that file's comment
     // for the full rationale. `IS DISTINCT FROM` is NULL-safe so legacy
     // rows with NULL link_source still count toward backlinks.
@@ -2706,7 +2827,7 @@ export class PGLiteEngine implements BrainEngine {
       `INSERT INTO timeline_entries (page_id, date, source, summary, detail)
        SELECT id, $2::date, $3, $4, $5
        FROM pages WHERE slug = $1 AND source_id = $6
-       ON CONFLICT (page_id, date, summary) DO NOTHING`,
+       ON CONFLICT (page_id, date, summary, source) DO NOTHING`,
       [slug, entry.date, entry.source || '', entry.summary, entry.detail || '', sourceId]
     );
   }
@@ -2725,7 +2846,7 @@ export class PGLiteEngine implements BrainEngine {
        FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[])
          AS v(slug, date, source, summary, detail, source_id)
        JOIN pages p ON p.slug = v.slug AND p.source_id = v.source_id
-       ON CONFLICT (page_id, date, summary) DO NOTHING
+       ON CONFLICT (page_id, date, summary, source) DO NOTHING
        RETURNING 1`,
       [slugs, dates, sources, summaries, details, sourceIds]
     );
@@ -4259,9 +4380,28 @@ export class PGLiteEngine implements BrainEngine {
     return (rows as Record<string, unknown>[]).map(r => rowToChunk(r, true));
   }
 
-  async executeRaw<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<T[]> {
-    const { rows } = await this.db.query(sql, params);
-    return rows as T[];
+  async executeRaw<T = Record<string, unknown>>(
+    sql: string,
+    params?: unknown[],
+    opts?: { signal?: AbortSignal },
+  ): Promise<T[]> {
+    // v0.41.18.0 (A20, codex #7): PGLite is in-process WASM with no
+    // kernel-level cancellation. Best-effort: pre-check the signal so
+    // an already-aborted call returns immediately, and race against
+    // a settle promise so a late-arriving abort throws AbortError
+    // (the query keeps running in WASM until it returns; the result
+    // is discarded). Documented gap in src/core/engine.ts.
+    if (opts?.signal?.aborted) {
+      throw new DOMException('aborted', 'AbortError');
+    }
+    const queryPromise = this.db.query(sql, params).then((r) => r.rows as T[]);
+    if (!opts?.signal) return queryPromise;
+    const abortPromise = new Promise<T[]>((_resolve, reject) => {
+      opts.signal!.addEventListener('abort', () => {
+        reject(new DOMException('aborted', 'AbortError'));
+      }, { once: true });
+    });
+    return Promise.race([queryPromise, abortPromise]);
   }
 
   // ============================================================

@@ -467,12 +467,19 @@ const get_page: Operation = {
     // the cross-source view, preserving pre-v0.31.8 behavior. MCP callers
     // (stdio + HTTP) populate ctx.sourceId via the transport layer.
     const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {};
+    // v0.41.13 #1436: fuzzy resolveSlugs ALSO needs source scope — pre-fix
+    // it was unscoped, so a remote `get_page` with `fuzzy: true` could
+    // return candidates from sources outside ctx.auth.allowedSources /
+    // ctx.sourceId. sourceScopeOpts(ctx) is the canonical precedence
+    // ladder (federated array > scalar > nothing) shared with every other
+    // read-side handler.
+    const fuzzyScope = sourceScopeOpts(ctx);
 
     let page = await ctx.engine.getPage(slug, { includeDeleted, ...sourceOpts });
     let resolved_slug: string | undefined;
 
     if (!page && fuzzy) {
-      const candidates = await ctx.engine.resolveSlugs(slug);
+      const candidates = await ctx.engine.resolveSlugs(slug, fuzzyScope);
       if (candidates.length === 1) {
         page = await ctx.engine.getPage(candidates[0], { includeDeleted, ...sourceOpts });
         resolved_slug = candidates[0];
@@ -4161,6 +4168,112 @@ const reload_schema_pack: Operation = {
   },
 };
 
+// v0.41.18.0 (A7 + T16, codex finding #5): MCP op for federated / thin-client
+// brain installs to drive `gbrain onboard --auto` over MCP. Admin scope
+// (NOT localOnly) so remote agents authenticated via OAuth can probe
+// brain health + submit auto-eligible remediation handlers.
+//
+// Critical security gate (codex #5): admin scope alone is NOT sufficient
+// to submit handlers in PROTECTED_JOB_NAMES (synthesize, patterns,
+// consolidate, extract-takes-from-pages, contextual_reindex_per_chunk).
+// Without this gate, an admin-scoped OAuth token would bypass the same
+// guard that `submit_job` enforces. The new NAMED scope
+// `run_protected_onboard` MUST be granted IN ADDITION TO admin for any
+// protected child handler to fire.
+//
+// Behavior:
+//   - mode='check' (default): returns the OnboardReport JSON envelope,
+//     never submits jobs. Admin scope sufficient.
+//   - mode='auto':            submits auto_apply tier. Admin + non-protected
+//                             handlers only.
+//   - mode='auto-with-prompt': submits auto_apply + prompt_required tier.
+//                             Same protection check.
+//
+// Any LLM-bearing handler the plan would have submitted gets filtered out
+// unless the caller has run_protected_onboard. Filtered items appear in
+// the response with status='skipped_missing_scope' so the caller knows
+// what they would have gotten with the right grants.
+const run_onboard: Operation = {
+  name: 'run_onboard',
+  description: 'Probe brain health + optionally submit onboard remediations. Admin scope required. Protected handlers (LLM-bearing) require run_protected_onboard scope ADDITIONALLY.',
+  params: {
+    mode: { type: 'string', description: "'check' (default), 'auto', or 'auto-with-prompt'" },
+    target_score: { type: 'number', description: 'Target brain_score (default 90)' },
+    max_usd: { type: 'number', description: 'USD cap for autopilot path (required for auto modes)' },
+  },
+  mutating: true,
+  scope: 'admin',
+  handler: async (ctx, p) => {
+    const mode = (typeof p.mode === 'string' ? p.mode : 'check') as 'check' | 'auto' | 'auto-with-prompt';
+    const targetScore = typeof p.target_score === 'number' ? p.target_score : 90;
+    const maxUsd = typeof p.max_usd === 'number' ? p.max_usd : undefined;
+
+    const { computeRemediationPlan, runRemediation } = await import('./remediation/index.ts');
+    const { runAllOnboardChecks } = await import('./onboard/checks.ts');
+    const { buildOnboardReport } = await import('./onboard/render.ts');
+
+    // Per A26: source-scope via sourceScopeOpts(ctx). The recommendation
+    // planner is brain-wide today; future extension can scope by reading
+    // ctx.sourceId / ctx.auth.allowedSources for per-source plans.
+
+    let extraRemediations: import('./remediation-step.ts').RemediationStep[] = [];
+    try {
+      const checkResults = await runAllOnboardChecks(ctx.engine);
+      extraRemediations = checkResults.flatMap((r) => r.remediations);
+    } catch {
+      // Fail-open per A19 — return plan without extras rather than error.
+    }
+
+    // 'check' mode: just return the plan + JSON envelope. No submission.
+    if (mode === 'check') {
+      const plan = await computeRemediationPlan(ctx.engine, { targetScore, extraRemediations });
+      const report = buildOnboardReport(plan);
+      return report;
+    }
+
+    // 'auto' and 'auto-with-prompt' modes: require --max-usd per A12 + A20
+    // safety posture (cron-safety; refuses surprise spend).
+    if (maxUsd === undefined) {
+      throw new OperationError('invalid_params', `mode='${mode}' requires max_usd (cron-safety cap)`);
+    }
+
+    // Critical T16 + codex #5 security gate: filter out PROTECTED_JOB_NAMES
+    // unless the caller has the run_protected_onboard scope IN ADDITION
+    // to admin. Admin alone is insufficient.
+    const grantedScopes = ctx.auth?.scopes ?? [];
+    const canRunProtected = grantedScopes.includes('run_protected_onboard');
+    const { isProtectedJobName } = await import('./minions/protected-names.ts');
+
+    const skippedMissingScope: Array<{ id: string; job: string; reason: string }> = [];
+    const allowedExtras = extraRemediations.filter((r) => {
+      if (canRunProtected) return true;
+      if (isProtectedJobName(r.job)) {
+        skippedMissingScope.push({ id: r.id, job: r.job, reason: 'requires run_protected_onboard scope' });
+        return false;
+      }
+      return true;
+    });
+
+    // Run remediation with filtered extras. Hooks emit nothing — MCP
+    // returns structured result. Per A23 client_id attribution: stamp
+    // job.data.client_id on each submission so the spend chain (T10)
+    // attributes correctly. The library doesn't do this today; the
+    // upstream submit-side gating in submit_job filters protected names
+    // for ctx.remote !== false callers, so even if MCP run_onboard had a
+    // typo, the underlying queue.add would reject. Defense-in-depth.
+    const result = await runRemediation(
+      ctx.engine,
+      { targetScore, maxUsd },
+      {},
+    );
+
+    return {
+      ...result,
+      skipped_missing_scope: skippedMissingScope,
+    };
+  },
+};
+
 export const operations: Operation[] = [
   // Page CRUD
   get_page, put_page, delete_page, list_pages,
@@ -4229,6 +4342,8 @@ export const operations: Operation[] = [
   schema_stats, schema_lint, schema_graph, schema_explain_type,
   schema_review_orphans,
   schema_apply_mutations, reload_schema_pack,
+  // v0.41.18.0 (T16, A7, codex #5)
+  run_onboard,
 ];
 
 export const operationsByName = Object.fromEntries(

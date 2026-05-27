@@ -126,6 +126,15 @@ export interface LinkBatchInput {
   from_source_id?: string;
   to_source_id?: string;
   origin_source_id?: string;
+  /**
+   * v0.41.18.0 (A10, codex finding #12): distinguishes "plain body mention"
+   * (NULL or 'plain') from "verb-pattern-derived typed NER" ('typed_ner')
+   * within link_source='mentions'. Backed by v98 schema column. NOT in
+   * the links UNIQUE constraint — same (from, to, type, source, origin)
+   * tuple with different link_kind collides DO NOTHING. Default NULL =
+   * legacy / unknown / pre-v98 semantics.
+   */
+  link_kind?: string;
 }
 
 /** Input row for addTimelineEntriesBatch. Optional fields default to '' (matches NOT NULL DDL). */
@@ -165,7 +174,19 @@ export interface TimelineBatchInput {
  * transaction itself is waiting to write.
  */
 export interface ReservedConnection {
-  executeRaw<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<T[]>;
+  /**
+   * v0.41.18.0 (A20, codex #7): optional 3rd-arg `opts.signal` lets callers
+   * actually cancel a running query. Init nudge (3s wallclock cap) wires an
+   * AbortController whose timer fires at 3s; queries that haven't returned
+   * by then get cancelled (Postgres: query.cancel(); PGLite: in-process,
+   * Promise.race against signal-rejection — documented gap because PGLite
+   * has no kernel-level cancellation).
+   */
+  executeRaw<T = Record<string, unknown>>(
+    sql: string,
+    params?: unknown[],
+    opts?: { signal?: AbortSignal },
+  ): Promise<T[]>;
 }
 
 /**
@@ -624,6 +645,35 @@ export interface BrainEngine {
    */
   putPage(slug: string, page: PageInput, opts?: { sourceId?: string }): Promise<Page>;
   /**
+   * v0.41.13 (#1309) — identity-based dedup pre-check for the import pipeline.
+   *
+   * Returns the first matching `{slug, id}` whose `(source_id, …)` matches
+   * the supplied identity signal, OR null when nothing matches.
+   *
+   * Identity precedence (a row matches if EITHER fires):
+   *   - `content_hash = $hash` AND `deleted_at IS NULL`
+   *   - `frontmatter->>'id' = $frontmatterId` AND `$frontmatterId IS NOT NULL`
+   *     AND `deleted_at IS NULL`
+   *
+   * Background: the overlapping-ingest-roots bug class (infiniteGameExp,
+   * issue #1309) created two pages per file when a user ran `gbrain import
+   * /vault/Subdir/` then `gbrain import /vault/` — the slug-shape changed
+   * but the content + external ID were identical. Pre-fix, the import
+   * pipeline dedup-checked by `getPage(slug)` alone and missed the
+   * cross-slug duplicate. This method gives the importer a deterministic
+   * way to identify true duplicates BEFORE insert.
+   *
+   * Per codex review: the optional `?` shape lets existing test doubles
+   * compile without changes. Callers must defensively check
+   * `engine.findDuplicatePage?.(...)` and fall through on undefined.
+   * `deleted_at IS NULL` is deliberate — a soft-deleted page should NOT
+   * block a legitimate re-import under a new slug.
+   */
+  findDuplicatePage?(
+    sourceId: string,
+    opts: { hash: string; frontmatterId?: string | null },
+  ): Promise<{ slug: string; id: number } | null>;
+  /**
    * Hard-delete a page row. Cascades to content_chunks, page_links,
    * chunk_relations via existing FK ON DELETE CASCADE.
    *
@@ -663,7 +713,20 @@ export interface BrainEngine {
    * `filters.includeDeleted: true` to surface them.
    */
   listPages(filters?: PageFilters): Promise<Page[]>;
-  resolveSlugs(partial: string): Promise<string[]>;
+  /**
+   * Fuzzy slug resolver.
+   *
+   * v0.41.13 (#1436): `opts.sourceId` scopes the search to a single source;
+   * `opts.sourceIds` to an array (federated_read OAuth tier). Pre-fix the
+   * resolver was unscoped, so MCP `get_page` with `fuzzy: true` would
+   * return candidates from sources the caller couldn't actually access.
+   * Source-bleed via fuzzy resolution was the bug class infiniteGameExp
+   * reported as #1436. When neither opt is set, the original unscoped
+   * behavior is preserved for back-compat with internal callers (the
+   * `gbrain query --resolve` CLI path, etc.). Field names match the
+   * `sourceScopeOpts(ctx)` helper output so callers can spread directly.
+   */
+  resolveSlugs(partial: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<string[]>;
   /**
    * Returns the slug of every page in the brain. Used by batch commands as a
    * mutation-immune iteration source (alternative to listPages OFFSET pagination,
@@ -823,6 +886,16 @@ export interface BrainEngine {
     afterPageId?: number;
     afterChunkIndex?: number;
     sourceId?: string;
+    // v0.41.18.0 (A13, codex #9): pagination order. Default 'page_id'
+    // (legacy stable cursor). 'updated_desc' joins pages and orders by
+    // p.updated_at DESC NULLS LAST, p.id, cc.chunk_index — backed by
+    // idx_pages_updated_at_desc + content_chunks_stale_idx partial.
+    orderBy?: 'page_id' | 'updated_desc';
+    // For 'updated_desc' cursor: previous row's updated_at, page_id, chunk_index.
+    // ISO-8601 string for cross-engine compatibility (postgres.js + PGLite
+    // both round-trip TIMESTAMPTZ as Date | string; ISO string is the
+    // common denominator on the wire).
+    afterUpdatedAt?: string | null;
   }): Promise<StaleChunkRow[]>;
   /**
    * Delete every chunk for a page. Internal page-id lookup is sourceId-scoped
@@ -1564,7 +1637,19 @@ export interface BrainEngine {
   getChunksWithEmbeddings(slug: string, opts?: { sourceId?: string }): Promise<Chunk[]>;
 
   // Raw SQL (for Minions job queue and other internal modules)
-  executeRaw<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<T[]>;
+  /**
+   * v0.41.18.0 (A20, codex #7): optional 3rd-arg `opts.signal` lets callers
+   * actually cancel a running query. Init nudge (3s wallclock cap) wires an
+   * AbortController whose timer fires at 3s; queries that haven't returned
+   * by then get cancelled (Postgres: query.cancel(); PGLite: in-process,
+   * Promise.race against signal-rejection — documented gap because PGLite
+   * has no kernel-level cancellation).
+   */
+  executeRaw<T = Record<string, unknown>>(
+    sql: string,
+    params?: unknown[],
+    opts?: { signal?: AbortSignal },
+  ): Promise<T[]>;
 
   // ============================================================
   // v0.20.0 Cathedral II: code edges (Layer 5 populates, Layer 7 consumes)

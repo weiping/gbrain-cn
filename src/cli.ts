@@ -35,7 +35,7 @@ for (const op of operations) {
 }
 
 // CLI-only commands that bypass the operation layer
-const CLI_ONLY = new Set(['init', 'reinit-pglite', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval', 'sync', 'extract', 'extract-conversation-facts', 'features', 'autopilot', 'graph-query', 'jobs', 'agent', 'apply-migrations', 'skillpack-check', 'skillpack', 'resolvers', 'integrity', 'repair-jsonb', 'orphans', 'sources', 'mounts', 'dream', 'check-resolvable', 'routing-eval', 'skillify', 'smoke-test', 'providers', 'storage', 'repos', 'code-def', 'code-refs', 'reindex-code', 'reindex-frontmatter', 'code-callers', 'code-callees', 'frontmatter', 'auth', 'friction', 'claw-test', 'book-mirror', 'takes', 'think', 'salience', 'anomalies', 'transcripts', 'models', 'remote', 'recall', 'forget', 'edges-backfill', 'cache', 'ze-switch', 'founder', 'brainstorm', 'lsd', 'schema', 'capture']);
+const CLI_ONLY = new Set(['init', 'reinit-pglite', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval', 'sync', 'extract', 'extract-conversation-facts', 'features', 'autopilot', 'graph-query', 'jobs', 'agent', 'apply-migrations', 'skillpack-check', 'skillpack', 'resolvers', 'integrity', 'repair-jsonb', 'orphans', 'sources', 'mounts', 'dream', 'check-resolvable', 'routing-eval', 'skillify', 'smoke-test', 'providers', 'storage', 'repos', 'code-def', 'code-refs', 'reindex', 'reindex-code', 'reindex-frontmatter', 'code-callers', 'code-callees', 'frontmatter', 'auth', 'friction', 'claw-test', 'book-mirror', 'takes', 'think', 'salience', 'anomalies', 'transcripts', 'models', 'remote', 'recall', 'forget', 'edges-backfill', 'cache', 'ze-switch', 'founder', 'brainstorm', 'lsd', 'schema', 'capture', 'onboard', 'conversation-parser']);
 // CLI-only commands whose handlers print their own --help text. These are
 // excluded from the generic short-circuit so detailed per-command and
 // per-subcommand usage stays reachable.
@@ -1068,13 +1068,22 @@ async function handleCliOnly(command: string, args: string[]) {
   if (command === 'dream') {
     // Dream mirrors doctor's pattern: filesystem phases run without a DB,
     // so an engine connection failure is non-fatal. runCycle honestly
-    // reports DB phases as skipped when engine is null.
+    // reports DB phases as skipped when engine is null. v0.41.13 (#1422):
+    // bind + surface the error on stderr so the user knows WHY DB phases
+    // were skipped instead of seeing a silent "lint + backlinks done"
+    // and assuming the cycle actually ran. Pre-fix, foxhoundinc reported
+    // the cycle exiting 0 on PostgreSQL with every DB phase silently no-op.
     const { runDream } = await import('./commands/dream.ts');
     let eng: BrainEngine | null = null;
     try {
       eng = await connectEngine();
-    } catch {
-      // DB unavailable — lint + backlinks still run against the brain dir.
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(
+        `[dream] WARNING: could not connect to DB (${msg}). ` +
+        `Running filesystem-only phases (lint, backlinks, extract). ` +
+        `DB-dependent phases (sync, embed, synthesize, etc.) will report as skipped.\n`
+      );
     }
     try {
       await runDream(eng, args);
@@ -1125,6 +1134,32 @@ async function handleCliOnly(command: string, args: string[]) {
       configureGateway(buildGatewayConfig(config));
     }
     await runEvalLongMemEval(args.slice(1));
+    return;
+  }
+
+  // v0.41.13.0: `gbrain eval conversation-parser` is pure-function
+  // (parses fixture JSONL, runs parseConversation, scores results).
+  // No DB access; bypass connectEngine entirely so the CI fixture
+  // gate runs on machines with no `~/.gbrain/config.json`.
+  if (command === 'eval' && args[0] === 'conversation-parser') {
+    const { runEvalConversationParser } = await import('./commands/eval-conversation-parser.ts');
+    process.exit(await runEvalConversationParser(args.slice(1)));
+  }
+
+  // v0.41.13.0: `gbrain conversation-parser list-builtins | validate
+  // | --help` are pure (no DB access). Bypass connectEngine so the
+  // operator can run them on machines with no brain configured.
+  // `scan <slug>` needs a brain and falls through.
+  if (
+    command === 'conversation-parser' &&
+    (args.length === 0 ||
+      args[0] === '--help' ||
+      args[0] === '-h' ||
+      args[0] === 'list-builtins' ||
+      args[0] === 'validate')
+  ) {
+    const { runConversationParser } = await import('./commands/conversation-parser.ts');
+    await runConversationParser(null, args);
     return;
   }
 
@@ -1344,8 +1379,18 @@ async function handleCliOnly(command: string, args: string[]) {
       case 'reindex': {
         if (args.includes('--multimodal')) {
           const { runReindexMultimodal } = await import('./commands/reindex-multimodal.ts');
+          const { parseWorkers } = await import('./core/sync-concurrency.ts');
           const limitIdx = args.indexOf('--limit');
           const limitVal = limitIdx >= 0 && limitIdx + 1 < args.length ? parseInt(args[limitIdx + 1], 10) : undefined;
+          // v0.41.15.0 (T9, D9): --workers N for parallel UPDATEs within
+          // each Voyage batch. Honored by the inner write loop only;
+          // the outer batch loop is one Voyage round-trip per batch.
+          const workersIdx = args.indexOf('--workers');
+          const concurrencyIdx = args.indexOf('--concurrency');
+          const workersValIdx = workersIdx >= 0 ? workersIdx + 1 : (concurrencyIdx >= 0 ? concurrencyIdx + 1 : -1);
+          const workers = workersValIdx > 0 && workersValIdx < args.length
+            ? parseWorkers(args[workersValIdx])
+            : undefined;
           const result = await runReindexMultimodal(engine, {
             limit: Number.isFinite(limitVal as number) ? (limitVal as number) : undefined,
             dryRun: args.includes('--dry-run'),
@@ -1353,6 +1398,7 @@ async function handleCliOnly(command: string, args: string[]) {
             noEmbed: args.includes('--no-embed'),
             json: args.includes('--json'),
             yes: args.includes('--yes'),
+            workers,
           });
           if (args.includes('--json')) {
             console.log(JSON.stringify(result, null, 2));
@@ -1380,6 +1426,14 @@ async function handleCliOnly(command: string, args: string[]) {
       case 'capture': {
         const { runCapture } = await import('./commands/capture.ts');
         await runCapture(engine, args);
+        break;
+      }
+      case 'conversation-parser': {
+        // v0.41.13.0 — debug + introspection CLI for the new parser
+        // cathedral. `scan <slug>` requires a connected brain; the
+        // other subcommands are pure (`list-builtins`, `validate`).
+        const { runConversationParser } = await import('./commands/conversation-parser.ts');
+        await runConversationParser(engine, args);
         break;
       }
       case 'edges-backfill': {
@@ -1443,6 +1497,13 @@ async function handleCliOnly(command: string, args: string[]) {
       case 'takes': {
         const { runTakes } = await import('./commands/takes.ts');
         await runTakes(engine, args);
+        break;
+      }
+      case 'onboard': {
+        // v0.41.18.0 (T13) — gbrain onboard. Thin shell over T2 library
+        // + T4 onboard checks + T12 render layer.
+        const { runOnboard } = await import('./commands/onboard.ts');
+        await runOnboard(engine, args);
         break;
       }
       case 'founder': {
