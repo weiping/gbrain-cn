@@ -623,6 +623,9 @@ async function cmdExtract(engine: BrainEngine, rest: string[]): Promise<void> {
   }
 
   const { extractTakesFromPages } = await import('../core/extract-takes-from-pages.ts');
+  // Model resolution is handled inside extractTakesFromPages:
+  //   opts.model → GBRAIN_FACTS_EXTRACTION_MODEL env → 'anthropic:claude-haiku-4-5'
+  // No need to pass model here unless a per-call override is required.
   const result = await extractTakesFromPages(engine, {
     bootstrapEnabled: true,
     dryRun,

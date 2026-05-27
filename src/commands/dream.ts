@@ -54,6 +54,8 @@ interface DreamArgs {
    * Never auto-applied for --input (codex finding #3).
    */
   bypassDreamGuard: boolean;
+  /** v0.39+: per-source cycle — writes last_full_cycle_at to sources.config on completion. */
+  sourceId: string | null;
 }
 
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -110,6 +112,9 @@ function parseArgs(args: string[]): DreamArgs {
   // --input implies --phase synthesize.
   if (inputFile && !phase) phase = 'synthesize';
 
+  const sourceIdx = args.indexOf('--source');
+  const sourceId = sourceIdx !== -1 ? (args[sourceIdx + 1] ?? null) : null;
+
   return {
     json: args.includes('--json'),
     dryRun: args.includes('--dry-run'),
@@ -122,6 +127,7 @@ function parseArgs(args: string[]): DreamArgs {
     from,
     to,
     bypassDreamGuard: args.includes('--unsafe-bypass-dream-guard'),
+    sourceId,
   };
 }
 
@@ -288,6 +294,7 @@ export async function runDream(engine: BrainEngine | null, args: string[]): Prom
     synthFrom: opts.from ?? undefined,
     synthTo: opts.to ?? undefined,
     synthBypassDreamGuard: opts.bypassDreamGuard,
+    sourceId: opts.sourceId ?? undefined,
   });
 
   if (opts.json) {

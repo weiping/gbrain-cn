@@ -114,7 +114,15 @@ export async function extractTakesFromPages(
     };
   }
 
-  if (!isAvailable('chat')) {
+  // If a model override is provided (e.g. zhipu:glm-4.7), check availability
+  // for that specific model rather than the gateway's default chat model.
+  // Resolution order: opts.model → GBRAIN_FACTS_EXTRACTION_MODEL env → hardcoded default.
+  const effectiveModel =
+    opts.model ??
+    process.env.GBRAIN_FACTS_EXTRACTION_MODEL ??
+    'anthropic:claude-haiku-4-5';
+  const checkModel = effectiveModel;
+  if (!isAvailable('chat', checkModel)) {
     return {
       pages_scanned: 0,
       claims_extracted: 0,
@@ -173,17 +181,26 @@ export async function extractTakesFromPages(
 
     let response: { text: string };
     try {
-      response = await chat({
-        model: opts.model ?? 'anthropic:claude-haiku-4-5',
-        system: CLASSIFIER_SYSTEM,
-        messages: [
-          {
-            role: 'user',
-            content: `<page slug="${page.slug}" type="${page.type}">\n${text}\n</page>`,
-          },
-        ],
-        maxTokens: 2000,
-      });
+      // Per-page timeout: prevents slow/hanging LLM calls from blocking the
+      // entire extraction run. Default 30s; override via GBRAIN_FACTS_EXTRACTION_TIMEOUT_S.
+      const timeoutSec = parseInt(process.env.GBRAIN_FACTS_EXTRACTION_TIMEOUT_S ?? '30', 10);
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error(`takes-extract: per-page timeout (${timeoutSec}s)`)), timeoutSec * 1000)
+      );
+      response = await Promise.race([
+        chat({
+          model: effectiveModel,
+          system: CLASSIFIER_SYSTEM,
+          messages: [
+            {
+              role: 'user',
+              content: `<page slug="${page.slug}" type="${page.type}">\n${text}\n</page>`,
+            },
+          ],
+          maxTokens: 2000,
+        }),
+        timeoutPromise,
+      ]);
     } catch {
       // Skip pages whose chat call fails (rate limit, content filter,
       // transient error). Per-page progress continues.

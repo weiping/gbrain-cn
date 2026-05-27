@@ -28,6 +28,7 @@ test/.cache/
 
 .claude/
 .pi/
+.github/
 export/
 
 # Conductor workspace-local agent artifacts: plans, todos, run-unit-parallel
