@@ -11,6 +11,7 @@ export {
   type SchemaPackManifest,
   type PackPageType,
   type PackLinkType,
+  type ExtractableSpec,
   SchemaPackManifestSchema,
   SchemaPackManifestError,
   parseSchemaPackManifest,
@@ -110,7 +111,10 @@ export {
 
 export {
   extractableTypesFromPack,
+  extractableSpecsFromPack,
+  getExtractableSpec,
   isExtractableType,
+  refuseVerifierPathInV042,
 } from './extractable.ts';
 
 export {
