@@ -1,7 +1,6 @@
 ---
 title: acme-example
 type: companies
-slug: companies/acme-example
 ---
 
 # acme-example

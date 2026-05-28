@@ -1,7 +1,6 @@
 ---
 title: "On conviction"
 type: essay
-slug: writing/on-conviction
 date: 2026-04-19
 ---
 

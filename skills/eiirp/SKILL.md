@@ -37,6 +37,19 @@ tools:
   - add_timeline_entry
 mutating: true
 writes_pages: true
+writes_to:
+  - people
+  - companies
+  - deals
+  - meetings
+  - concepts
+  - projects
+  - civic
+  - writing
+  - guides
+  - analysis
+---
+
 # EIIRP files across the full canonical set — the actual destination
 # per page is decided by brain-taxonomist consulting the active schema
 # pack via `gbrain schema show --json`. List the gbrain-recommended set

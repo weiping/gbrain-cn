@@ -14,6 +14,7 @@
 import type { BrainEngine } from './engine.ts';
 import type { PageType } from './types.ts';
 import { embed } from './embedding.ts';
+import { slugifyPath } from './sync.ts';
 
 // ─── Entity references ──────────────────────────────────────────
 
@@ -44,8 +45,10 @@ export type LinkResolutionType = 'qualified' | 'unqualified';
  *   - Our domain extensions: tech, finance, personal, openclaw (domain-organized wikis)
  *   - Our entity prefix: entities (we kept some legacy entities/projects/ pages)
  *   - Content organization: inbox, daily, illustrations (navigation and content hubs)
+ *   - v0.41.x: vault content directories (Notes, Archive, Books, Papers, Reports, etc.)
+ *     Matched case-insensitively via the 'i' flag on WIKILINK_RE / ENTITY_REF_RE.
  */
-const DIR_PATTERN = '(?:people|companies|meetings|concepts|deal|civic|project|projects|source|media|yc|tech|finance|personal|openclaw|entities|inbox|daily|illustrations)';
+const DIR_PATTERN = '(?:people|companies|meetings|concepts|deal|civic|project|projects|source|media|yc|tech|finance|personal|openclaw|entities|inbox|daily|illustrations|notes|archive|books|ideas|papers|prompts|reading|references|reports|admin)';
 
 /**
  * Match `[Name](path)` markdown links pointing to entity directories.
@@ -59,7 +62,7 @@ const DIR_PATTERN = '(?:people|companies|meetings|concepts|deal|civic|project|pr
  */
 const ENTITY_REF_RE = new RegExp(
   `\\[([^\\]]+)\\]\\((?:\\.\\.\\/)*(${DIR_PATTERN}\\/[^)\\s]+?)(?:\\.md)?\\)`,
-  'g',
+  'gi',
 );
 
 /**
@@ -72,7 +75,7 @@ const ENTITY_REF_RE = new RegExp(
  */
 const WIKILINK_RE = new RegExp(
   `\\[\\[(${DIR_PATTERN}\\/[^|\\]#]+?)(?:#[^|\\]]*?)?(?:\\|([^\\]]+?))?\\]\\]`,
-  'g',
+  'gi',
 );
 
 /**
@@ -257,6 +260,8 @@ export function extractEntityRefs(content: string): EntityRef[] {
     if (!slug) continue;
     if (slug.includes('://')) continue;
     if (slug.endsWith('.md')) slug = slug.slice(0, -3);
+    // v0.41.x: normalize slug to DB format (lowercase + slugify, CJK preserved)
+    slug = slugifyPath(slug);
     const displayName = (match[3] || slug).trim();
     const dir = slug.split('/')[0];
     refs.push({ name: displayName, slug, dir, sourceId });
@@ -272,6 +277,8 @@ export function extractEntityRefs(content: string): EntityRef[] {
     if (!slug) continue;
     if (slug.includes('://')) continue;
     if (slug.endsWith('.md')) slug = slug.slice(0, -3);
+    // v0.41.x: normalize slug to DB format (lowercase + slugify, CJK preserved)
+    slug = slugifyPath(slug);
     const displayName = (match[2] || slug).trim();
     const dir = slug.split('/')[0];
     refs.push({ name: displayName, slug, dir });
