@@ -1,0 +1,63 @@
+name: Copilot Auto Review
+
+on:
+  push:
+    branches: [gbrain-cn]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  request-review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          fetch-depth: 0
+
+      - name: Ensure PR exists and request Copilot review
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          COMMIT_SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -e
+
+          PR_NUMBER=$(gh pr list \
+            --repo "${REPO}" \
+            --head gbrain-cn \
+            --base main \
+            --state open \
+            --json number \
+            --jq '.[0].number')
+
+          if [ -z "$PR_NUMBER" ]; then
+            COMMIT_MSG=$(git log -1 --pretty=format:%s HEAD)
+            TITLE="${COMMIT_MSG:-feat(gbrain-cn): changes}"
+
+            printf 'Auto-created for Copilot review.\n\n- Commit: `%s`\n- Run: %s\n' \
+              "${COMMIT_SHA}" "${RUN_URL}" > /tmp/pr_body.md
+
+            PR_URL=$(gh pr create \
+              --repo "${REPO}" \
+              --base main \
+              --head gbrain-cn \
+              --title "${TITLE}" \
+              --draft \
+              --body-file /tmp/pr_body.md)
+            PR_NUMBER=$(echo "${PR_URL}" | grep -oE '[0-9]+$')
+            echo "Created PR #${PR_NUMBER}"
+          else
+            echo "PR #${PR_NUMBER} already exists"
+          fi
+
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/${REPO}/pulls/${PR_NUMBER}/requested_reviewers" \
+            -f "reviewers[]=copilot-pull-request-reviewer" \
+            && echo "Copilot review requested on PR #${PR_NUMBER}" \
+            || echo "Copilot reviewer API call failed — auto-review via Settings is still active"
