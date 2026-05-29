@@ -16,18 +16,31 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Ensure PR exists and request Copilot review
+      - name: Ensure PR exists on upstream and request Copilot review
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # GH_PAT: Personal Access Token with pull-requests:write on garrytan/gbrain
+          # Add at: weiping/gbrain-cn → Settings → Secrets → Actions → GH_PAT
+          GH_TOKEN: ${{ secrets.GH_PAT }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           COMMIT_SHA: ${{ github.sha }}
-          REPO: ${{ github.repository }}
+          UPSTREAM: garrytan/gbrain
+          BASE_BRANCH: gbrain-cn
+          FORK_OWNER: weiping
         run: |
           set -e
 
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "GH_PAT secret not set — skipping PR creation"
+            echo "Add it at: weiping/gbrain-cn → Settings → Secrets → Actions → GH_PAT"
+            exit 0
+          fi
+
+          HEAD_REF="${FORK_OWNER}:${BASE_BRANCH}"
+
           PR_NUMBER=$(gh pr list \
-            --head gbrain-cn \
-            --base master \
+            --repo "${UPSTREAM}" \
+            --head "${HEAD_REF}" \
+            --base "${BASE_BRANCH}" \
             --state open \
             --json number \
             --jq '.[0].number')
@@ -40,23 +53,24 @@ jobs:
               "${COMMIT_SHA}" "${RUN_URL}" > /tmp/pr_body.md
 
             PR_NUMBER=$(gh pr create \
-              --base master \
-              --head gbrain-cn \
+              --repo "${UPSTREAM}" \
+              --base "${BASE_BRANCH}" \
+              --head "${HEAD_REF}" \
               --title "${TITLE}" \
               --draft \
               --body-file /tmp/pr_body.md \
               --json number \
               --jq '.number')
-            echo "Created PR #${PR_NUMBER}"
+            echo "Created PR #${PR_NUMBER} on ${UPSTREAM}"
           else
-            echo "PR #${PR_NUMBER} already exists"
+            echo "PR #${PR_NUMBER} already exists on ${UPSTREAM}"
           fi
 
           gh api \
             --method POST \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            "/repos/${REPO}/pulls/${PR_NUMBER}/requested_reviewers" \
+            "/repos/${UPSTREAM}/pulls/${PR_NUMBER}/requested_reviewers" \
             -f "reviewers[]=copilot-pull-request-reviewer" \
             && echo "Copilot review requested on PR #${PR_NUMBER}" \
-            || echo "Copilot reviewer request failed — check Settings → Copilot → Code review"
+            || echo "Copilot reviewer API failed — auto-review via Settings is still active"
