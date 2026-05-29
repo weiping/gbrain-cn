@@ -1,6 +1,5 @@
 name: Copilot Auto Review
 
-# Push to gbrain-cn → ensure PR exists → request Copilot review
 on:
   push:
     branches: [gbrain-cn]
@@ -17,10 +16,15 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Ensure PR exists, then request Copilot review
+      - name: Ensure PR exists and request Copilot review
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          COMMIT_SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
         run: |
+          set -e
+
           # ── 1. Find or create PR ──────────────────────────────────────
           PR_NUMBER=$(gh pr list \
             --head gbrain-cn \
@@ -31,15 +35,22 @@ jobs:
 
           if [ -z "$PR_NUMBER" ]; then
             COMMIT_MSG=$(git log -1 --pretty=format '%s' HEAD)
+            TITLE="${COMMIT_MSG:-feat(gbrain-cn): changes}"
+
+            # Write body to file to avoid YAML/shell quoting issues
+            cat > /tmp/pr_body.md << EOF
+Auto-created for Copilot review.
+
+- Commit: \`${COMMIT_SHA}\`
+- Run: ${RUN_URL}
+EOF
+
             PR_NUMBER=$(gh pr create \
               --base master \
               --head gbrain-cn \
-              --title "${COMMIT_MSG:-feat(gbrain-cn): changes}" \
+              --title "${TITLE}" \
               --draft \
-              --body "Auto-created for Copilot review.
-
-Commit: \`${{ github.sha }}\`
-Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+              --body-file /tmp/pr_body.md \
               --json number \
               --jq '.number')
             echo "Created PR #${PR_NUMBER}"
@@ -48,12 +59,11 @@ Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.r
           fi
 
           # ── 2. Request Copilot as reviewer ────────────────────────────
-          # Copilot bot reviewer: copilot-pull-request-reviewer[bot]
           gh api \
             --method POST \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            "/repos/${{ github.repository }}/pulls/${PR_NUMBER}/requested_reviewers" \
+            "/repos/${REPO}/pulls/${PR_NUMBER}/requested_reviewers" \
             -f "reviewers[]=copilot-pull-request-reviewer" \
             && echo "Copilot review requested on PR #${PR_NUMBER}" \
-            || echo "Note: Copilot reviewer request failed (may need Settings → Copilot → Code review enabled)"
+            || echo "Copilot reviewer request failed — check Settings → Copilot → Code review"
