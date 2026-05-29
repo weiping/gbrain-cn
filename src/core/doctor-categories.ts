@@ -79,6 +79,8 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'facts_health',
   'frontmatter_integrity',
   'grade_confidence_drift',
+  'embed_staleness',
+  'entity_link_coverage',
   'graph_coverage',
   'graph_signals_coverage',
   'image_assets',
@@ -95,7 +97,9 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'stub_guard_24h',
   'sync_failures',
   'sync_freshness',
+  'takes_count',
   'takes_weight_grid',
+  'timeline_coverage',
   'unified_multimodal_coverage',
   'voice_gate_health',
 ]);
@@ -151,14 +155,17 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
  */
 export const META_CHECK_NAMES: ReadonlySet<string> = new Set([
   'cycle_phase_scope',
+  'dangling_aliases',
   'eval_capture',
   'minions_migration',
   'multi_source_drift',
+  'pack_upgrade_available',
   'schema_pack_active',
   'schema_pack_consistency',
   'schema_pack_source_drift',
   'schema_version',
   'slug_fallback_audit',
+  'type_proliferation',
   'upgrade_errors',
 ]);
 

@@ -302,17 +302,39 @@ export async function checkTimelineCoverage(
 export async function checkTakesCount(
   engine: BrainEngine,
 ): Promise<OnboardCheckResult> {
-  const takesCount = await safeCount(
-    engine,
-    `SELECT COUNT(*) AS count FROM takes`,
-  );
-
+  // PGLite + pgvector WASM: the takes.embedding (VECTOR 1536) column can
+  // cause PGLite to hang on first access when the vector WASM extension
+  // loads. COUNT(*) is safe on Postgres but can stall on PGLite because
+  // the query planner still materializes the tuple descriptor.
+  // Fix: on PGLite, use pg_class.reltuples (catalog estimate) which never
+  // touches the heap or the vector column. On Postgres, use COUNT(*) for
+  // an exact count (cheap on real pgvector).
+  let takesCount = 0;
   let bootstrapEnabled = false;
+
   try {
     const cfg = await engine.getConfig('takes.bootstrap_enabled');
     bootstrapEnabled = cfg === 'true' || cfg === '1';
   } catch {
     bootstrapEnabled = false;
+  }
+
+  if (engine.kind === 'pglite') {
+    // pg_class.reltuples: catalog-estimated row count. Zero-cost, never
+    // touches the takes heap or vector column. PGLite returns -1 when the
+    // table exists but hasn't been ANALYZEd — clamp to 0 (conservative).
+    // Returns 0 rows when the table doesn't exist yet, so safeCount
+    // yields 0 via its fallback.
+    takesCount = await safeCount(
+      engine,
+      `SELECT GREATEST(0, COALESCE(pg_class.reltuples, 0))::bigint AS count
+         FROM pg_class WHERE relname = 'takes'`,
+    );
+  } else {
+    takesCount = await safeCount(
+      engine,
+      `SELECT COUNT(*) AS count FROM takes`,
+    );
   }
 
   const remediations: RemediationStep[] = [];
