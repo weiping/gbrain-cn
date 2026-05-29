@@ -1,0 +1,69 @@
+name: Auto PR
+
+# Triggers after the Test workflow completes on the gbrain-cn branch.
+# Creates a PR to master if one doesn't already exist.
+
+on:
+  workflow_run:
+    workflows: ["Test"]
+    types: [completed]
+    branches: [gbrain-cn]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  create-pr:
+    # Only run when the triggering Test workflow succeeded
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: gbrain-cn
+          fetch-depth: 0
+
+      - name: Create PR if not exists
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Check if a PR from gbrain-cn -> master already exists
+          EXISTING=$(gh pr list \
+            --head gbrain-cn \
+            --base master \
+            --state open \
+            --json number \
+            --jq '.[0].number')
+
+          if [ -n "$EXISTING" ]; then
+            echo "PR #$EXISTING already exists — skipping creation"
+            exit 0
+          fi
+
+          # Build a title from the most recent commit on this branch
+          COMMIT_MSG=$(git log -1 --pretty=format '%s' HEAD)
+          PR_TITLE="${COMMIT_MSG:-feat(gbrain-cn): sync changes to master}"
+
+          # Count commits ahead of master for the body
+          COMMIT_COUNT=$(git rev-list --count origin/master..HEAD 2>/dev/null || echo "?")
+
+          gh pr create \
+            --base master \
+            --head gbrain-cn \
+            --title "${PR_TITLE}" \
+            --body "$(cat <<'EOF'
+## Auto-generated PR
+
+This PR was created automatically after CI passed on the **gbrain-cn** branch.
+
+- **Commits ahead of master:** ${COMMIT_COUNT}
+- **Triggered by:** ${{ github.event.workflow_run.html_url }}
+
+### Checklist
+- [ ] Tests pass (confirmed by CI above)
+- [ ] CHANGELOG updated
+- [ ] Ready for review
+EOF
+)"
+          echo "PR created successfully"
