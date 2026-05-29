@@ -593,7 +593,7 @@ async function cmdExtract(engine: BrainEngine, rest: string[]): Promise<void> {
     process.stderr.write(
       'Usage: gbrain takes extract --from-pages [--yes] [--dry-run] [--source-id <id>] [--max-pages N] [--holder <name>]\n',
     );
-    process.exit(1);
+    process.exitCode = 1; return;
   }
   const dryRun = rest.includes('--dry-run');
   const skipConfirm = rest.includes('--yes');
@@ -612,14 +612,14 @@ async function cmdExtract(engine: BrainEngine, rest: string[]): Promise<void> {
     process.stderr.write(
       `takes-bootstrap is opt-in. Enable with:\n  gbrain config set takes.bootstrap_enabled true\nThen re-run with --yes.\n`,
     );
-    process.exit(2);
+    process.exitCode = 2; return;
   }
   if (!dryRun && !skipConfirm) {
     process.stderr.write(
       `[takes extract] sends concept/atom/lore/briefing/writing/originals page content to Haiku.\n` +
       `Pass --yes to proceed (or --dry-run to preview).\n`,
     );
-    process.exit(1);
+    process.exitCode = 1; return;
   }
 
   const { extractTakesFromPages } = await import('../core/extract-takes-from-pages.ts');
@@ -635,7 +635,7 @@ async function cmdExtract(engine: BrainEngine, rest: string[]): Promise<void> {
   });
   if (result.llm_unavailable) {
     process.stderr.write(`[takes extract] chat gateway unavailable (no API key configured).\n`);
-    process.exit(2);
+    process.exitCode = 2; return;
   }
   process.stdout.write(
     `takes extract --from-pages: ${result.claims_extracted} claim(s) from ${result.pages_scanned} page(s)` +
