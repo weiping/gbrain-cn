@@ -264,8 +264,9 @@ jobs:
 
   # ──────────────────────────────────────────────────────────────────────
   # create-pr: runs ONLY when test-status exits 0 (all tests green) AND
-  # the push is to gbrain-cn (not master, not a PR). Opens a PR to master
-  # if one doesn't already exist. Idempotent — safe to re-run.
+  # the push is to gbrain-cn (not master, not a PR).
+  # Creates a cross-repo PR: weiping/gbrain-cn:gbrain-cn → garrytan/gbrain:gbrain-cn
+  # Requires secret GH_PAT: a PAT with repo scope on garrytan/gbrain.
   # ──────────────────────────────────────────────────────────────────────
   create-pr:
     needs: [test-status]
@@ -273,41 +274,50 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: write
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           fetch-depth: 0
 
-      - name: Create PR to master if not exists
+      - name: Create PR to garrytan/gbrain:gbrain-cn if not exists
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # GH_PAT must be a Personal Access Token with repo scope on garrytan/gbrain
+          # Set it at: weiping/gbrain-cn → Settings → Secrets → Actions → GH_PAT
+          GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
+          UPSTREAM="garrytan/gbrain"
+          BASE_BRANCH="gbrain-cn"
+          FORK_OWNER="weiping"
+          HEAD_REF="${FORK_OWNER}:gbrain-cn"
+
+          # Check if PR already exists on the upstream repo
           EXISTING=$(gh pr list \
-            --head gbrain-cn \
-            --base master \
+            --repo "${UPSTREAM}" \
+            --head "${HEAD_REF}" \
+            --base "${BASE_BRANCH}" \
             --state open \
             --json number \
             --jq '.[0].number')
 
           if [ -n "$EXISTING" ]; then
-            echo "PR #$EXISTING already exists — skipping"
+            echo "PR #$EXISTING already exists on ${UPSTREAM} — skipping"
             exit 0
           fi
 
           COMMIT_MSG=$(git log -1 --pretty=format '%s' HEAD)
-          PR_TITLE="${COMMIT_MSG:-feat(gbrain-cn): sync to master}"
-          COMMIT_COUNT=$(git rev-list --count origin/master..HEAD 2>/dev/null || echo "?")
+          PR_TITLE="${COMMIT_MSG:-feat(gbrain-cn): sync fork changes}"
+          COMMIT_COUNT=$(git rev-list --count HEAD ^$(git ls-remote origin refs/heads/gbrain-cn | cut -f1) 2>/dev/null || echo "?")
 
           gh pr create \
-            --base master \
-            --head gbrain-cn \
+            --repo "${UPSTREAM}" \
+            --base "${BASE_BRANCH}" \
+            --head "${HEAD_REF}" \
             --title "${PR_TITLE}" \
             --body "## Auto-generated PR
 
-All CI checks passed on **gbrain-cn** before this PR was created.
+All CI checks passed on **weiping/gbrain-cn** before this PR was created.
 
-- Commits ahead of master: ${COMMIT_COUNT}
+- Target: \`${UPSTREAM}:${BASE_BRANCH}\`
 - Commit: \`${{ github.sha }}\`
 - Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
@@ -316,4 +326,4 @@ All CI checks passed on **gbrain-cn** before this PR was created.
 - [ ] CHANGELOG updated
 - [ ] Ready for review"
 
-          echo "PR created"
+          echo "PR created on ${UPSTREAM}"
