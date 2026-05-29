@@ -25,7 +25,6 @@ jobs:
         run: |
           set -e
 
-          # ── 1. Find or create PR ──────────────────────────────────────
           PR_NUMBER=$(gh pr list \
             --head gbrain-cn \
             --base master \
@@ -37,13 +36,8 @@ jobs:
             COMMIT_MSG=$(git log -1 --pretty=format '%s' HEAD)
             TITLE="${COMMIT_MSG:-feat(gbrain-cn): changes}"
 
-            # Write body to file to avoid YAML/shell quoting issues
-            cat > /tmp/pr_body.md << EOF
-Auto-created for Copilot review.
-
-- Commit: \`${COMMIT_SHA}\`
-- Run: ${RUN_URL}
-EOF
+            printf 'Auto-created for Copilot review.\n\n- Commit: `%s`\n- Run: %s\n' \
+              "${COMMIT_SHA}" "${RUN_URL}" > /tmp/pr_body.md
 
             PR_NUMBER=$(gh pr create \
               --base master \
@@ -58,7 +52,6 @@ EOF
             echo "PR #${PR_NUMBER} already exists"
           fi
 
-          # ── 2. Request Copilot as reviewer ────────────────────────────
           gh api \
             --method POST \
             -H "Accept: application/vnd.github+json" \
