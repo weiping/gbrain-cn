@@ -302,13 +302,12 @@ export async function checkTimelineCoverage(
 export async function checkTakesCount(
   engine: BrainEngine,
 ): Promise<OnboardCheckResult> {
-  // PGLite + pgvector WASM: the takes.embedding (VECTOR 1536) column can
-  // cause PGLite to hang on any query that materializes heap rows (including
-  // COUNT, LIMIT 1, EXISTS). We use pg_class.reltuples as a proxy that never
-  // touches the heap. pg_class.reltuples = -1 means ANALYZE hasn't run;
-  // the count is genuinely unknown. In that case we return 'ok' (not 'warn')
-  // so the user isn't misled by a false "0 takes" when the actual count is
-  // unknowable without hitting the broken vector column.
+  // pgvector WASM (macOS pre-v0.41.28): COUNT(*) on takes can crash
+  // with "could not access file \"$libdir/vector\": No such file or directory"
+  // when pg_vector WASM is missing. In that case safeCount() returns 0
+  // and we show 'ok' (the 0 is a query failure, not a genuine empty table).
+  // After upstream v0.41.28 fix the crash should be gone; the simple
+  // COUNT(*) path runs on both PGLite and Postgres.
   let takesCount = 0;
   let bootstrapEnabled = false;
 
@@ -319,24 +318,10 @@ export async function checkTakesCount(
     bootstrapEnabled = false;
   }
 
-  if (engine.kind === 'pglite') {
-    // pg_class.reltuples: catalog-estimated row count. Zero-cost, never
-    // touches the takes heap or vector column. PGLite returns -1 when
-    // ANALYZE hasn't run — meaning the count is unknown, not zero.
-    // safeCount() falls back to 0 on throw, which would incorrectly show
-    // a WARN for "0 takes" when the real count is unknowable.
-    const result = await safeCount(
-      engine,
-      `SELECT pg_class.reltuples
-         FROM pg_class WHERE relname = 'takes'`,
-    );
-    takesCount = result;
-  } else {
-    takesCount = await safeCount(
-      engine,
-      `SELECT COUNT(*) AS count FROM takes`,
-    );
-  }
+  takesCount = await safeCount(
+    engine,
+    `SELECT COUNT(*) AS count FROM takes`,
+  );
 
   const remediations: RemediationStep[] = [];
   let status: 'ok' | 'warn' | 'fail' = 'ok';
@@ -345,9 +330,7 @@ export async function checkTakesCount(
   if (takesCount >= 100) {
     message = `${takesCount} takes (calibration ready)`;
   } else if (takesCount === 0) {
-    // When pg_class.reltuples is -1 (ANALYZE not run), takesCount arrives
-    // as 0 via the GREATEST(0, ...) clamp. The real count is unknown —
-    // show 'ok' rather than a misleading 'warn' that says "0 takes".
+    status = 'warn';
     if (bootstrapEnabled) {
       message = `0 takes (bootstrap eligible — gbrain takes extract --from-pages)`;
       remediations.push(makeRemediationStep({
