@@ -670,6 +670,9 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'content_sanity.bytes_block',
   'content_sanity.junk_patterns_enabled',
   'content_sanity.disabled',
+  // Takes bootstrap consent gates (A12 / A24)
+  'takes.bootstrap_enabled',
+  'takes.autopilot_allowed',
   // Misc
   'artifacts_sync_mode',
   'cross_project_learnings',
