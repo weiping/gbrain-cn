@@ -1,4 +1,4 @@
-name: Copilot Auto Review
+name: Copilot Review on Push
 
 on:
   push:
@@ -12,47 +12,27 @@ jobs:
   request-review:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
-        with:
-          fetch-depth: 0
-
-      - name: Ensure PR exists and request Copilot review
+      - name: Request Copilot review if PR exists
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          COMMIT_SHA: ${{ github.sha }}
           REPO: ${{ github.repository }}
         run: |
-          set -e
-
+          # Find any open PR from gbrain-cn (to any base branch).
+          # PRs are created manually; this workflow only triggers review on existing ones.
           PR_NUMBER=$(gh pr list \
             --repo "${REPO}" \
             --head gbrain-cn \
-            --base master \
             --state open \
             --json number \
             --jq '.[0].number')
 
           if [ -z "$PR_NUMBER" ]; then
-            COMMIT_MSG=$(git log -1 --pretty=format:%s HEAD)
-            TITLE="${COMMIT_MSG:-feat(gbrain-cn): changes}"
-
-            printf 'Auto-created for Copilot review.\n\n- Commit: `%s`\n- Run: %s\n' \
-              "${COMMIT_SHA}" "${RUN_URL}" > /tmp/pr_body.md
-
-            PR_URL=$(gh pr create \
-              --repo "${REPO}" \
-              --base master \
-              --head gbrain-cn \
-              --title "${TITLE}" \
-              --draft \
-              --body-file /tmp/pr_body.md)
-            PR_NUMBER=$(echo "${PR_URL}" | grep -oE '[0-9]+$')
-            echo "Created PR #${PR_NUMBER}"
-          else
-            echo "PR #${PR_NUMBER} already exists"
+            echo "No open PR found for gbrain-cn — skipping Copilot review."
+            echo "Create a PR manually when ready for review."
+            exit 0
           fi
 
+          echo "Found PR #${PR_NUMBER}, requesting Copilot review..."
           gh api \
             --method POST \
             -H "Accept: application/vnd.github+json" \
@@ -60,4 +40,4 @@ jobs:
             "/repos/${REPO}/pulls/${PR_NUMBER}/requested_reviewers" \
             -f "reviewers[]=copilot-pull-request-reviewer" \
             && echo "Copilot review requested on PR #${PR_NUMBER}" \
-            || echo "Copilot reviewer API call failed — check Settings > Copilot > Code review"
+            || echo "Copilot reviewer request failed (HTTP 422 = feature not enabled or no active PR)"
