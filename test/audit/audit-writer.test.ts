@@ -209,7 +209,8 @@ describe('createAuditWriter — log()', () => {
 describe('createAuditWriter — readRecent()', () => {
   it('returns events from current week, filtered by ts cutoff', async () => {
     const dir = makeDir();
-    const now = new Date('2026-05-22T12:00:00Z');
+    // Use real current time so log() and readRecent() agree on the ISO week file.
+    const now = new Date();
     await withEnv({ GBRAIN_AUDIT_DIR: dir }, async () => {
       const writer = createAuditWriter<TestEvent>({ featureName: 'read-current' });
 
@@ -219,13 +220,13 @@ describe('createAuditWriter — readRecent()', () => {
       const inWin2 = new Date(now.getTime() - 6 * 86400000).toISOString();
       const outOfWin = new Date(now.getTime() - 8 * 86400000).toISOString();
 
-      // All written to current-week file for simplicity (the readRecent
-      // window filter is what we're testing, not the cross-week walk).
+      // Write events — log() uses the real current date for the filename,
+      // so readRecent() must also use the real current date (no mocked now).
       writer.log({ ts: inWin1, message: 'in window 1' });
       writer.log({ ts: inWin2, message: 'in window 2' });
       writer.log({ ts: outOfWin, message: 'out of window' });
 
-      const recent = writer.readRecent(7, now);
+      const recent = writer.readRecent(7); // uses real now — same week as log()
       expect(recent.length).toBe(2);
       expect(recent.map(e => e.message).sort()).toEqual(['in window 1', 'in window 2']);
     });

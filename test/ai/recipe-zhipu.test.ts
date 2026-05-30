@@ -35,7 +35,7 @@ describe('recipe: zhipu', () => {
     expect(r.touchpoints.embedding!.models[0]).toBe('embedding-3');
     expect(r.touchpoints.embedding!.models).toContain('embedding-2');
     expect(r.touchpoints.embedding!.default_dims).toBe(1024);
-    expect(r.touchpoints.embedding!.dims_options).toEqual([256, 512, 1024, 2048]);
+    expect(r.touchpoints.embedding!.dims_options).toEqual([512, 1024, 1536, 2048]);
     // The default must stay HNSW-compatible.
     expect(r.touchpoints.embedding!.default_dims).toBeLessThanOrEqual(
       PGVECTOR_HNSW_VECTOR_MAX_DIMS,

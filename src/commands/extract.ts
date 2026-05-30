@@ -1335,8 +1335,37 @@ async function extractTimelineFromDB(
       }
     }
     fmLines.push('---', '');
-    const fullContent = fmLines.join('\n') + (page.compiled_truth || '') + '\n' + (page.timeline || '');
-    const entries = extractTimelineFromContent(fullContent, slug);
+
+    // Collect timeline entries from two sources, deduped by (date, summary):
+    //   1. parseTimelineEntries on the page's timeline field — handles the
+    //      standard `- **DATE** | Summary` format used by most brain pages.
+    //   2. extractTimelineFromContent on the full markdown (frontmatter +
+    //      compiled_truth + timeline) — handles the structured
+    //      `- **DATE** | Source — Summary` format and frontmatter dates.
+    const seenKeys = new Set<string>();
+    const entries: Array<{ slug: string; date: string; source: string; summary: string; detail?: string }> = [];
+
+    for (const e of parseTimelineEntries(page.timeline || '')) {
+      const key = `${e.date}::${e.summary}`;
+      if (!seenKeys.has(key)) {
+        seenKeys.add(key);
+        entries.push({ slug, date: e.date, source: 'timeline', summary: e.summary, detail: e.detail || '' });
+      }
+    }
+
+    // Pass only frontmatter + compiled_truth to extractTimelineFromContent to
+    // handle frontmatter dates and the structured `| Source — Summary` format.
+    // The timeline field itself is handled above by parseTimelineEntries, which
+    // correctly parses the simple `- **DATE** | Summary` format without the
+    // regex spanning-multiple-lines bug in extractTimelineFromContent Format 1.
+    const bodyContent = fmLines.join('\n') + (page.compiled_truth || '');
+    for (const e of extractTimelineFromContent(bodyContent, slug)) {
+      const key = `${e.date}::${e.summary}`;
+      if (!seenKeys.has(key)) {
+        seenKeys.add(key);
+        entries.push(e);
+      }
+    }
 
     for (const entry of entries) {
       if (dryRunSeen) {

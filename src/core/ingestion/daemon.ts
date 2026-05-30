@@ -432,11 +432,16 @@ export class IngestionDaemon {
     // is lying about its identity. Trust source.kind over event.source_kind.
     const effectiveEvent: IngestionEvent = { ...event, source_kind: sourceKind, source_id: sourceId };
 
-    // 2. Dedup.
-    const isNew = this.dedup.mark(sourceKind, effectiveEvent.content_hash);
-    if (!isNew) {
-      // Silent dedup hit. dedup.hits counter already incremented.
-      return;
+    // 2. Dedup — skipped for migration-mode sources (they bulk-import without
+    // 24h uniqueness semantics; two identical content_hashes from the same
+    // migration run are intentional and must both dispatch).
+    const sourceMode = state.registration.source.mode ?? 'trickle';
+    if (sourceMode !== 'migration') {
+      const isNew = this.dedup.mark(sourceKind, effectiveEvent.content_hash);
+      if (!isNew) {
+        // Silent dedup hit. dedup.hits counter already incremented.
+        return;
+      }
     }
 
     // 3. Rate limit (token-bucket-ish: count events in trailing window).
