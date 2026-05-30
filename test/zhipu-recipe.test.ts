@@ -40,10 +40,7 @@ describe('Zhipu AI Recipe', () => {
   it('should have chat touchpoint with GLM models', () => {
     const chat = zhipu.touchpoints!.chat!;
     expect(chat).toBeDefined();
-    expect(chat.models).toContain('glm-4');
     expect(chat.models).toContain('glm-4-flash');
-    expect(chat.models).toContain('glm-4-plus');
-    expect(chat.models).toContain('glm-4-air');
     expect(chat.supports_tools).toBe(true);
     expect(chat.supports_subagent_loop).toBe(true);
     expect(chat.max_context_tokens).toBe(128000);

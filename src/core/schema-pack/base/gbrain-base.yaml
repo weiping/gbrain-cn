@@ -261,7 +261,7 @@ page_types:
     path_prefixes:
       - conversations/
     aliases: []
-    extractable: true
+    extractable: false
     expert_routing: false
 
   # v0.41.11.0 — smallest extractable claim unit. NOT extractable (atoms

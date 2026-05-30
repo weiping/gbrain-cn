@@ -2693,7 +2693,7 @@ export const MIGRATIONS: Migration[] = [
     `,
   },
   {
-    version: 55,
+    version: 108,
     name: 'cjk_search_support',
     sql: '', // Engine-agnostic SQL not needed; sqlFor provides engine-specific DDL
     // gbrain-cn: CJK (Chinese/Japanese/Korean) search support.
@@ -2717,7 +2717,7 @@ export const MIGRATIONS: Migration[] = [
     },
   },
   {
-    version: 56,
+    version: 55,
     name: 'query_cache_search_lite',
     // v0.32.x (search-lite, originally claimed v52 in PR #897; renumbered
     // to v55 on merge with master to sit after eval_contradictions_cache (v52),
@@ -2818,7 +2818,7 @@ export const MIGRATIONS: Migration[] = [
     },
   },
   {
-    version: 57,
+    version: 56,
     name: 'query_cache_knobs_hash',
     // v0.32.3 search-lite mode cache contamination hotfix [CDX-4].
     //
@@ -2850,7 +2850,7 @@ export const MIGRATIONS: Migration[] = [
     `,
   },
   {
-    version: 58,
+    version: 57,
     name: 'search_telemetry_rollup',
     // v0.32.3 search-lite: per-day rollup of search-call shape.
     //
@@ -3215,7 +3215,7 @@ export const MIGRATIONS: Migration[] = [
     },
   },
   {
-    version: 67,
+    version: 109,
     name: 'edges_backfilled_at_v0_33_3',
     // v0.33.3 W0c — resumable symbol-resolution backfill watermark.
     // (Originally claimed v55; renumbered to v59, then to v67 after merging
@@ -3264,7 +3264,7 @@ export const MIGRATIONS: Migration[] = [
     `,
   },
   {
-    version: 68,
+    version: 67,
     name: 'facts_typed_claim_columns',
     // v0.35.4 — typed-claim columns for trajectory queries.
     //

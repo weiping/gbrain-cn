@@ -731,6 +731,11 @@ const COLUMN_EXEMPTIONS = new Set<string>([
   'minion_jobs.budget_remaining_cents',
   'minion_jobs.budget_owner_job_id',
   'minion_jobs.budget_root_owner_id',
+  // gbrain-cn (CJK wave) — chinese_search_vector is a TSVECTOR column for
+  // Chinese bigram search. Added by ALTER TABLE ... ADD COLUMN IF NOT EXISTS;
+  // no forward-reference index in PGLITE_SCHEMA_SQL. Migration handles fresh
+  // installs (schema blob then migration) and upgrades (IF NOT EXISTS no-ops).
+  'pages.chinese_search_vector',
 ]);
 
 test('every ALTER TABLE ADD COLUMN in MIGRATIONS is covered by applyForwardReferenceBootstrap (column-only class)', async () => {

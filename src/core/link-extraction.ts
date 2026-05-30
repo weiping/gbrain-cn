@@ -48,7 +48,7 @@ export type LinkResolutionType = 'qualified' | 'unqualified';
  *   - v0.41.x: vault content directories (Notes, Archive, Books, Papers, Reports, etc.)
  *     Matched case-insensitively via the 'i' flag on WIKILINK_RE / ENTITY_REF_RE.
  */
-const DIR_PATTERN = '(?:people|companies|meetings|concepts|deal|civic|project|projects|source|media|yc|tech|finance|personal|openclaw|entities|inbox|daily|illustrations|notes|archive|books|ideas|papers|prompts|reading|references|reports|admin)';
+const DIR_PATTERN = '(?:people|companies|meetings|concepts|deal|civic|project|projects|source|media|yc|tech|finance|personal|openclaw|entities)';
 
 /**
  * Match `[Name](path)` markdown links pointing to entity directories.

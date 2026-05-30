@@ -4,10 +4,13 @@ version: 0.1.0
 description: Universal archivist for personal file archives (Dropbox/B2/Gmail-takeout/local-mount/hard-drive-dump). Filters for high-value content (the user's own writing, ideas, relationships) and surfaces it interactively. REFUSES TO RUN without an explicit gbrain.yml `archive-crawler.scan_paths:` allow-list.
 triggers:
   - "crawl my archive"
-  - "find gold in my archive"
   - "archive crawler"
+  - "archive of old"
+  - "scan my dropbox"
   - "scan my dropbox for"
+  - "mine my old files"
   - "mine my old files for"
+  - "find gold in my archive"
 mutating: true
 writes_pages: true
 writes_to:
