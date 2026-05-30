@@ -2260,9 +2260,10 @@ async function checkSubagentCapability(engine: BrainEngine): Promise<Check> {
       const { loadConfig } = await import('../core/config.ts');
       const cfg = loadConfig();
       const chatModel = cfg?.chat_model;
-      const gatewayLoop = (cfg as Record<string, unknown> | null)?.agent &&
-        typeof (cfg as Record<string, unknown>).agent === 'object' &&
-        ((cfg as Record<string, unknown>).agent as Record<string, unknown>)?.use_gateway_loop === true;
+      const cfgAny = cfg as unknown as Record<string, unknown> | null;
+      const gatewayLoop = cfgAny?.agent &&
+        typeof (cfgAny as Record<string, unknown>).agent === 'object' &&
+        ((cfgAny as Record<string, unknown>).agent as Record<string, unknown>)?.use_gateway_loop === true;
       const { isAnthropicProvider } = await import('../core/model-config.ts');
       // gateway_loop=true routes subagent jobs through the configured chat_model;
       // no Anthropic key needed in that mode.

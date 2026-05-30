@@ -67,6 +67,13 @@ export const INGESTION_CONTENT_TYPES = [
 export type IngestionContentType = typeof INGESTION_CONTENT_TYPES[number];
 
 /**
+ * Source operating mode (v0.41 T2 — bulk migration vs trickle ingestion).
+ * Migration-mode sources are one-shot bulk importers. Trickle-mode sources
+ * run continuously.
+ */
+export type IngestionSourceMode = 'trickle' | 'migration';
+
+/**
  * Stable event the daemon receives from every source. Carries enough
  * identity for content-hash dedup at the daemon layer and enough provenance
  * for the put_page handler to stamp frontmatter without re-deriving fields.

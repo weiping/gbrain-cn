@@ -1538,7 +1538,7 @@ export class PGLiteEngine implements BrainEngine {
       params
     );
 
-    return rows.map(rowToSearchResult);
+    return (rows as Record<string, unknown>[]).map(rowToSearchResult);
   }
 
   /**

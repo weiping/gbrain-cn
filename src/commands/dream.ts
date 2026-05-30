@@ -434,7 +434,6 @@ export async function runDream(engine: BrainEngine | null, args: string[]): Prom
     synthFrom: opts.from ?? undefined,
     synthTo: opts.to ?? undefined,
     synthBypassDreamGuard: opts.bypassDreamGuard,
-    sourceId: opts.sourceId ?? undefined,
   });
 
   if (opts.json) {
