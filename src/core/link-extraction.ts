@@ -44,9 +44,8 @@ export type LinkResolutionType = 'qualified' | 'unqualified';
  *   - Gbrain canonical: people, companies, meetings, concepts, deal, civic, project, source, media, yc, projects
  *   - Our domain extensions: tech, finance, personal, openclaw (domain-organized wikis)
  *   - Our entity prefix: entities (we kept some legacy entities/projects/ pages)
- *   - Content organization: inbox, daily, illustrations (navigation and content hubs)
- *   - v0.41.x: vault content directories (Notes, Archive, Books, Papers, Reports, etc.)
- *     Matched case-insensitively via the 'i' flag on WIKILINK_RE / ENTITY_REF_RE.
+ * Note: content dirs like notes/, archive/, books/, inbox/ are intentionally excluded —
+ * they are not entity directories and should not generate graph links.
  */
 const DIR_PATTERN = '(?:people|companies|meetings|concepts|deal|civic|project|projects|source|media|yc|tech|finance|personal|openclaw|entities)';
 

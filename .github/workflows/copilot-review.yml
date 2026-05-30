@@ -28,7 +28,7 @@ jobs:
           PR_NUMBER=$(gh pr list \
             --repo "${REPO}" \
             --head gbrain-cn \
-            --base main \
+            --base master \
             --state open \
             --json number \
             --jq '.[0].number')
@@ -42,7 +42,7 @@ jobs:
 
             PR_URL=$(gh pr create \
               --repo "${REPO}" \
-              --base main \
+              --base master \
               --head gbrain-cn \
               --title "${TITLE}" \
               --draft \
