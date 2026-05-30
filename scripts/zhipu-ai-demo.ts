@@ -14,7 +14,7 @@ const config: AIGatewayConfig = {
   expansion_model: 'zhipu:glm-4.7',
   chat_model: 'zhipu:glm-4.7',
   env: {
-    ZHIPU_API_KEY: process.env.ZHIPU_API_KEY || 'd8e72d7cc79c4f1f9ee1edc8bd33a341.zCXSMTBJoj2TDbSo',
+    ZHIPU_API_KEY: process.env.ZHIPU_API_KEY ?? '',
   },
   base_urls: {
     zhipu: 'https://open.bigmodel.cn/api/paas/v4',

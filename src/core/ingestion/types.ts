@@ -157,6 +157,9 @@ export interface IngestionSource {
   /** Source kind taxonomy. The router uses this to look up processors
    *  and the dedup window to scope content-hash keys. */
   readonly kind: string;
+  /** v0.41 T2 — operating mode discriminator. Defaults to 'trickle' when
+   *  absent. Migration-mode sources are one-shot bulk importers. */
+  readonly mode?: IngestionSourceMode;
   /**
    * Begin emitting events. MUST resolve when the source is ready to emit;
    * MAY throw on unrecoverable startup failure. The daemon catches throws

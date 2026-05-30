@@ -336,9 +336,10 @@ describe('Lane E.4 — loadRecommendationContext is provider-aware', () => {
     const fnIdx = src.indexOf('async function loadRecommendationContext');
     expect(fnIdx).toBeGreaterThan(0);
     const slice = src.slice(fnIdx, fnIdx + 3000);
-    expect(slice).toContain('ZEROENTROPY_API_KEY');
-    expect(slice).toContain('zeroentropy_api_key');
-    expect(slice).toContain('zeroentropyai:');
+    // v0.40.x uses the shared recipe-aware helper (ZE strings live in
+    // brain-score-recommendations.ts via HOSTED_EMBED_KEY_CONFIG, not inline here).
+    expect(slice).toContain('embeddingProviderConfigured');
+    expect(slice).toContain('HOSTED_EMBED_KEY_CONFIG');
     // Reads from gateway, not DB.
     expect(slice).toContain('gateway');
   });
