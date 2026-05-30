@@ -9,35 +9,44 @@ permissions:
   pull-requests: write
 
 jobs:
-  request-review:
+  ensure-ready-for-review:
     runs-on: ubuntu-latest
     steps:
-      - name: Request Copilot review if PR exists
+      - name: Ensure open PR is non-draft (triggers Copilot auto-review)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          # Find any open PR from gbrain-cn (to any base branch).
-          # PRs are created manually; this workflow only triggers review on existing ones.
-          PR_NUMBER=$(gh pr list \
+          # Copilot auto-review fires when commits land on a non-draft open PR.
+          # This step converts draft → ready-for-review so Copilot picks up
+          # every push without needing the collaborator API.
+          PR_JSON=$(gh pr list \
             --repo "${REPO}" \
             --head gbrain-cn \
             --state open \
-            --json number \
-            --jq '.[0].number')
+            --json number,isDraft \
+            --jq '.[0]')
 
-          if [ -z "$PR_NUMBER" ]; then
-            echo "No open PR found for gbrain-cn — skipping Copilot review."
-            echo "Create a PR manually when ready for review."
+          if [ -z "$PR_JSON" ] || [ "$PR_JSON" = "null" ]; then
+            echo "No open PR for gbrain-cn — skipping. Create one manually when ready."
             exit 0
           fi
 
-          echo "Found PR #${PR_NUMBER}, requesting Copilot review..."
-          gh api \
-            --method POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "/repos/${REPO}/pulls/${PR_NUMBER}/requested_reviewers" \
-            -f "reviewers[]=copilot-pull-request-reviewer" \
-            && echo "Copilot review requested on PR #${PR_NUMBER}" \
-            || echo "Copilot reviewer request failed (HTTP 422 = feature not enabled or no active PR)"
+          PR_NUMBER=$(echo "$PR_JSON" | jq -r '.number')
+          IS_DRAFT=$(echo "$PR_JSON" | jq -r '.isDraft')
+
+          echo "PR #${PR_NUMBER}, draft=${IS_DRAFT}"
+
+          if [ "$IS_DRAFT" = "true" ]; then
+            echo "Converting draft → ready for review (triggers Copilot)..."
+            gh api graphql -f query="
+              mutation {
+                markPullRequestReadyForReview(input: {pullRequestId: \"$(
+                  gh api repos/${REPO}/pulls/${PR_NUMBER} --jq .node_id
+                )\"}) {
+                  pullRequest { isDraft }
+                }
+              }"
+          else
+            echo "PR #${PR_NUMBER} is already ready for review — Copilot reviews on sync."
+          fi
