@@ -53,5 +53,11 @@ jobs:
             echo "PR #${PR_NUMBER} already exists"
           fi
 
-          echo "PR #${PR_NUMBER} is ready for review."
-          echo "Enable Copilot auto-review in the fork's GitHub Settings > Copilot > Code review."
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/${REPO}/pulls/${PR_NUMBER}/requested_reviewers" \
+            -f "reviewers[]=copilot-pull-request-reviewer" \
+            && echo "Copilot review requested on PR #${PR_NUMBER}" \
+            || echo "Copilot reviewer API call failed — check Settings > Copilot > Code review"
