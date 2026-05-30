@@ -4297,7 +4297,7 @@ export class PGLiteEngine implements BrainEngine {
     // dashboard, v0.10.3 metrics give entity-page-level granularity.
     const { rows: [h] } = await this.db.query(`
       WITH all_pages AS (
-        SELECT id, slug FROM pages
+        SELECT id, slug, type FROM pages
       )
       SELECT
         (SELECT count(*) FROM pages) as page_count,
@@ -4318,10 +4318,14 @@ export class PGLiteEngine implements BrainEngine {
         (SELECT count(*) FROM content_chunks WHERE embedded_at IS NULL) as missing_embeddings,
         (SELECT count(*) FROM links) as link_count,
         (SELECT count(DISTINCT page_id) FROM timeline_entries) as pages_with_timeline,
-        -- Extended to all pages (not just person/company) for broader graph coverage insight.
+        -- Entity-scoped link coverage (person/company/organization/entity pages
+        -- with >= 1 inbound link). Used only by checkEntityLinkCoverage;
+        -- kept here for the getHealth() contract. See #530.
         (SELECT count(*) FROM all_pages e
-         WHERE EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = e.id))::float /
-          GREATEST((SELECT count(*) FROM all_pages), 1)::float as link_coverage,
+         WHERE e.type IN ('person', 'company', 'organization', 'entity')
+           AND EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = e.id))::float /
+          GREATEST((SELECT count(*) FROM all_pages e
+                    WHERE e.type IN ('person', 'company', 'organization', 'entity')), 1)::float as link_coverage,
         (SELECT count(*) FROM all_pages e
          WHERE EXISTS (SELECT 1 FROM timeline_entries te WHERE te.page_id = e.id))::float /
           GREATEST((SELECT count(*) FROM all_pages), 1)::float as timeline_coverage

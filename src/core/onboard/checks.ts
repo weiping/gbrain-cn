@@ -137,15 +137,19 @@ export async function checkEntityLinkCoverage(
     : 100;
   const sampleClause = useSample ? `TABLESAMPLE BERNOULLI (${samplePct.toFixed(2)})` : '';
 
-  // Sample query: counts entities with inbound links
+  // Sample query: counts entities with inbound links.
+  //
+  // NOTE: this matches the semantics of getHealth().link_coverage as computed
+  // in pglite-engine.ts / postgres-engine.ts (counts pages with at least one
+  // inbound link). The graph_coverage check surfaces the same number as a
+  // percentage of ALL pages; this check reports it as a percentage of entity
+  // pages specifically.
   const linkedCount = await safeCount(
     engine,
-    `SELECT COUNT(*) AS count FROM (
-       SELECT p.id FROM pages p ${sampleClause}
-       WHERE p.type IN ('person', 'company', 'organization', 'entity')
-         AND p.deleted_at IS NULL
-         AND EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = p.id)
-     ) sub`,
+    `SELECT COUNT(*) AS count FROM pages p ${sampleClause}
+     WHERE p.type IN ('person', 'company', 'organization', 'entity')
+       AND p.deleted_at IS NULL
+       AND EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = p.id)`,
   );
   const sampleSize = useSample
     ? Math.max(1, Math.round(totalEntities * (samplePct / 100)))
