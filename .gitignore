@@ -50,3 +50,5 @@ reports/network-intelligence/
 media/x/
 media/articles/
 meetings/transcripts/
+
+.codegraph/
