@@ -2,6 +2,272 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.3.0] - 2026-05-30
+
+**Search now returns the *confident handful* instead of a fixed wall of results
+— automatically. When you ask something with one clear answer, you get one
+result; when there are genuinely a few, you get those few; you stop getting 20
+loosely-related pages just because 20 was the limit. No flag to turn on — it is
+the default.**
+
+Here is the problem it fixes. Ask your brain "what's the door code for the
+cabin" and the old default would hand back 20 results: the right one on top, then
+19 things that merely mention cabins or codes. You (or the agent reading the
+results) then wade through the pile. That is fine for "show me everything about
+X," but it is noise when the question has a small answer. The new behavior,
+called **autocut**, looks at how the relevance scores drop off and cuts the list
+where the scores fall off a cliff. One obvious answer comes back as one result.
+A real cluster of three comes back as three. A broad question with no clear
+winner still returns the full set, so you never lose recall when you actually
+want breadth.
+
+The important detail, and why this is trustworthy where a naive version would
+not be: autocut cuts on the **reranker's** score, not the raw search score.
+gbrain already measured that the raw search score gap looks the same whether the
+top hit is right or wrong — it is not a reliable "is this the answer" signal. The
+cross-encoder reranker score *is*. So autocut only runs in the search modes where
+the reranker runs (the default `balanced` mode and `tokenmax`), and it is a clean
+no-op everywhere else. It can never return zero results when matches exist, and
+it never runs on a page the reranker did not actually score.
+
+### How to use it
+
+Nothing. It is on by default in the `balanced` and `tokenmax` search modes. The
+`conservative` mode (no reranker) is unaffected.
+
+Your agent gets one new lever on the `query` tool — `autocut: false` — to force
+the full top-K back when it deliberately wants breadth (broad exploration, "list
+everything about X," or when it suspects the top hit is wrong and wants to see
+the alternatives). It almost never needs to set it; the default is the smart path.
+
+Per-brain knobs if you want to tune or disable:
+
+```bash
+gbrain config set search.autocut false        # turn autocut off for this brain
+gbrain config set search.autocut_jump 0.30     # require a steeper cliff to cut (default 0.20)
+gbrain search modes                            # see autocut / autocut_jump per-mode
+gbrain query "what is X" --explain             # shows each result's rerank score + the cut
+```
+
+### What a concrete example looks like
+
+Query: "cabin door code" against a brain on the default mode. The reranker scores
+the candidates, autocut sees the cliff, and you get:
+
+| Result | Rerank score | Kept? |
+|---|---|---|
+| `notes/cabin-access` | 0.95 | yes (above the cliff) |
+| `notes/cabin-packing-list` | 0.22 | no (below the cliff) |
+| `notes/lake-house-wifi` | 0.18 | no |
+| ...17 more | <0.2 | no |
+
+One result instead of twenty. Ask "everything about the cabin" instead and the
+scores come back flat (no cliff) — autocut declines and you get the full set.
+
+### Things to know about
+
+- **One-time cache cold-start on upgrade.** The query cache key changed
+  (it now distinguishes autocut-on from autocut-off results), so every cached
+  search row is invalidated once on upgrade and the cache refills over the next
+  hour (`search.cache.ttl_seconds`, default 3600s). This is a global one-time
+  miss spike, including in `conservative` mode where autocut is a no-op — the
+  cache key is shared. Same pattern as prior search upgrades.
+- **`conservative` mode gets no precision change** — it has no reranker, so there
+  is no trustworthy cliff to cut on. Autocut is a documented no-op there. Use
+  `balanced` or `tokenmax` to get it.
+- **Default search mode reranks a few more candidates per query.** To make
+  autocut correct, the reranker now scores the full returned set (50 in
+  `tokenmax`, 25 in `balanced`, up from 30) so there is never a returned-but-
+  unscored result that autocut might wrongly drop. The extra rerank cost is
+  rounding error next to the downstream model.
+- **This is one wave of a larger retrieval redesign** ([#1663](https://github.com/garrytan/gbrain/issues/1663)).
+  Still to come: query-shape routing, a structural exact-lookup tier, and
+  automatic escalation to `think` on low-confidence queries. The issue stays open.
+
+### Itemized changes
+
+- **New `src/core/search/autocut.ts`** — pure score-discontinuity algorithm.
+  Normalizes the reranker scores, finds the largest gap, and cuts there when the
+  gap clears a sensitivity threshold (`autocut_jump`, default 0.20). Robust to
+  unsorted provider output (cuts on a sorted copy, keeps items in input order),
+  guards against unusable score scales (top ≤ 0, non-finite), and never returns
+  empty. No-ops when fewer than 2 results carry a reranker score (covers the
+  reranker's fail-open path).
+- **`query` tool gains an `autocut` boolean** — the ceiling override. Description
+  teaches the agent it is the smart default and `false` is the breadth escape
+  hatch, and distinguishes it from `adaptive_return` (cuts by score cliff vs.
+  caps by question intent). The keyword-only `search` tool is unchanged (no
+  reranker there).
+- **`gbrain search modes`** lists `autocut` + `autocut_jump` with per-knob source
+  attribution; **`--explain`** shows each result's rerank score and an autocut
+  summary line; the metric glossary documents `autocut.signal` + `autocut.gap_ratio`.
+- **Reranker now scores the full returned set** in `balanced` (25) and `tokenmax`
+  (50) so autocut never drops an unscored tail.
+- **Cache-meta fix (found during review):** the cached search path was silently
+  dropping the `adaptive_return` decision (and would have dropped `autocut`,
+  `mode`, `embedding_column`) from the metadata it reports. All are now carried
+  through, so `--explain` and eval-capture report the real decision on cache
+  writeback and hits.
+- `rerank_score` is now a first-class field on search results.
+- Cache-key version bumped (7 → 8) to fold in the autocut knobs (stacked on master's title_boost v=7).
+- **In-repo eval gate** (`bun run eval:autocut`, also runs in CI) measures the
+  precision-lift-without-recall-regression claim default-ON rests on, over
+  labeled qrels fixtures with realistic cross-encoder score distributions — no
+  API key, no external repo. Current result: mean precision 0.33 → 0.94, mean
+  recall 1.00 → 0.95, and **zero recall regression on enumeration queries**
+  (autocut declines on flat curves by construction). Floors are env-overridable.
+  A live-corpus PrecisionMemBench run remains an optional empirical confirmation,
+  not a blocker.
+## [0.42.2.0] - 2026-05-30
+
+**One command now wires Claude Code, Codex, or Perplexity Computer to a remote
+gbrain when all you have is a bearer token. `gbrain connect <url> --token <tok>`
+prints a paste-ready block, or `--install` runs it for you and checks the token
+actually works before you walk away.**
+
+If your brain runs somewhere as an HTTP server (`gbrain serve --http`) and you
+have a token, connecting an agent used to mean remembering the exact
+`claude mcp add ... -H "Authorization: Bearer ..."` incantation, getting the
+`/mcp` path right, and hoping the token was valid. Now you run one command.
+It normalizes the URL (adds `/mcp`, rejects a bare host so you don't silently
+point at the wrong thing), and the block it prints tells the agent to call
+`get_brain_identity` and `list_skills` so it immediately knows whose brain this
+is and everything it can do. No local brain, no proxy, no OAuth dance: the agent
+talks straight to your remote over HTTP.
+
+Pick your agent with `--agent`:
+
+- **claude-code** (default): `claude mcp add ... -H "Authorization: Bearer ..."`.
+  `--install` runs it.
+- **codex**: `codex mcp add <name> --url <url> --bearer-token-env-var
+  GBRAIN_REMOTE_TOKEN`. Codex reads the token from the env var at runtime, so the
+  secret never lands in Codex's config file. `--install` runs it.
+- **perplexity**: prints the exact connector fields to paste into Perplexity's
+  Settings → Connectors (it's a GUI connector, so no `--install`). Defaults to a
+  bearer token, but since Perplexity is a cloud service the recommended path is
+  **OAuth**: `--agent perplexity --oauth --register` mints a least-privilege
+  client and prints the Issuer URL + Client ID + Client Secret. OAuth means the
+  connector mints short-lived, scoped access tokens instead of holding a
+  long-lived full-access secret.
+- **generic**: prints the URL + `Authorization` header (or OAuth fields with
+  `--oauth`) for any other MCP client.
+
+How to use it (run anywhere gbrain is installed):
+
+```
+gbrain auth create "claude-code"                          # mint a token on the host
+gbrain connect https://your-host/mcp --token gbrain_xxx   # print the paste block
+gbrain connect https://your-host --token gbrain_xxx --install   # or wire it + verify the token
+```
+
+`--install` runs `claude mcp add` for you, then makes one real call to your brain
+so a wrong or expired token fails right then instead of silently 401-ing on the
+agent's first question. `--json` gives you a machine-readable version with the
+token redacted (pass `--show-token` if you really want it inlined).
+
+A note on the token: a `gbrain auth create` token is long-lived and full-access.
+The printed block single-quotes it so pasting it can't accidentally run shell
+code, the command refuses to send it to a link-local or cloud-metadata address,
+and error output never echoes it. Keep it private, and prefer a scoped token if
+your host supports one.
+
+**Two ways to give a coding agent a memory, written down end to end.** Connecting
+to a remote brain is one funnel. The other is starting from nothing: `gbrain init
+--pglite` gives you a local brain in 2 seconds, and `claude mcp add gbrain --
+gbrain serve` (or `codex mcp add gbrain -- gbrain serve`) wires it straight into
+your agent with no server, no token, no tunnel. The new tutorial,
+[Give your coding agent a memory](docs/tutorials/connect-coding-agent.md), walks
+both funnels with copy-paste commands, then hands you the brain-first protocol to
+paste into `CLAUDE.md` / `AGENTS.md` and the four habits that make it worth it
+(brain-first lookup, ambient capture, briefing from your brain, whoknows). The
+README now has a "Quick start: Claude Code or Codex" fork that separates the
+lightweight retrieval path from the full autonomous install, and `INSTALL.md`
+shows the one-command wire-up right where the standalone CLI section ends.
+
+**`gbrain serve --http` now tells you when your skills are invisible.** If
+`mcp.publish_skills` is OFF, a connected agent can search and write but can't call
+`list_skills` / `get_skill` — so your skill catalog (the thing that makes an
+OpenClaw setup special) silently doesn't show up. The startup banner now prints a
+`Skills: published / not published` line, and when it's off you get a one-line
+nudge with the exact fix: `gbrain config set mcp.publish_skills true`. New brains
+from `gbrain init` default it ON; brains upgraded from before stay OFF until you
+opt in, which is the common gotcha.
+
+**Fixed: `connect` told agents to call a tool that doesn't exist over MCP.** The
+self-orientation block named `capture` as a core tool, but `capture` is a CLI-only
+convenience command, not an MCP tool — an agent that followed the instruction got
+"unknown tool." The block now names `put_page`, the real MCP write tool. A new
+end-to-end test spawns `gbrain serve` over stdio and drives the official MCP SDK
+client through `initialize` → `tools/list` → `tools/call`, so the advertised tool
+set is now pinned against what the server actually exposes (the local stdio funnel
+had zero coverage before this).
+
+## To take advantage of v0.42.2.0
+
+`gbrain upgrade` is all you need. `gbrain connect` is available immediately after
+upgrade. To wire up a coding agent:
+
+1. On the brain host (or anywhere gbrain is installed), mint a token:
+   ```bash
+   gbrain auth create "claude-code"
+   ```
+2. Generate the onboarding block (or wire it directly):
+   ```bash
+   gbrain connect https://your-host/mcp --token <the-token>
+   # or, on the machine you want to connect:
+   gbrain connect https://your-host/mcp --token <the-token> --install
+   ```
+3. Paste the printed block into Claude Code. It connects the MCP server and
+   tells the agent to call `get_brain_identity` + `list_skills`.
+4. Verify: in Claude Code, ask it to `search` for something in your brain.
+
+If anything looks wrong, `gbrain connect --help` lists every flag, and
+`docs/mcp/CLAUDE_CODE.md` covers the local-stdio path too.
+
+### Itemized changes
+
+#### Added
+- **`gbrain connect <mcp-url>`** generates (or, with `--install`, runs) the MCP
+  wiring for a remote gbrain from a bearer token. Flags: `--token`, `--name`,
+  `--agent claude-code|codex|perplexity|generic`, `--install`, `--yes`, `--force`,
+  `--json`, `--show-token`, `--timeout-ms`. Reads the token from `--token` or
+  `$GBRAIN_REMOTE_TOKEN`; in print mode the token is optional (it emits a
+  `<paste-your-token>` placeholder).
+- **Per-agent setup**: `--agent codex` emits `codex mcp add ... --bearer-token-env-var
+  GBRAIN_REMOTE_TOKEN` (token read from the env var at runtime, never written to
+  Codex config; `--install` runs it). `--agent perplexity` prints the URL + token
+  for Perplexity's Settings → Connectors GUI (no `--install`). `--agent generic`
+  prints the URL + `Authorization` header for any other MCP client. Docs:
+  `docs/mcp/CLAUDE_CODE.md` (leads with `gbrain connect`, keeps the local stdio
+  path), new `docs/mcp/CODEX.md`, updated `docs/mcp/PERPLEXITY.md`, and the README.
+- **`--install` smoke-tests the token.** After registering the server it makes a
+  real `get_brain_identity` call over the bearer connection and warns loudly on
+  a 401, unreachable host, or timeout, so a bad token fails at setup instead of
+  on the agent's first request. Supported for claude-code and codex (Perplexity
+  is GUI-only).
+- **OAuth client-credentials path (`--oauth`, perplexity + generic).** The
+  correct path when the credential lives on a third-party cloud: instead of a
+  long-lived full-access bearer token, the connector gets an Issuer URL + Client
+  ID + Client Secret and mints its own short-lived, scoped access tokens.
+  `--oauth --register` mints a least-privilege client on the host in one command;
+  `--oauth --client-id X --client-secret Y` uses an existing one (runs anywhere).
+  The full chain (register → OAuth discovery → `/token` → tool call) is proven by
+  a new end-to-end test against a live server.
+
+#### Fixed
+- **`gbrain auth create <name>` no longer drops the name.** On the bare form
+  (no `--takes-holders` flag) the name was silently discarded and the command
+  printed usage instead of minting a token. It now creates the token as
+  documented.
+
+#### Security
+- The connection command single-quotes the rendered `claude mcp add` so a token
+  containing shell metacharacters can't run code when the block is pasted;
+  validates the token to keep it out of HTTP headers; refuses to send the token
+  to link-local / cloud-metadata addresses (including IPv4-mapped IPv6 forms);
+  redacts the token from all error output and from `--json` unless `--show-token`;
+  and requires `--yes` for `--install` in a non-interactive shell.
+
 ## [0.42.1.0] - 2026-05-29
 
 **Skill self-improvement no longer starts from a blank file.**
