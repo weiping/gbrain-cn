@@ -52,3 +52,5 @@ media/articles/
 meetings/transcripts/
 
 .codegraph/
+.understand-anything/
+graphify-out/
