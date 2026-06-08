@@ -140,10 +140,6 @@ use generic placeholders (`alice-example`, `acme-example`, `fund-a`).
 If you are a fork, regenerate `llms.txt` + `llms-full.txt` with your own URL base before
 publishing: `LLMS_REPO_BASE=https://raw.githubusercontent.com/your-org/your-fork/main bun run build:llms`.
 
-后续工作流：
-  - 同步上游：git fetch origin && git merge origin/master（在 master 分支）
-  - 推送你的修改：git push fork gbrain-cn（已设为默认 tracking）
-
 ---
 
 ## CLAUDE.md
@@ -301,6 +297,7 @@ project resolves through `src/core/search/mode.ts`.
 | `intentWeighting`             | true           | true       | true           |
 | `tokenBudget`                 | **4000**       | **12000**  | **off**        |
 | `expansion` (LLM multi-query) | false          | false      | **true**       |
+| `relationalRetrieval`         | false          | **true**   | **true**       |
 | `searchLimit` default         | 10             | 25         | 50             |
 
 **Cost anchors (downstream agent input cost — gbrain itself is rounding error).**
@@ -358,6 +355,19 @@ through `embedding_voyage` (1024d Voyage) can't be served a cache row
 written against `embedding` (1536d OpenAI). Existing v=2 rows become
 unreachable on first re-query (one-time miss spike on upgrade);
 `mode.ts:KNOBS_HASH_VERSION` is the single source of truth.
+
+**v0.42.34.0 knobs_hash v=9 → v=10.** Folds the `relationalRetrieval` knob +
+depth into the cache key so a relational-on result set can't be served to a
+relational-off lookup (same contamination class as graph_signals). One-time
+miss spike on upgrade.
+
+**Relational retrieval (v0.42.34.0).** `relationalRetrieval` (on for
+balanced/tokenmax) adds a fourth recall arm: a relational query ("who invested
+in X", "what connects A and B") resolves its seed entity and walks the typed-edge
+graph (`src/core/search/relational-recall.ts` + `relational-intent.ts`,
+`engine.relationalFanout`), injecting edge-derived answers into RRF. Within-source,
+deterministic, mentions-excluded by default, pure no-op for non-relational queries.
+The `query` op's `relational` flag forces it on/off per call.
 
 **Three CLI surfaces:**
 
@@ -1268,7 +1278,6 @@ This is the dispatcher. Skills are the implementation. **Read the skill file bef
 | "What do we know about", "tell me about", "search for", "who is", "background on", "notes on" | `skills/query/SKILL.md` |
 | "Who knows who", "relationship between", "connections", "graph query" | `skills/query/SKILL.md` (use graph-query) |
 | Creating/enriching a person or company page | `skills/enrich/SKILL.md` |
-| Backfill page.type, find untyped pages | `skills/brain-taxonomist/SKILL.md` |
 | Where does a new file go? Filing rules | `skills/repo-architecture/SKILL.md` |
 | "where does this brain page go", "file this in the brain", "brain taxonomist", "taxonomy check", "refile brain page", "which directory does this page go" | `skills/brain-taxonomist/SKILL.md` |
 | "EIIRP", "everything in its right place", "store this research", "put this in the brain", "make this re-doable", "DRY this up", "file all of this", "organize all of this work", "archive this research thread" | `skills/eiirp/SKILL.md` |
@@ -1289,7 +1298,6 @@ This is the dispatcher. Skills are the implementation. **Read the skill file bef
 | "watch this video", "process this YouTube link", "ingest this PDF", "save this podcast", "process this book", "summarize this book", "PDF book", "ingest it into my brain", "what's in this screenshot", "check out this repo" | `skills/media-ingest/SKILL.md` |
 | Meeting transcript received | `skills/meeting-ingestion/SKILL.md` |
 | Generic "ingest this" (auto-routes to above) | `skills/ingest/SKILL.md` |
-| "capture this", "save this thought", "remember this" | `skills/capture/SKILL.md` |
 
 ## Thinking skills (from GStack)
 
@@ -1316,7 +1324,7 @@ This is the dispatcher. Skills are the implementation. **Read the skill file bef
 | "Skillify this", "is this a skill?", "make this proper" | `skills/skillify/SKILL.md` |
 | "Compress my resolver", "AGENTS.md too large", "RESOLVER.md too big", "functional area dispatcher", "shrink routing table" | `skills/functional-area-resolver/SKILL.md` |
 | "Is gbrain healthy?", morning health check, skillpack-check | `skills/skillpack-check/SKILL.md` |
-| "harvest this skill into gbrain", "harvest my skill into gbrain", "publish this skill to gbrain", "fork only skill upstream", "lift this skill upstream", "lift this skill back into gbrain", "share this skill with other gbrain clients", "skill with the gbrain bundle", "promote my skill to gbrain", "promote this skill to gbrain", "want this skill in the gbrain", "custom skill into the gbrain core" | `skills/skillpack-harvest/SKILL.md` |
+| "harvest this skill into gbrain", "publish this skill to gbrain", "lift this skill upstream", "share this skill with other gbrain clients", "promote my skill to gbrain" | `skills/skillpack-harvest/SKILL.md` |
 | Post-restart health + auto-fix, "did the container restart break anything", smoke test | `skills/smoke-test/SKILL.md` |
 | Cross-modal review, second opinion | `skills/cross-modal-review/SKILL.md` |
 | "Validate skills", skill health check | `skills/testing/SKILL.md` |
@@ -1332,9 +1340,7 @@ This is the dispatcher. Skills are the implementation. **Read the skill file bef
 | "Now what?", "fill my brain", "cold start", "bootstrap", "import my data", "what should I import first" | `skills/cold-start/SKILL.md` |
 | "Migrate from Obsidian/Notion/Logseq" | `skills/migrate/SKILL.md` |
 | Brain health check, maintenance run | `skills/maintain/SKILL.md` |
-| Evolve brain schema, add/remove page types | `skills/schema-author/SKILL.md` |
 | "Extract links", "build link graph", "populate timeline" | `skills/maintain/SKILL.md` (extraction sections) |
-| "everything in its right place", "eiirp", "organize all of this" | `skills/eiirp/SKILL.md` |
 | "Run dream", "process today's session", "synthesize my conversations", "consolidate yesterday's conversations", "what patterns did you see", "did the dream cycle run" | `skills/maintain/SKILL.md` (dream cycle section) |
 | "Brain health", "what features am I missing", "brain score" | Run `gbrain features --json` |
 | "Set up autopilot", "run brain maintenance", "keep brain updated" | Run `gbrain autopilot --install --repo ~/brain` |
@@ -1377,15 +1383,16 @@ These apply to ALL brain-writing skills:
 
 | Trigger | Skill |
 |---------|-------|
-| "personalized version of this book", "personalized version", "mirror this book", "two-column book", "two-column book analysis", "chapter-by-chapter", "book to my life", "apply this book to my life", "how does this book apply to me" | `skills/book-mirror/SKILL.md` |
-| "enrich this article", "batch enrich", "enriching the article", "enrich brain pages", "enrich pass", "enrich the article", "make brain pages useful" | `skills/article-enrichment/SKILL.md` |
-| "strategic reading", "through the lens of", "read this through the lens of", "apply this to my problem", "what can I learn from this", "extract a playbook", "extract a playbook from this" | `skills/strategic-reading/SKILL.md` |
-| "concept synthesis", "synthesize my concepts", "patterns across my notes", "intellectual map", "idea evolution", "find patterns across my notes", "trace idea evolution", "build my intellectual map", "canon vs riff" | `skills/concept-synthesis/SKILL.md` |
-| "perplexity research", "perplexity-research", "brain doesn't already cover", "yc w26", "focus on the delta", "what changed about this funding", "what's new about this", "current state of", "web research", "web research pass", "surface new developments" | `skills/perplexity-research/SKILL.md` |
-| "crawl my archive", "archive crawler", "archive of old", "scan my dropbox", "scan my dropbox for", "mine my old files", "mine my old files for", "find gold in my archive" | `skills/archive-crawler/SKILL.md` |
-| "verify this academic claim", "academic verify", "check this study", "validate citation", "retraction watch", "Retraction Watch", "is this study real" | `skills/academic-verify/SKILL.md` |
-| "make pdf from brain", "brain pdf", "brain page to pdf", "page as pdf", "export brain page", "convert brain page to pdf", "publish this page as pdf" | `skills/brain-pdf/SKILL.md` |
-| "voice note", "voice memo", "audio message", "audio note", "ingest this voice memo", "transcribe and file", "voice note ingest", "save this audio note" | `skills/voice-note-ingest/SKILL.md` |
+| "personalized version of this book", "mirror this book", "two-column book analysis", "apply this book to my life", "how does this book apply to me" | `skills/book-mirror/SKILL.md` |
+| "enrich this article", "enrich brain pages", "batch enrich", "make brain pages useful" | `skills/article-enrichment/SKILL.md` |
+| "strategic reading", "read this through the lens of", "apply this to my problem", "what can I learn from this about", "extract a playbook from" | `skills/strategic-reading/SKILL.md` |
+| "concept synthesis", "synthesize my concepts", "find patterns across my notes", "build my intellectual map", "trace idea evolution" | `skills/concept-synthesis/SKILL.md` |
+| "idea lineage", "trace the lineage of this idea", "how my thinking about", "how has my thinking about", "what is my current version of", "show reversals in my thinking about", "where did this idea come from" | `skills/idea-lineage/SKILL.md` |
+| "perplexity research", "what's new about", "current state of", "web research", "what changed about" | `skills/perplexity-research/SKILL.md` |
+| "crawl my archive", "find gold in my archive", "archive crawler", "scan my dropbox for", "mine my old files for" | `skills/archive-crawler/SKILL.md` |
+| "verify this academic claim", "check this study", "academic verify", "validate citation", "is this study real" | `skills/academic-verify/SKILL.md` |
+| "make pdf from brain", "brain pdf", "convert brain page to pdf", "publish this page as pdf", "export brain page" | `skills/brain-pdf/SKILL.md` |
+| "voice note", "ingest this voice memo", "transcribe and file", "voice note ingest", "save this audio note" | `skills/voice-note-ingest/SKILL.md` |
 | "add a page type", "add a type to my schema", "schema author", "schema mutate", "schema pack add", "my brain has untyped pages", "propose new types from my corpus", "backfill page types", "evolve my schema", "researcher type", "make X an expert type" (dispatcher for: gbrain schema active/list/show/validate/graph/lint/stats/explain/use/downgrade/reload/init/fork/edit/diff/add-type/remove-type/update-type/add-alias/remove-alias/add-prefix/remove-prefix/add-link-type/remove-link-type/set-extractable/set-expert-routing/detect/suggest/review-candidates/review-orphans/sync) | `skills/schema-author/SKILL.md` |
 | "unify my types", "migrate to gbrain-base-v2", "94 types to 14", "apply canonical taxonomy", "clean up my page types", "pack upgrade", "shrink type proliferation", "consolidate page types", "retype pages to canonical" (dispatcher for: gbrain onboard --check, gbrain onboard --check --explain, gbrain jobs submit unify-types, gbrain pages restore) | `skills/schema-unify/SKILL.md` |
 
@@ -1415,77 +1422,6 @@ It's easier to ship a daemon that runs 24/7 to ingest, enrich, and consolidate t
 > **~30 minutes to a fully working brain.** Database ready in 2 seconds (PGLite, no server). You just answer questions about API keys.
 
 > **LLMs:** fetch [`llms.txt`](llms.txt) for the documentation map, or [`llms-full.txt`](llms-full.txt) for the same map with core docs inlined in one fetch. **Agents:** start with [`AGENTS.md`](AGENTS.md) (or [`CLAUDE.md`](CLAUDE.md) if you're Claude Code).
-
-## gbrain-cn: Zhipu AI & CJK Support
-
-> This is the **gbrain-cn** fork. It adds native Chinese AI provider support and CJK full-text search on top of upstream gbrain. 中文文档: [README.zh-CN.md](README.zh-CN.md)
-
-### What's added
-
-| Feature | Detail |
-|---|---|
-| **Zhipu AI (智谱 AI)** | `embedding-3` (1024 / 1536 / 2048 dims), `glm-4.7` for chat + query expansion |
-| **CJK search** | Native bigram tokenization — no external deps, full PGLite + Postgres support |
-| **Nodejieba (optional)** | Professional-grade Chinese segmentation for technical/domain corpora |
-| **Chinese wikilink resolution** | `[[中文标题]]` wikilinks resolve via vector search fallback |
-| **Variable embedding dims** | `embedding-3` supports 1024 / 1536 / 2048; set via `EMBEDDING_DIMENSIONS` |
-
-### Quick setup
-
-```bash
-# 1. Set environment variables (~/.zshrc)
-export ZHIPUAI_API_KEY="your_key_here"
-export EMBEDDING_MODEL="zhipu:embedding-3"
-export EMBEDDING_DIMENSIONS="1536"
-export EMBEDDING_BASE_URL="https://open.bigmodel.cn/api/paas/v4"
-export CHAT_MODEL="zhipu:glm-4.7"
-export EXPANSION_MODEL="zhipu:glm-4.7"
-
-# 2. Init brain
-gbrain init
-
-# 3. Sync and embed your vault
-gbrain sync --repo ~/your-vault
-gbrain embed --stale
-
-# 4. Verify
-gbrain doctor
-```
-
-Get your API key at [open.bigmodel.cn](https://open.bigmodel.cn/usercenter/apikeys).
-
-Full guides: [Zhipu AI setup](docs/guides/zhipu-ai-setup.md) · [Variable dimensions](docs/guides/zhipu-ai-dimensions.md) · [CJK search](docs/cjk-enhancement.md)
-
-### Nodejieba: professional Chinese segmentation (optional)
-
-By default gbrain-cn uses a **native bigram tokenizer** — no dependencies, works everywhere. For technical corpora (AI papers, product docs, domain-specific terms), enable [nodejieba](https://github.com/yanyiwu/nodejieba) for word-boundary-aware segmentation:
-
-```bash
-# Install
-npm install nodejieba --legacy-peer-deps
-
-# Enable
-export GBRAIN_USE_NODEJIEBA=true
-
-# Rebuild tsvector indexes for existing pages
-gbrain sync --force
-```
-
-Tokenization comparison on real text:
-
-| Text | Native bigram (tokens) | Nodejieba (words) |
-|---|---|---|
-| 人工智能大语言模型 | 人、工、智、能、大、语、言… (17) | **人工智能**、大、语言、模型 (4) |
-| 知识图谱与向量检索 | 知、识、图、谱、与… (17) | **知识**、**图谱**、与、**向量**、**检索** (5) |
-| 我今天参加了技术分享会议 | 23 single/bigram tokens | 我、今天、参加、了、技术、分享、**会议** (7) |
-
-**When to use nodejieba:** technical documentation, academic papers, domain-specific corpora where compound terms (人工智能, 知识图谱) must be matched as units. For everyday notes, the native bigram tokenizer gives excellent recall without the installation overhead.
-
-> Note: brand names mixing Chinese + English (e.g. `智谱AI`) are split character-by-character by nodejieba since they're not in the default dictionary. Add custom words via `nodejieba.addWord('智谱AI')` if needed.
-
-> **Embedding providers:** OpenAI is the default, but gbrain ships with **14 recipes** covering Voyage, Google Gemini, Azure OpenAI, MiniMax, Alibaba DashScope, Zhipu, Ollama (local), llama.cpp llama-server (local), LiteLLM proxy (universal), and 5 more. Run `gbrain providers list` to see them, or read [`docs/integrations/embedding-providers.md`](docs/integrations/embedding-providers.md) for setup, pricing, and a decision tree. `gbrain doctor` will surface alternative providers whose env vars you already have set.
-
-> **New in v0.32.3.0 — compress your AGENTS.md without losing accuracy:** if your downstream agent fork has grown a 25KB+ `AGENTS.md` / `RESOLVER.md`, the new [`functional-area-resolver`](skills/functional-area-resolver/SKILL.md) skill ships a two-layer dispatch pattern that compresses 25KB → 13KB (48% the size) while **beating** the verbose baseline by +13 to +17pp across Opus 4.7, Sonnet 4.6, and Haiku 4.5. A/B eval harness, cross-model receipts, and reproduction instructions live at [`evals/functional-area-resolver/`](evals/functional-area-resolver/). The static-prompt analog of AnyTool / RAG-MCP / Anthropic Agent Skills progressive disclosure — single-LLM-pass dispatch, no second routing call.
 
 ## What this looks like
 
@@ -2694,6 +2630,17 @@ hashes match. If both a cron and `--watch` fire simultaneously, no conflict.
    instant sync, the receiving server must be running and reachable. If the
    server is down when a push happens, that sync is missed. Pair webhooks
    with a cron fallback that catches anything the webhook missed.
+
+4. **A single un-parseable file can't wedge all indexing.** When a file fails
+   to import (malformed YAML frontmatter, an unquoted colon, etc.), sync holds
+   the bookmark and tells you exactly which file broke — a *fresh* failure
+   fails closed so nothing is silently dropped. But a file that fails the same
+   way `GBRAIN_SYNC_AUTOSKIP_AFTER` consecutive syncs (default 3, set `0` to
+   disable) is auto-skipped so the rest of the brain keeps indexing past it.
+   Skipped files don't disappear: `gbrain doctor` keeps warning until you fix
+   or delete them, and fixing the file clears it on the next sync. A repository
+   history rewrite still hard-blocks even with `--skip-failed`. Run
+   `gbrain sync --skip-failed` to acknowledge a known-bad set yourself.
 
 ## How to Verify
 
