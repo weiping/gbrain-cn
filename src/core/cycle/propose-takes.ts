@@ -227,12 +227,26 @@ export async function defaultExtractor(
     .replace('{EXISTING_TAKES_JSON}', JSON.stringify(input.existingTakes, null, 2))
     .replace('{PAGE_BODY}', input.pageBody);
 
-  const result = await gatewayChat({
-    messages: [{ role: 'user', content: prompt }],
-    ...(input.modelHint ? { model: input.modelHint } : {}),
-    maxTokens: 2048,
+  // Custom timeout via Promise.race. gbrain's gatewayChat has a 20s default
+  // (configurable via GBRAIN_AI_CHAT_TIMEOUT_MS), but Zhipu retries internally
+  // on rate limit, and AI SDK retries up to 3 times on transient errors.
+  // Race against an explicit 45s ceiling so a single bad page can't
+  // monopolize a 100-page cycle.
+  const TIMEOUT_MS = 45_000;
+  const timeout = new Promise<never>((_, reject) => {
+    setTimeout(() => reject(new Error(`extractor timeout ${TIMEOUT_MS}ms`)), TIMEOUT_MS);
   });
 
+  const chatCall = gatewayChat({
+    messages: [{ role: 'user', content: prompt }],
+    // v0.x: use glm-4-flash by default for take extraction. Take extraction
+    // is short-form JSON (3-5 claims per page); flash handles it in 4-5s
+    // vs glm-4.7's 30-50s, and 5x more requests fit in the per-minute
+    // Zhipu rate-limit window. Caller can still override via modelHint.
+    model: input.modelHint ?? 'zhipu:glm-4-flash',
+    maxTokens: 1024,
+  });
+  const result = await Promise.race([chatCall, timeout]);
   // ChatResult.text is already the concatenated text content.
   return parseExtractorOutput(result.text);
 }
@@ -373,18 +387,33 @@ class ProposeTakesPhase extends BaseCyclePhase {
 
       // Call the extractor. Errors on a single page log a warning but do not abort.
       let proposals: ProposedTake[];
-      try {
-        proposals = await extractor({
-          pagePath: page.slug,
-          pageBody: body,
-          existingTakes,
-          modelHint: opts.model,
-        });
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        result.warnings.push(`extractor failed on ${page.slug}: ${msg}`);
-        continue;
+      let lastErr: unknown = null;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          proposals = await extractor({
+            pagePath: page.slug,
+            pageBody: body,
+            existingTakes,
+            modelHint: opts.model,
+          });
+          lastErr = null;
+          break;
+        } catch (err) {
+          lastErr = err;
+          const msg = err instanceof Error ? err.message : String(err);
+          // v0.x: Zhipu rate-limit. Empirical recovery is ~30s (single LLM call
+          // returns 200 in 1.3s after a 30s sleep). One retry with 30s backoff
+          // is enough; a second hit means Zhipu is hard-throttling the account
+          // for the day and we should bail to keep the cycle moving.
+          if (/速率限制|rate.?limit|429|Throttling/i.test(msg) && attempt === 0) {
+            await new Promise((r) => setTimeout(r, 30_000));
+            continue;
+          }
+          result.warnings.push(`extractor failed on ${page.slug}: ${msg}`);
+          break;
+        }
       }
+      if (lastErr) continue;
 
       // Write proposals to take_proposals. Each row is a separate INSERT
       // because the composite idempotency key is on the per-page tuple — a
