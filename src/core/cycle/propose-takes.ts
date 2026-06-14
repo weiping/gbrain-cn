@@ -386,7 +386,7 @@ class ProposeTakesPhase extends BaseCyclePhase {
       }
 
       // Call the extractor. Errors on a single page log a warning but do not abort.
-      let proposals: ProposedTake[];
+      let proposals: ProposedTake[] = [];
       let lastErr: unknown = null;
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
