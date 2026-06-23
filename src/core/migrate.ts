@@ -2693,7 +2693,7 @@ export const MIGRATIONS: Migration[] = [
     `,
   },
   {
-    version: 108,
+    version: 120, // renumbered 108→120 on master merge that landed v0.41.31's pages_embedding_signature at v108
     name: 'cjk_search_support',
     sql: '', // Engine-agnostic SQL not needed; sqlFor provides engine-specific DDL
     // gbrain-cn: CJK (Chinese/Japanese/Korean) search support.
@@ -3215,11 +3215,11 @@ export const MIGRATIONS: Migration[] = [
     },
   },
   {
-    version: 109,
+    version: 121, // renumbered 109→121 on master merge that landed v0.41.32's sources_newest_content_at at v109
     name: 'edges_backfilled_at_v0_33_3',
     // v0.33.3 W0c — resumable symbol-resolution backfill watermark.
-    // (Originally claimed v55; renumbered to v59, then to v67 after merging
-    // master's v55-v66 migrations.)
+    // (Originally claimed v55; renumbered to v59, then to v67, then v109,
+    // then v121 after merging master's migrations at v108-v109.)
     //
     // The within-file two-pass resolver (src/core/chunkers/symbol-resolver.ts)
     // walks every content_chunks row that has unresolved edges
