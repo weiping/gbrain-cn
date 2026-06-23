@@ -5875,13 +5875,20 @@ export async function buildChecks(
       const hint =
         'Run: gbrain extract links --by-mention   (auto-links entity mentions in body text). ' +
         'Run gbrain orphans for the list.';
-      if (ratio > 0.8) {
+      // gbrain-cn: configurable thresholds for note-centric brains whose
+      // note/concept pages naturally lack inbound links (verified 0/392 notes
+      // carry [[wikilink]]). Defaults preserve upstream behavior (0.8/0.5).
+      // Set via ~/.gbrain/config.json -> doctor.orphan_ratio.{fail,warn}_threshold.
+      const oc = (loadConfig() as unknown as Record<string, any>)?.doctor?.orphan_ratio ?? {};
+      const failTh = typeof oc.fail_threshold === 'number' ? oc.fail_threshold : 0.8;
+      const warnTh = typeof oc.warn_threshold === 'number' ? oc.warn_threshold : 0.5;
+      if (ratio > failTh) {
         checks.push({
           name: 'orphan_ratio',
           status: 'fail',
           message: `Orphan ratio ${pct}%${inSource} (${data.total_orphans}/${data.total_linkable} linkable pages have no inbound links)${caveat}. ${hint}`,
         });
-      } else if (ratio > 0.5) {
+      } else if (ratio > warnTh) {
         checks.push({
           name: 'orphan_ratio',
           status: 'warn',
