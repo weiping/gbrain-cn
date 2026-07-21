@@ -67,6 +67,55 @@ import { hasCJK, escapeLikePattern } from './cjk.ts';
 
 type PGLiteDB = PGlite;
 
+// ---- Self-heal query timeout (issue #223 class) ----
+
+/**
+ * Ceiling for PGLite queries. PGLite is in-process WASM with no kernel-level
+ * cancellation: under sustained multi-phase load OR after a mid-write SIGTERM
+ * leaves WAL/catalog dirty, a query's backing async op can wedge — the JS
+ * thread parks in the event loop (kevent64 at 0% CPU) waiting for a
+ * completion that never arrives. Without a ceiling the caller hangs forever
+ * and the process must be SIGKILL'd, which worsens the WAL corruption and
+ * creates a vicious cycle (next run also wedges). Racing the query against
+ * this ceiling makes a wedged query fail fast so the CLI exits cleanly and
+ * the next invocation's WAL recovery handles the dirty state.
+ *
+ * 0 = disabled (legacy hang behavior). Default 60s — generous vs. the
+ * longest legit single query (search paths already cap themselves at 8s via
+ * statement_timeout; batch inserts / migrations are many small queries, each
+ * fast). Override per-process via GBRAIN_PGLITE_QUERY_TIMEOUT_MS.
+ */
+const DEFAULT_PGLITE_QUERY_TIMEOUT_MS = 60_000;
+let _cachedPgliteQueryTimeoutMs: number | null = null;
+function pgliteQueryTimeoutMs(): number {
+  if (_cachedPgliteQueryTimeoutMs !== null) return _cachedPgliteQueryTimeoutMs;
+  const raw = process.env.GBRAIN_PGLITE_QUERY_TIMEOUT_MS;
+  if (raw === undefined || raw === '') {
+    _cachedPgliteQueryTimeoutMs = DEFAULT_PGLITE_QUERY_TIMEOUT_MS;
+  } else {
+    const n = Number.parseFloat(raw);
+    _cachedPgliteQueryTimeoutMs = Number.isFinite(n) && n >= 0 ? n : DEFAULT_PGLITE_QUERY_TIMEOUT_MS;
+  }
+  return _cachedPgliteQueryTimeoutMs;
+}
+
+/** Test-only: reset the cached timeout so an env change takes effect mid-run. */
+export function _resetPgliteQueryTimeoutCacheForTests(): void {
+  _cachedPgliteQueryTimeoutMs = null;
+}
+
+/** Thrown when a PGLite query exceeds the self-heal ceiling (issue #223 class). */
+export class PGLiteQueryTimeoutError extends Error {
+  constructor(public readonly sqlPreview: string, public readonly timeoutMs: number) {
+    super(
+      `PGLite query timed out after ${timeoutMs}ms (issue #223 class — WASM wedged, ` +
+      `likely dirty WAL/catalog from a prior mid-write crash). The CLI will exit ` +
+      `cleanly; the next invocation runs WAL recovery. SQL: ${sqlPreview.slice(0, 80)}`,
+    );
+    this.name = 'PGLiteQueryTimeoutError';
+  }
+}
+
 // ---- CJK Search Support (v0.30+) ----
 
 /**
@@ -5400,13 +5449,38 @@ export class PGLiteEngine implements BrainEngine {
       throw new DOMException('aborted', 'AbortError');
     }
     const queryPromise = this.db.query(sql, params).then((r) => r.rows as T[]);
-    if (!opts?.signal) return queryPromise;
-    const abortPromise = new Promise<T[]>((_resolve, reject) => {
-      opts.signal!.addEventListener('abort', () => {
-        reject(new DOMException('aborted', 'AbortError'));
-      }, { once: true });
-    });
-    return Promise.race([queryPromise, abortPromise]);
+
+    // Self-heal ceiling (issue #223 class, gbrain-cn). Race against a generous
+    // timeout so a wedged WASM query fails fast instead of parking the event
+    // loop forever. The timer is unref'd (won't keep the process alive on its
+    // own) and cleared on settle (no leak). Disable via
+    // GBRAIN_PGLITE_QUERY_TIMEOUT_MS=0.
+    const timeoutMs = pgliteQueryTimeoutMs();
+    if (timeoutMs <= 0 && !opts?.signal) return queryPromise;
+
+    const racers: Promise<T[]>[] = [queryPromise];
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    if (timeoutMs > 0) {
+      racers.push(new Promise<T[]>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new PGLiteQueryTimeoutError(sql, timeoutMs)),
+          timeoutMs,
+        );
+        (timer as { unref?: () => void }).unref?.();
+      }));
+    }
+    if (opts?.signal) {
+      racers.push(new Promise<T[]>((_, reject) => {
+        opts.signal!.addEventListener('abort', () => {
+          reject(new DOMException('aborted', 'AbortError'));
+        }, { once: true });
+      }));
+    }
+    try {
+      return await Promise.race(racers);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   /**

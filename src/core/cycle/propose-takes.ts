@@ -135,7 +135,7 @@ export type ProposeTakesExtractor = (input: {
 export interface ProposeTakesOpts extends BasePhaseOpts {
   /** Brain repo root for fs-source page walking. Optional — defaults to engine pages. */
   repoPath?: string;
-  /** Limit pages processed in this cycle (for triage / quick smoke). Default: 100. */
+  /** Limit pages processed in this cycle (for triage / quick smoke). Default: 30 — small enough to complete well within typical per-cycle/per-phase timeouts (see issue #223 class: a slow propose_takes that always hits a timeout gets SIGTERM'd mid-write, leaving PGLite WAL dirty → next run wedges). Override via opts.pageLimit or config `cycle.propose_takes.page_limit`. */
   pageLimit?: number;
   /** Inject the LLM call for tests; production uses gateway.chat. */
   extractor?: ProposeTakesExtractor;
@@ -302,6 +302,23 @@ class ProposeTakesPhase extends BaseCyclePhase {
   protected readonly budgetUsdKey = 'cycle.propose_takes.budget_usd';
   protected readonly budgetUsdDefault = 5.0;
 
+  /**
+   * Resolve the per-cycle page cap. Precedence: explicit opts.pageLimit →
+   * config `cycle.propose_takes.page_limit` → 30. The default is small on
+   * purpose so the phase finishes in ~1-2 min instead of always exceeding a
+   * per-phase timeout and getting SIGTERM'd mid-write (issue #223 class — a
+   * mid-write SIGTERM dirties PGLite WAL and the next run wedges).
+   */
+  private resolvePageLimit(ctx: OperationContext): number {
+    const raw = (ctx.config as unknown as Record<string, unknown>)['cycle.propose_takes.page_limit'];
+    if (typeof raw === 'number' && Number.isFinite(raw) && raw >= 0) return Math.floor(raw);
+    if (typeof raw === 'string') {
+      const n = Number.parseInt(raw, 10);
+      if (Number.isFinite(n) && n >= 0) return n;
+    }
+    return 30;
+  }
+
   protected override mapErrorCode(err: unknown): string {
     if (err instanceof GBrainError) return err.problem;
     if (err instanceof Error) {
@@ -314,12 +331,12 @@ class ProposeTakesPhase extends BaseCyclePhase {
   protected async process(
     engine: BrainEngine,
     scope: ScopedReadOpts,
-    _ctx: OperationContext,
+    ctx: OperationContext,
     opts: ProposeTakesOpts,
   ): Promise<{ summary: string; details: Record<string, unknown>; status?: PhaseStatus }> {
     const extractor = opts.extractor ?? defaultExtractor;
     const promptVersion = opts.promptVersion ?? PROPOSE_TAKES_PROMPT_VERSION;
-    const pageLimit = opts.pageLimit ?? 100;
+    const pageLimit = opts.pageLimit ?? this.resolvePageLimit(ctx);
     const skipPagesWithFence = opts.skipPagesWithFence ?? false;
     const proposalRunId = `propose-${new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '')}-${randomUUID().slice(0, 8)}`;
 
