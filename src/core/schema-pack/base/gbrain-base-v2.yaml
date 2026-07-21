@@ -556,3 +556,12 @@ mapping_rules:
     to_type: note
     subtype_field: legacy_type
     subtype: "*original_type*"
+
+# Phase participation. The runCycle orchestrator gates pack-flavored
+# phases on this list (see src/core/cycle.ts:packDeclaresPhase). The
+# pre-existing 17 core phases ALWAYS run regardless — `phases:` is
+# additive, not subtractive. Declared here so the active brain opts
+# into extract_atoms on every cycle, keeping extract_atoms_backlog
+# drained instead of relying on manual `dream --drain` runs.
+phases:
+  - extract_atoms
