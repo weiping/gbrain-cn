@@ -54,3 +54,5 @@ meetings/transcripts/
 .codegraph/
 .understand-anything/
 graphify-out/
+.agents/
+.codex/
