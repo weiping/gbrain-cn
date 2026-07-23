@@ -3052,7 +3052,46 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
     }
   }
 
-  const modelStr = modelStrEarly;
+  // ---- chat fallback chain (chat_fallback_chain) ----
+  // Try the primary model first, then each configured fallback in order. Only
+  // transient/infrastructure errors (timeout, connection, 5xx, 429 — normalized
+  // to AITransientError) advance to the next candidate; AIConfigError (4xx, bad
+  // model id/key) propagates at once. When a chain is configured the SDK's own
+  // per-call retries are disabled so a dead primary fails fast at the chat
+  // timeout and the chain advances (otherwise the SDK burns 3× timeout/model).
+  const _chainCfg = requireConfig();
+  const _fallbackChain = (_chainCfg.chat_fallback_chain ?? []).filter(
+    (m): m is string => typeof m === 'string' && m.trim().length > 0,
+  );
+  const _seen = new Set<string>();
+  const candidates: string[] = [];
+  for (const m of [modelStrEarly, ..._fallbackChain]) {
+    if (m && !_seen.has(m)) { _seen.add(m); candidates.push(m); }
+  }
+  const useFallbackChain = candidates.length > 1;
+
+  // Budget records exactly once per chat() call (success OR final failure), so
+  // declared outside the loop: a failed intermediate candidate must NOT record,
+  // otherwise it would crowd out the successful fallback's real usage.
+  let _budgetRecorded = false;
+  const _recordBudget = (modelLabel: string, inputTokens: number, outputTokens: number): void => {
+    if (!tracker || _budgetRecorded) return;
+    _budgetRecorded = true;
+    try {
+      tracker.record({
+        modelId: modelLabel,
+        inputTokens,
+        outputTokens,
+        label: 'gateway.chat',
+      });
+    } catch {
+      // BudgetExhausted (TX1) raised here; surface via next reserve()
+    }
+  };
+
+  for (let ci = 0; ci < candidates.length; ci++) {
+    const modelStr = candidates[ci];
+    const isLastCandidate = ci === candidates.length - 1;
   const { model, recipe, modelId } = await resolveChatProvider(modelStr);
   const cfg = requireConfig();
 
@@ -3125,21 +3164,7 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
     }
   }
 
-  let _budgetRecorded = false;
-  const _recordBudget = (modelLabel: string, inputTokens: number, outputTokens: number): void => {
-    if (!tracker || _budgetRecorded) return;
-    _budgetRecorded = true;
-    try {
-      tracker.record({
-        modelId: modelLabel,
-        inputTokens,
-        outputTokens,
-        label: 'gateway.chat',
-      });
-    } catch {
-      // BudgetExhausted (TX1) raised here; surface via next reserve()
-    }
-  };
+  // (_budgetRecorded / _recordBudget are declared above, before the fallback loop.)
 
   // The actual Anthropic system-prompt cache breakpoint. A bare string
   // `system` produces `{ role: 'system', content }` with no `providerOptions`
@@ -3169,6 +3194,9 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
       // v0.42.20.0 — default a chat timeout (composes with the caller's signal,
       // shorter wins). Covers native-anthropic (the default provider + facts Haiku).
       abortSignal: withDefaultTimeout(opts.abortSignal, AI_CHAT_TIMEOUT_MS),
+      // Fallback chain active → no SDK-internal retries: a dead primary fails
+      // fast at the chat timeout so the chain advances to the next model.
+      maxRetries: useFallbackChain ? 0 : undefined,
       providerOptions: Object.keys(providerOptions).length > 0 ? providerOptions : undefined,
     });
 
@@ -3226,15 +3254,34 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
       providerMetadata,
     };
   } catch (err) {
-    // Pessimistic fallback (A3 amended): when err.usage isn't there, charge
-    // the worst-case ceiling — better to overcount on failure than under.
+    const normalized = normalizeAIError(err, `chat(${recipe.id}:${modelId})`);
+    // Fallback chain: a transient/infrastructure error (AITransientError —
+    // timeout, connection, 5xx, 429) advances to the next candidate.
+    // AIConfigError (4xx, bad model id, bad key) throws at once: the same
+    // request would fail identically on a fallback. Intermediate failures are
+    // NOT budget-recorded — only the final outcome records, so a failed
+    // primary doesn't crowd out the successful fallback's real usage.
+    if (!isLastCandidate && normalized instanceof AITransientError) {
+      console.warn(
+        `[gateway.chat] ${recipe.id}:${modelId} transient failure` +
+          ` (${(normalized as Error).message?.slice(0, 140) || normalized.name});` +
+          ` falling back to ${candidates[ci + 1]}`,
+      );
+      continue;
+    }
+    // Last candidate failed, or non-transient error → pessimistic budget
+    // charge (A3 amended: overcount on failure rather than under) + throw.
     const fallback = _extractUsageFromError(err, {
       inputTokens: estimatedInputTokens,
       outputTokens: maxOutputTokens,
     });
     _recordBudget(`${recipe.id}:${modelId}`, fallback.inputTokens, fallback.outputTokens);
-    throw normalizeAIError(err, `chat(${recipe.id}:${modelId})`);
+    throw normalized;
   }
+  } // end for (chat fallback chain)
+  // Unreachable: the loop returns on first success or throws on the last
+  // candidate's failure. Defensive guard for control-flow exhaustiveness.
+  throw normalizeAIError(new Error('chat: exhausted all fallback candidates'), 'chat');
 }
 
 // ---- Tool loop (v0.38 — D11 + D6/D7 gateway-native subagent path) ----
