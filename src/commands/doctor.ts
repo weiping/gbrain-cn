@@ -3058,7 +3058,7 @@ export async function computeConversationFactsBacklogCheck(
     const typesRaw = await engine.getConfig(
       'cycle.conversation_facts_backfill.types',
     );
-    let types = ['conversation', 'meeting', 'slack', 'email'];
+    let types = ['conversation', 'meeting', 'slack', 'email', 'imessage', 'imessage-daily'];
     if (typesRaw) {
       try {
         const parsed = JSON.parse(typesRaw);
@@ -4347,7 +4347,7 @@ export async function buildChecks(
 
   // 2. Skill conformance (SKILL group — gated)
   if (scope === 'all' && skillsDir) {
-    const conformanceResult = checkSkillConformance(skillsDir);
+    const conformanceResult = skillConformanceCheck(skillsDir);
     checks.push(conformanceResult);
   }
 
@@ -4929,8 +4929,8 @@ export async function buildChecks(
     try {
       const { readConversationBodyForParsing } = await import('../core/conversation-parser/body.ts');
       const { parseConversation } = await import('../core/conversation-parser/parse.ts');
-      const allowedTypes = ['conversation', 'meeting', 'slack', 'email'] as const;
-      // PageFilters supports singular `type` only; iterate the 4 types
+      const allowedTypes = ['conversation', 'meeting', 'slack', 'email', 'imessage', 'imessage-daily'] as const;
+      // PageFilters supports singular `type` only; iterate the allowed types
       // and cap at ~50/each to land at ~200 total max.
       const sample: import('../core/types.ts').Page[] = [];
       for (const t of allowedTypes) {
@@ -4965,8 +4965,7 @@ export async function buildChecks(
             message:
               `${unmatched}/${sample.length} conversation pages (${unmatchedPct.toFixed(1)}%) match NO built-in pattern. ` +
               `Breakdown: ${breakdown}. ` +
-              `Investigate: gbrain conversation-parser scan <slug> | ` +
-              `Enable LLM fallback (opt-in): gbrain config set conversation_parser.llm_fallback_enabled true`,
+              `Investigate: gbrain conversation-parser scan <slug>`,
           });
         } else {
           checks.push({
@@ -7187,9 +7186,17 @@ export async function buildChecks(
       let vanished = 0;
       const vanishedPaths: string[] = [];
       const fs = await import('node:fs');
+      const nodePath = await import('node:path');
+      // storage_path is repo-relative for sync-ingested assets. Resolving
+      // against cwd made this check a false-positive WARN whenever doctor
+      // ran outside the brain repo.
+      const repoRoot = (await engine.getConfig('sync.repo_path')) ?? process.cwd();
       for (const r of rows) {
+        const abs = nodePath.isAbsolute(r.storage_path)
+          ? r.storage_path
+          : nodePath.join(repoRoot, r.storage_path);
         try {
-          fs.statSync(r.storage_path);
+          fs.statSync(abs);
         } catch {
           vanished++;
           if (vanishedPaths.length < 5) vanishedPaths.push(r.storage_path);
@@ -7433,15 +7440,13 @@ function printAutoFixReport(report: AutoFixReport, dryRun: boolean, jsonOutput: 
 
 
 /** Quick skill conformance check — frontmatter + required sections */
-function checkSkillConformance(skillsDir: string): Check {
-  const manifestPath = join(skillsDir, 'manifest.json');
-  if (!existsSync(manifestPath)) {
-    return { name: 'skill_conformance', status: 'warn', message: 'manifest.json not found' };
-  }
-
+export function skillConformanceCheck(skillsDir: string): Check {
   try {
-    const manifest = JSON.parse(readFileSync(manifestPath, 'utf-8'));
-    const skills = manifest.skills || [];
+    // Host workspaces are allowed to omit a gbrain-specific manifest. Keep
+    // conformance aligned with resolver_health and skill_brain_first by using
+    // the canonical fallback that derives entries from direct SKILL.md files.
+    const manifest = loadOrDeriveManifest(skillsDir);
+    const skills = manifest.skills;
     let passing = 0;
     const failing: string[] = [];
 
@@ -7461,7 +7466,8 @@ function checkSkillConformance(skillsDir: string): Check {
     }
 
     if (failing.length === 0) {
-      return { name: 'skill_conformance', status: 'ok', message: `${passing}/${skills.length} skills pass` };
+      const derivedNote = manifest.derived ? ' (derived from SKILL.md files)' : '';
+      return { name: 'skill_conformance', status: 'ok', message: `${passing}/${skills.length} skills pass${derivedNote}` };
     }
     return {
       name: 'skill_conformance',
@@ -7469,7 +7475,7 @@ function checkSkillConformance(skillsDir: string): Check {
       message: `${passing}/${skills.length} pass. Failing: ${failing.join(', ')}`,
     };
   } catch {
-    return { name: 'skill_conformance', status: 'warn', message: 'Could not parse manifest.json' };
+    return { name: 'skill_conformance', status: 'warn', message: 'Could not load or derive skills manifest' };
   }
 }
 
@@ -7780,27 +7786,71 @@ export async function runRemediationPlan(
     return;
   }
 
-  // Human output
-  console.log(`Brain score: ${plan.brain_score_current}/100 → target ${targetScore}`);
+  for (const line of renderRemediationPlanLines(plan, targetScore)) {
+    console.log(line);
+  }
+}
+
+/**
+ * Human-render the remediation plan into a sequence of console lines.
+ * Exported for unit-test access — `runRemediationPlan` consumes it
+ * verbatim and only adds the JSON-mode short-circuit.
+ *
+ * Gating the "at target" line on `brain_score_current >= targetScore`
+ * is load-bearing: when the plan is empty AND the target is unreachable,
+ * the prior shape printed both "Target unreachable: …" and "Brain is at
+ * target" back-to-back, which contradicted itself and hid the real next
+ * step (manual prereq config to lift `max_reachable_score`).
+ */
+export function renderRemediationPlanLines(
+  plan: RemediationPlanShape,
+  targetScore: number,
+): string[] {
+  const lines: string[] = [];
+  lines.push(`Brain score: ${plan.brain_score_current}/100 → target ${targetScore}`);
   if (plan.target_unreachable) {
-    console.log(`Target unreachable: max with autonomous remediation is ${plan.max_reachable_score}/100.`);
+    lines.push(`Target unreachable: max with autonomous remediation is ${plan.max_reachable_score}/100.`);
   }
   if (plan.plan.length === 0) {
-    console.log('No remediations needed. Brain is at target.');
+    if (plan.brain_score_current >= targetScore) {
+      lines.push('No remediations needed. Brain is at target.');
+    }
+    // When brain_score < targetScore and plan is empty, the unreachable
+    // line (if applicable) is the user-facing explanation; the blocked-
+    // checks block below surfaces the manual gap. Don't follow with a
+    // misleading "at target" claim.
   } else {
-    console.log(`Plan: ${plan.plan.length} step(s), est ${plan.est_total_seconds}s, est $${plan.est_total_usd_cost.toFixed(2)}`);
+    lines.push(`Plan: ${plan.plan.length} step(s), est ${plan.est_total_seconds}s, est $${plan.est_total_usd_cost.toFixed(2)}`);
     for (const step of plan.plan) {
       const protectedMark = step.protected ? ' [PROTECTED]' : '';
       const costMark = step.est_usd_cost ? ` ($${step.est_usd_cost.toFixed(2)})` : '';
-      console.log(`  ${step.step}. [${step.severity}] ${step.job}${protectedMark} — ${step.rationale}${costMark}`);
+      lines.push(`  ${step.step}. [${step.severity}] ${step.job}${protectedMark} — ${step.rationale}${costMark}`);
     }
   }
   if (plan.blocked.length > 0) {
-    console.log(`\nBlocked checks (prereq missing):`);
+    lines.push(`\nBlocked checks (prereq missing):`);
     for (const b of plan.blocked) {
-      console.log(`  - ${b.check}: ${b.reason}`);
+      lines.push(`  - ${b.check}: ${b.reason}`);
     }
   }
+  return lines;
+}
+
+interface RemediationPlanShape {
+  brain_score_current: number;
+  target_unreachable: boolean;
+  max_reachable_score: number;
+  plan: Array<{
+    step: number;
+    severity: string;
+    job: string;
+    protected?: boolean;
+    est_usd_cost?: number;
+    rationale: string;
+  }>;
+  est_total_seconds: number;
+  est_total_usd_cost: number;
+  blocked: Array<{ check: string; reason: string }>;
 }
 
 /**

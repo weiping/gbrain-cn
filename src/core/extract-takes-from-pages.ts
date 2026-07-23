@@ -15,7 +15,7 @@
 
 import type { BrainEngine } from './engine.ts';
 import type { TakeBatchInput, TakeKind } from './engine.ts';
-import { chat, isAvailable } from './ai/gateway.ts';
+import { chat, getChatModel, isAvailable } from './ai/gateway.ts';
 
 export const ALLOWED_PAGE_TYPES = [
   'concept', 'atom', 'lore', 'briefing', 'writing', 'originals',
@@ -123,11 +123,13 @@ export async function extractTakesFromPages(
 
   // If a model override is provided (e.g. zhipu:glm-4.7), check availability
   // for that specific model rather than the gateway's default chat model.
-  // Resolution order: opts.model → GBRAIN_FACTS_EXTRACTION_MODEL env → hardcoded default.
+  // Resolution order: opts.model → GBRAIN_FACTS_EXTRACTION_MODEL env → configured chat_model.
+  // Final fallback uses getChatModel() (#2997) so local-only / OAuth installs
+  // don't die with llm_unavailable on a hardcoded cloud model.
   const effectiveModel =
     opts.model ??
     process.env.GBRAIN_FACTS_EXTRACTION_MODEL ??
-    'anthropic:claude-haiku-4-5';
+    getChatModel();
   const checkModel = effectiveModel;
   if (!isAvailable('chat', checkModel)) {
     return {

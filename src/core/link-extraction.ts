@@ -81,13 +81,13 @@ export type LinkResolutionType = 'qualified' | 'unqualified';
 /**
  * Directory prefix whitelist. These are the top-level slug dirs the extractor
  * recognizes as entity references. Upstream canonical + our extensions:
- *   - Gbrain canonical: people, companies, meetings, concepts, deal, civic, project, source, media, yc, projects
+ *   - Gbrain canonical: people, companies, meetings, concepts, deal, civic, project, source, media, yc, projects, reference
  *   - Our domain extensions: tech, finance, personal, openclaw (domain-organized wikis)
  *   - Our entity prefix: entities (we kept some legacy entities/projects/ pages)
  * Note: content dirs like notes/, archive/, books/, inbox/ are intentionally excluded —
  * they are not entity directories and should not generate graph links.
  */
-const DIR_PATTERN = '(?:people|companies|meetings|concepts|deal|civic|project|projects|source|media|yc|tech|finance|personal|openclaw|entities)';
+const DIR_PATTERN = '(?:people|companies|meetings|concepts|deal|civic|project|projects|source|media|yc|tech|finance|personal|openclaw|entities|reference)';
 
 /**
  * Match `[Name](path)` markdown links pointing to entity directories.
@@ -497,7 +497,22 @@ export async function extractPageLinks(
       // text inside `[[...]]` before any `|`), NOT the display alias
       // (ref.name = match[2]). `[[struktura|the project]]` must resolve
       // `struktura`, not "the project". The display text is for context only.
-      const matches = await resolver.resolveBasenameMatches(ref.slug);
+      //
+      // The literal may be path-qualified (`[[notes/struktura]]`). The FS
+      // path (resolveSlugAll) strips the dirname before its basename lookup,
+      // but this path passed the raw literal to an index keyed by final
+      // segments only — so every slash-containing wikilink outside
+      // DIR_PATTERN silently resolved to nothing. Query by the final
+      // segment, then use the written path as a disambiguation filter
+      // (the analogue of the FS ancestor walk honoring the written path):
+      // a match must end with the literal, so `[[notes/struktura]]` can
+      // resolve to `vault/notes/struktura` but never to `wiki/struktura`.
+      const slashIdx = ref.slug.lastIndexOf('/');
+      const basename = slashIdx === -1 ? ref.slug : ref.slug.slice(slashIdx + 1);
+      let matches = await resolver.resolveBasenameMatches(basename);
+      if (slashIdx !== -1) {
+        matches = matches.filter(m => m === ref.slug || m.endsWith(`/${ref.slug}`));
+      }
       if (matches.length === 0) continue;
       const idx = content.indexOf(ref.slug);
       const context = idx >= 0 ? excerpt(content, idx, 240) : ref.name;
@@ -993,10 +1008,14 @@ const cacheKey = `${trimmed}\u0000${Array.isArray(dirHint) ? dirHint.join(',') :
 
       // Step 3: pg_trgm fuzzy title match — both modes. Tries each hint in
       // order; first hint with a ≥0.55 similarity match wins. If no hints,
-      // try the whole pages table.
+      // try the whole pages table. When opts.sourceId is set, the fuzzy
+      // search is constrained to that source (and skips soft-deleted pages)
+      // so cross-source slug suggestions don't get silently dropped at the
+      // FK filter downstream. Mirrors the same scope fix `tryFuzzyMatch` got
+      // via #1436.
       const searchHints = hints.length > 0 ? hints : [undefined];
       for (const hint of searchHints) {
-        const match = await engine.findByTitleFuzzy(trimmed, hint, 0.55);
+        const match = await engine.findByTitleFuzzy(trimmed, hint, 0.55, opts.sourceId);
         if (match) {
           cache.set(cacheKey, match.slug);
           return match.slug;
