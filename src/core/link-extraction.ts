@@ -483,6 +483,13 @@ export async function extractPageLinks(
 ): Promise<PageLinksResult> {
   const candidates: LinkCandidate[] = [];
 
+  // gbrain-cn hardening: cap input length to prevent catastrophic regex
+  // backtracking on pathologically large pages (a 200KB+ scraped report
+  // pinned `extract --stale` at 100% CPU for minutes). Links past the cap are
+  // missed on those outliers; normal pages (well under this) are unaffected.
+  const LINK_EXTRACT_MAX_CHARS = 64_000;
+  if (content.length > LINK_EXTRACT_MAX_CHARS) content = content.slice(0, LINK_EXTRACT_MAX_CHARS);
+
   // 1. Markdown entity refs.
   for (const ref of extractEntityRefs(content)) {
     // Issue #972: refs from the generic `[[bare-name]]` pass carry the
