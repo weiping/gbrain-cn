@@ -36,7 +36,7 @@ import type { PageType } from '../core/types.ts';
 import { parseMarkdown } from '../core/markdown.ts';
 import { parse as parseYaml } from '../core/yaml-lite.ts';
 import {
-  extractPageLinks, parseTimelineEntries, inferLinkType, makeResolver,
+  extractPageLinks, parseTimelineEntries, deriveTimelineAnchor, inferLinkType, makeResolver,
   extractFrontmatterLinks, isGlobalBasenameEnabled, LINK_EXTRACTOR_VERSION_TS,
   WIKILINK_BASENAME_LINK_TYPE,
   buildBasenameIndex, queryBasenameIndex, stripCodeBlocks,
@@ -778,6 +778,12 @@ export async function runExtract(engine: BrainEngine, args: string[]) {
   // v0.41.18.0 (A11, T8): --from-meetings extracts timeline entries from
   // meeting pages onto each discussed entity. Timeline subcommand only.
   const fromMeetings = args.includes('--from-meetings');
+  // --infer-dates: for pages whose body has NO parseable timeline line, anchor
+  // one entry at the page's computed effective_date (frontmatter / filename date,
+  // never the updated_at fallback). Default OFF for back-compat — comms/calendar
+  // brains opt in to populate timeline from slug/frontmatter dates. DB-source only
+  // (needs the full Page.effective_date, which getPage projects).
+  const inferDates = args.includes('--infer-dates');
   // v0.41.17.0 (T7, D9): --workers N parsed via the shared validator.
   // Honored on the fs-walk inner loops only; DB-source paths stay
   // serial in v0.41.17.0 (see ExtractOpts.workers doc).
@@ -992,7 +998,7 @@ Status (v0.42):
           result.pages_processed = r.pages;
         }
         if (subcommand === 'timeline' || subcommand === 'all') {
-          const r = await extractTimelineFromDB(engine, dryRun, jsonMode, typeFilter, since, { sourceIdFilter });
+          const r = await extractTimelineFromDB(engine, dryRun, jsonMode, typeFilter, since, { sourceIdFilter, inferDates });
           result.timeline_entries_created = r.created;
           result.pages_processed = Math.max(result.pages_processed, r.pages);
         }
@@ -1612,7 +1618,7 @@ async function extractTimelineFromDB(
   jsonMode: boolean,
   typeFilter: PageType | undefined,
   since: string | undefined,
-  opts?: { sourceIdFilter?: string },
+  opts?: { sourceIdFilter?: string; inferDates?: boolean },
 ): Promise<{ created: number; pages: number }> {
   // v0.32.8: listAllPageRefs enumerates (slug, source_id) pairs so we can
   // thread sourceId to getPage and addTimelineEntriesBatch. Pre-fix used
@@ -1621,6 +1627,7 @@ async function extractTimelineFromDB(
   // v0.37.7.0 #1204: when sourceIdFilter is set, scope the walk to one
   // source so federated brain users can extract per-source.
   const sourceIdFilter = opts?.sourceIdFilter;
+  const inferDates = opts?.inferDates ?? false;
   const allRefs = sourceIdFilter
     ? (await engine.listAllPageRefs()).filter(r => r.source_id === sourceIdFilter)
     : await engine.listAllPageRefs();
@@ -1702,6 +1709,21 @@ async function extractTimelineFromDB(
         seenKeys.add(key);
         entries.push(e);
       }
+    }
+
+    // --infer-dates: pages with no in-body timeline line but a trustworthy
+    // content date (frontmatter / filename) get one anchor entry at that date.
+    // Applied ONLY on the zero-entry path so it never shadows a real timeline.
+    // (deriveTimelineAnchor returns a TimelineCandidate lacking slug/source, so
+    // we adapt it to this loop's entry shape.)
+    if (entries.length === 0 && inferDates) {
+      const anchor = deriveTimelineAnchor({
+        slug,
+        title: page.title,
+        effectiveDate: page.effective_date,
+        effectiveDateSource: page.effective_date_source,
+      });
+      if (anchor) entries.push({ slug, date: anchor.date, source: 'inferred', summary: anchor.summary, detail: anchor.detail });
     }
 
     for (const entry of entries) {
