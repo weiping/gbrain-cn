@@ -30,12 +30,12 @@ import { ensureWellFormed } from './text-safe.ts';
  * OR updated_at > links_extracted_at`. It is an ISO-8601 string (NOT a number) —
  * the column is TIMESTAMPTZ and the predicate binds it as `::timestamptz`.
  */
-// 2026-08-01: bumped for the fix-wave-i extraction batch — the #3466
-// inferTypeByDir fix (unevidenced people/ -> companies/ adjacency now infers
-// 'mentions' instead of 'works_at') AND the #2576 bug-2 fix (the DIR_PATTERN
-// whitelist no longer drops markdown links / bare-slug refs / slash-shaped
-// wikilinks in non-whitelisted directories). Pages stamped by earlier sweeps
-// are re-flagged so the next --stale sweep re-extracts under both fixes.
+// 2026-08-19 (merge-day midnight): re-bumped — the shipped 08-04 stamp
+// pre-dated this wave's landing, exempting two weeks of pre-fix extractions
+// from re-extraction. Covers the fix-wave-i batch: #3466 (unevidenced
+// people/ -> companies/ adjacency infers 'mentions', not 'works_at') and
+// #2576 bug-2 (DIR_PATTERN whitelist no longer drops markdown links /
+// bare-slug refs / slash-shaped wikilinks in non-whitelisted directories).
 // The watermark MUST NOT be in the future: the stamp path clamps
 // links_extracted_at up to the watermark (so a fresh extraction isn't
 // immediately re-listed), which means a future watermark masks concurrent
@@ -44,7 +44,7 @@ import { ensureWellFormed } from './text-safe.ts';
 // PRE-wave code after this date reads as fresh and won't re-extract until
 // the page is next edited; no fixed watermark can cover code that keeps
 // running past it.
-export const LINK_EXTRACTOR_VERSION_TS = '2026-08-01T00:00:00Z';
+export const LINK_EXTRACTOR_VERSION_TS = '2026-08-19T00:00:00Z';
 
 // ─── Entity references ──────────────────────────────────────────
 
@@ -76,6 +76,16 @@ export interface EntityRef {
    * LinkCandidate per resolved match.
    */
   needsResolution?: boolean;
+  /**
+   * Number of leading `../` segments on the original markdown link (0 when
+   * absent or for engine-slug refs). The match regex strips the `../` run, so
+   * this preserves the relative depth for callers that know the linking page's
+   * slug (`extractPageLinks`) to resolve the target against the page's own
+   * directory. Without it, `[x](../concepts/x.md)` from a nested page resolves
+   * as the root-relative `concepts/x` instead of `<page-dir-parent>/concepts/x`
+   * — the reason subtree-scoped / nested brains got zero cross-dir edges.
+   */
+  upLevels?: number;
 }
 
 /**
@@ -254,7 +264,7 @@ export interface CodeRef {
 // The extension list is aligned with detectCodeLanguage in chunkers/code.ts.
 // Paths NOT matching these extensions are ignored because they wouldn't
 // have a code page to edge to anyway.
-const CODE_REF_REGEX = /\b((?:src|lib|app|test|tests|scripts|docs|packages|internal|cmd|examples)\/[\w\-./]+\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs|py|rb|go|rs|java|cs|cpp|cc|hpp|c|h|php|swift|kt|scala|lua|ex|exs|elm|ml|dart|zig|sol|sh|bash|css|html|vue|json|yaml|yml|toml))(?::(\d+))?\b/g;
+const CODE_REF_REGEX = /\b((?:src|lib|app|test|tests|scripts|docs|packages|internal|cmd|examples)\/[\w\-./]+\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs|py|rb|go|rs|java|cs|cpp|cc|hpp|c|h|php|swift|kt|scala|lua|ex|exs|elm|ml|dart|zig|sol|sh|bash|css|html|astro|svelte|vue|json|yaml|yml|toml))(?::(\d+))?\b/g;
 
 /**
  * Extract code-path references (e.g. 'src/core/sync.ts:42') from markdown
@@ -349,7 +359,18 @@ export function extractEntityRefs(content: string): EntityRef[] {
     const fullPath = match[2];
     const slug = fullPath;
     const dir = fullPath.split('/')[0];
-    refs.push({ name, slug, dir });
+    // The regex strips the leading `../` run from `fullPath`; recover its depth
+    // from the raw link target so extractPageLinks can resolve relative to the
+    // linking page's directory. `[x](path)` has no `](` collision because the
+    // capture stops before the first unescaped `)`.
+    const rawTarget = match[0].slice(match[0].indexOf('](') + 2, -1);
+    const up = rawTarget.match(/^(?:\.\.\/)+/);
+    const ref: EntityRef = { name, slug, dir };
+    // Only relative links carry depth; absolute / engine-slug refs keep the
+    // exact {name, slug, dir} shape (no upLevels key) so equality consumers
+    // are unaffected.
+    if (up) ref.upLevels = up[0].length / 3;
+    refs.push(ref);
     markdownRanges.push([match.index, match.index + match[0].length]);
   }
 
@@ -436,6 +457,29 @@ function maskRanges(content: string, ranges: Array<[number, number]>): string {
     for (let i = s; i < e && i < chars.length; i++) chars[i] = ' ';
   }
   return chars.join('');
+}
+
+/**
+ * Resolve a markdown ref's target against the LINKING page's directory when the
+ * original link was relative (had one or more `../`). Filesystem markdown links
+ * are relative to the file that contains them: `[x](../concepts/x.md)` from a
+ * page at `wiki/sources/foo` points at `wiki/concepts/x`, not the root-relative
+ * `concepts/x`. The match regex discards the `../` run, so `ref.upLevels` carries
+ * the depth and this reconstructs the absolute page slug.
+ *
+ * Backward-compatible: for a page one level below the root (`meetings/m` +
+ * `../people/alice` → `people/alice`) the parent walk lands exactly at the root,
+ * so the result is identical to the old `../`-stripping behavior. It only
+ * diverges — correctly — when the linking page is nested deeper than the `../`
+ * count unwinds, i.e. content under a prefix (subtree-scoped sources). An over-
+ * long `../` run clamps at the root. Absolute refs (upLevels 0, e.g. engine-slug
+ * `people/x` or `[[wikilinks]]`) are returned unchanged.
+ */
+function resolveRelativeSlug(pageSlug: string, ref: EntityRef): string {
+  if (!ref.upLevels || ref.upLevels <= 0) return ref.slug;
+  const dirSegs = pageSlug.includes('/') ? pageSlug.split('/').slice(0, -1) : [];
+  const keep = Math.max(0, dirSegs.length - ref.upLevels);
+  return [...dirSegs.slice(0, keep), ref.slug].join('/');
 }
 
 // ─── Link candidates (richer than EntityRef) ────────────────────
@@ -595,9 +639,10 @@ export async function extractPageLinks(
     // narrative prose where a partner's investment verbs appear once and
     // then portfolio companies are listed in subsequent sentences.
     const context = idx >= 0 ? excerpt(content, idx, 240) : ref.name;
-    // For bare wikilinks (dir=''), resolve the display name to a slug via resolver.
-    // For directory-prefixed wikilinks (dir!=''), use ref.slug directly.
-    const targetSlug = ref.dir ? ref.slug : (await resolver.resolve(ref.name) ?? ref.slug);
+    // Relative markdown links resolve against THIS page's directory (fixes
+    // cross-dir edges for nested / subtree-scoped content); absolute refs pass
+    // through unchanged.
+    const targetSlug = resolveRelativeSlug(slug, ref);
     candidates.push({
       targetSlug,
       linkType: inferLinkType(pageType, context, content, targetSlug),
@@ -1072,7 +1117,9 @@ const cacheKey = `${trimmed}\u0000${Array.isArray(dirHint) ? dirHint.join(',') :
       // (unwrapped by unwrapWikilink) that name a real page the strict regex
       // could not reach and whose full-path fuzzy score is below threshold.
       if (/\//.test(trimmed) && /^[a-z0-9][a-z0-9/_-]*$/.test(trimmed)) {
-        const page = await engine.getPage(trimmed);
+        // Same source scope as the basename index above (#972): a wikilink in
+        // source A must not resolve to a same-slug page in source B.
+        const page = await engine.getPage(trimmed, opts.sourceId ? { sourceId: opts.sourceId } : undefined); // gbrain-allow-unscoped-getpage: read-only wikilink resolution; unscoped-when-no-source is the documented single-source behavior
         if (page) {
           cache.set(cacheKey, trimmed);
           return trimmed;
@@ -1097,7 +1144,7 @@ const cacheKey = `${trimmed}\u0000${Array.isArray(dirHint) ? dirHint.join(',') :
       for (const hint of hints) {
         if (!hint) continue;
         const candidate = `${hint}/${slugified}`;
-        const page = await engine.getPage(candidate);
+        const page = await engine.getPage(candidate, opts.sourceId ? { sourceId: opts.sourceId } : undefined); // gbrain-allow-unscoped-getpage: read-only wikilink resolution; unscoped-when-no-source is the documented single-source behavior
         if (page) {
           cache.set(cacheKey, candidate);
           return candidate;
