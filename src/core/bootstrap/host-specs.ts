@@ -88,19 +88,24 @@ export const TARGETS: Record<string, HostSpecTarget> = {
       'docs/mcp/CODEX.md',
       'https://developers.openai.com/codex/mcp',
       'codex-cli 0.147.0 (binary serde field scan + live inline bearer_token wiring, issue #4043)',
+      'codex-cli 0.149.1 (reporter 3-variant probe in issue #4574: inline bearer_token is REJECTED ' +
+        'at config load for streamable_http; http_headers inline table loads on 0.147.x and 0.149.x)',
     ],
     note:
       'Local stdio MCP registration: `codex mcp add <name> [--env K=V]... -- ' +
       '<command> [args...]`, which writes [mcp_servers.<name>] into ' +
       '(CODEX_HOME || ~/.codex)/config.toml — codex resolves CODEX_HOME as ' +
       'the config dir itself. Streamable-HTTP servers are configured with ' +
-      '`url` plus `bearer_token` (inline) or `bearer_token_env_var`; the ' +
-      'config parser uses deny-unknown-fields, so writers must emit ONLY ' +
-      'verified keys and `KEY = "value"` spacing. The CX2-17 revisit trigger ' +
-      'FIRED (#4043): `codex mcp add` cannot express an inline bearer_token ' +
-      '(verified against codex-cli 0.147.0 --help), so the harness lane owns ' +
-      'a managed marker-delimited TOML block (codex-toml.ts) — the ONE ' +
-      'direct config.toml writer. One owner per server name: `codex mcp ' +
+      '`url` plus an inline `http_headers = { Authorization = "Bearer <t>" }` ' +
+      'table or `bearer_token_env_var` — inline `bearer_token` was accepted ' +
+      'by 0.147.x but is REJECTED AT CONFIG LOAD by >=0.149 (#4574, bricking ' +
+      'every codex session on the machine); the http_headers shape loads on ' +
+      'both. The config parser uses deny-unknown-fields, so writers must emit ' +
+      'ONLY verified keys and `KEY = "value"` spacing. The CX2-17 revisit ' +
+      'trigger FIRED (#4043): `codex mcp add` cannot express an inline ' +
+      'credential (verified against codex-cli 0.147.0 --help), so the harness ' +
+      'lane owns a managed marker-delimited TOML block (codex-toml.ts) — the ' +
+      'ONE direct config.toml writer. One owner per server name: `codex mcp ' +
       'remove` rewrites config.toml wholesale and drops comments, so the ' +
       'stdio lane (runHooks) must never manage a name the harness block ' +
       'owns, and vice versa. Codex 0.147.0 also ships a real hook system ' +
@@ -260,6 +265,16 @@ export function claudeUserSettingsPath(): string {
   return join(claudeConfigBase(), 'settings.json');
 }
 
+/**
+ * #4325: the config-dir base itself, exported for detection — a machine with
+ * a `~/.claude` (or CLAUDE_CONFIG_DIR) directory has Claude Code configured
+ * even when the `claude` binary isn't on the probing process's PATH (CI
+ * runners, alias-only shells). Mirrors detectCodex's config-file fallback.
+ */
+export function claudeConfigDir(): string {
+  return claudeConfigBase();
+}
+
 /** permissions.allow entry that pre-approves an MCP server's tools for headless runs. */
 export function mcpPermissionEntry(serverName: string): string {
   return `mcp__${serverName}`;
@@ -278,9 +293,13 @@ export function claudeUserMcpConfigPath(): string {
   return join(home || homedir(), '.claude.json');
 }
 
-/** Where Claude Code stores session transcripts — the confinement root [S3#8]. */
+/**
+ * Where Claude Code stores session transcripts — the confinement root [S3#8].
+ * Uses the same config-dir base as settings/skills so custom config dirs keep
+ * legitimate transcript paths inside the allowed root.
+ */
 export function claudeProjectsDir(): string {
-  return join(homedir(), '.claude', 'projects');
+  return join(claudeConfigBase(), 'projects');
 }
 
 /**

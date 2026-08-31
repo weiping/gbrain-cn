@@ -101,7 +101,21 @@ page_types:
       - wiki/concepts/
       - wiki/concept/
     aliases: []
-    extractable: false
+    # v0.41.11+ — concepts ARE knowledge: their bodies define the
+    # concept, so the facts extractor should mine them like writing/
+    # source/note pages. Pre-v0.41.11 default was false because concepts
+    # were treated as link-only stubs; the operational reality is that
+    # concept bodies routinely contain definitions, distinctions, and
+    # claims that belong in the facts table.
+    #
+    # Important: this flip is SEMANTIC ONLY for v0.41.11. The post-sync
+    # backstop uses hardcoded ELIGIBLE_TYPES in src/core/facts/eligibility.ts
+    # which does NOT read pack extractable, so the flip has zero
+    # behavioral effect on the backstop today. Power-users who want
+    # concept extraction run `gbrain extract-facts --type concept --force`
+    # explicitly. The pack-driven-ELIGIBLE_TYPES refactor (which would
+    # make this flag actually drive backstop behavior) is a v0.42+ TODO.
+    extractable: true
     expert_routing: false
 
   - name: person
@@ -305,25 +319,6 @@ page_types:
     extractable: false
     expert_routing: false
 
-  # v0.41.11.0 — imported chat/transcript pages. Promoted from hardcoded
-  # type list into gbrain-base so the schema pack surface is complete.
-  - name: conversation
-    primitive: temporal
-    path_prefixes:
-      - conversations/
-    aliases: []
-    extractable: false
-    expert_routing: false
-
-  # v0.41.11.0 — smallest extractable claim unit. NOT extractable (atoms
-  # ARE the extracted form; extracting from them creates a loop).
-  - name: atom
-    primitive: annotation
-    path_prefixes: []
-    aliases: []
-    extractable: false
-    expert_routing: false
-
 # Link verbs — ordered to match inferLinkType priority in link-extraction.ts.
 # Each entry carries the regex pattern that triggers the verb. Inferences
 # without a pattern (e.g. type-bound: meeting → attended) are encoded via
@@ -433,3 +428,11 @@ filing_rules:
     directory: meetings/
     examples:
       - meetings/2026-04-03
+  - kind: conversation
+    directory: conversations/
+    examples:
+      - conversations/imessage/alice-example
+  - kind: atom
+    directory: atoms/
+    examples:
+      - atoms/2026-04-12-revenue-claim

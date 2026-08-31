@@ -40,7 +40,11 @@ describe('Zhipu AI Recipe', () => {
   it('should have chat touchpoint with GLM models', () => {
     const chat = zhipu.touchpoints!.chat!;
     expect(chat).toBeDefined();
-    expect(chat.models).toContain('glm-4-flash');
+    // Upstream v0.47 ships the glm-5.x family on chat; gbrain-cn's cheap
+    // takes extractor (glm-4-flash) rides the expansion touchpoint below —
+    // openai-compat tier doesn't enforce the chat model list, so
+    // `zhipu:glm-4-flash` still routes through chat().
+    expect(chat.models).toContain('glm-5.1');
     expect(chat.supports_tools).toBe(true);
     expect(chat.supports_subagent_loop).toBe(true);
     expect(chat.max_context_tokens).toBe(128000);
@@ -59,12 +63,10 @@ describe('Zhipu AI Recipe', () => {
 
   it('should have pricing data', () => {
     const embedding = zhipu.touchpoints!.embedding!;
-    const chat = zhipu.touchpoints!.chat!;
     const expansion = zhipu.touchpoints!.expansion!;
     expect(embedding.cost_per_1m_tokens_usd).toBe(0.02);
     expect(embedding.price_last_verified).toBeDefined();
-    expect(chat.cost_per_1m_input_usd).toBe(0.5);
-    expect(chat.cost_per_1m_output_usd).toBe(0.5);
     expect(expansion.cost_per_1m_tokens_usd).toBe(0.5);
+    expect(expansion.price_last_verified).toBeDefined();
   });
 });
