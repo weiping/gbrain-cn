@@ -242,6 +242,75 @@ export class PGLiteQueryTimeoutError extends Error {
   }
 }
 
+/** Race any PGLite promise against the self-heal ceiling. */
+function racePgliteCall<T>(label: string, p: Promise<T>): Promise<T> {
+  const timeoutMs = pgliteQueryTimeoutMs();
+  if (timeoutMs <= 0) return p;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    p,
+    new Promise<T>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new PGLiteQueryTimeoutError(label, timeoutMs)),
+        timeoutMs,
+      );
+      (timer as { unref?: () => void }).unref?.();
+    }),
+  ]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+/**
+ * Wrap a PGLite handle (engine db or a transaction tx) so EVERY query/exec —
+ * and every query/exec inside transaction bodies — races the self-heal
+ * ceiling. executeRaw already raced (v0.41); this proxy closes the remaining
+ * blind spots observed live on 2026-08-31: direct `this.db.query/exec` call
+ * sites (~40 in this file), peeled modules that receive `deps.db`, and
+ * transaction() bodies whose tx handle was raw. A wedged WASM op fails fast
+ * with PGLiteQueryTimeoutError so the CLI exits cleanly instead of parking
+ * the event loop at 0% CPU until an external SIGKILL (which worsens the WAL
+ * corruption). Memoized per handle so the proxy identity is stable.
+ */
+const pgliteTimeoutWrapCache = new WeakMap<object, PGlite>();
+
+export function wrapPgliteQueryTimeout<T extends PGlite>(handle: T): T {
+  const cached = pgliteTimeoutWrapCache.get(handle);
+  if (cached) return cached as unknown as T;
+  const wrapped = new Proxy(handle, {
+    get(target, prop, receiver) {
+      if (prop === 'query') {
+        return (sql: string, params?: unknown[]) =>
+          racePgliteCall(
+            typeof sql === 'string' ? sql : String(sql),
+            target.query(sql as string, params),
+          );
+      }
+      if (prop === 'exec') {
+        return (sql: string | string[]) =>
+          racePgliteCall(
+            Array.isArray(sql) ? (sql[0] ?? 'batch exec') : sql,
+            target.exec(sql as string),
+          );
+      }
+      if (prop === 'transaction') {
+        // The raw Transaction handle is structurally a query/exec surface;
+        // wrap it so tx bodies race the same ceiling (cast: PGlite's Tx type
+        // is structurally compatible for query/exec access).
+        return (fn: (tx: never) => Promise<unknown>) =>
+          target.transaction((tx: import('@electric-sql/pglite').Transaction) =>
+            fn(wrapPgliteQueryTimeout(tx as unknown as PGlite) as never),
+          );
+      }
+      const value = Reflect.get(target, prop, target);
+      if (typeof value === 'function') return value.bind(target);
+      return value;
+    },
+  }) as unknown as T;
+  pgliteTimeoutWrapCache.set(handle, wrapped as unknown as PGlite);
+  return wrapped;
+}
+
 // Tier 3 snapshot fast-restore. Reads a tar dump produced by
 // `bun run scripts/build-pglite-snapshot.ts`. Snapshot is matched against
 // the current MIGRATIONS hash via a sidecar `.version` file; on mismatch we
@@ -756,7 +825,17 @@ export class PGLiteEngine implements BrainEngine {
 
   get db(): PGLiteDB {
     if (!this._db) throw new Error('PGLite not connected. Call connect() first.');
-    return this._db;
+    // Self-heal ceiling on EVERY access path (engine methods, peeled modules'
+    // deps.db, transaction bodies) — see wrapPgliteQueryTimeout. NOTE:
+    // transaction() shadows this getter per-instance with the tx handle
+    // (Object.defineProperty below); executeRaw deliberately goes through
+    // the getter for exactly that reason — a raw-handle bypass here would
+    // route transactional executeRaw calls to the ROOT connection and
+    // single-connection PGLite deadlocks (tx holds the connection, root
+    // query queues behind it forever). The double race (proxy ceiling +
+    // executeRaw's own) is benign: same error, unref'd timers, cleared on
+    // settle.
+    return wrapPgliteQueryTimeout(this._db);
   }
 
   // Lifecycle
