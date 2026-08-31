@@ -5,10 +5,14 @@ description: Brain-augmented web research. Sends brain context about a topic to 
 triggers:
   - "perplexity research"
   - "perplexity-research"
-  - "what's new about"
+  - "brain doesn't already cover"
+  - "yc w26"
+  - "focus on the delta"
+  - "what changed about this funding"
+  - "what's new about this"
   - "current state of"
   - "web research"
-  - "what changed about"
+  - "web research pass"
   - "surface new developments"
 mutating: true
 writes_pages: true
@@ -181,7 +185,6 @@ for news-cycle topics; omit for evergreen research.
   entity-enrichment loop
 - `skills/data-research/SKILL.md` — structured-data trackers (different
   shape: parameterized YAML recipes, not free-form research)
-
 
 ## Contract
 

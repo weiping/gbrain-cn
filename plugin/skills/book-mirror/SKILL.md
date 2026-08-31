@@ -4,8 +4,12 @@ version: 0.5.0
 description: Take any book (EPUB/PDF), produce a personalized chapter-by-chapter analysis. Each chapter is preserved in detail (The Chapter) and mirrored back to the reader's actual life (The Mirror) using brain context. The mirror observes and resonates — a friend pointing out parallels, NOT a consultant rearranging the reader's life, NOT a therapist assigning homework. The reader decides what to do about it. Layout is a top-aligned HTML table or stacked sections, never a bare markdown pipe table (pipe tables center-misalign uneven columns). Output is a single brain page at media/books/<slug>-personalized.md plus an optional PDF via brain-pdf.
 triggers:
   - "personalized version of this book"
+  - "personalized version"
   - "mirror this book"
+  - "two-column book"
   - "two-column book analysis"
+  - "chapter-by-chapter"
+  - "book to my life"
   - "apply this book to my life"
   - "how does this book apply to me"
 mutating: true
