@@ -277,30 +277,61 @@ const pgliteTimeoutWrapCache = new WeakMap<object, PGlite>();
 export function wrapPgliteQueryTimeout<T extends PGlite>(handle: T): T {
   const cached = pgliteTimeoutWrapCache.get(handle);
   if (cached) return cached as unknown as T;
+  // Snapshot the ORIGINAL (unbound) methods at wrap time. Two reasons:
+  //  1. The wrappers below call the snapshot, not a late-bound
+  //     target.query — a late-bound hop makes the common test pattern
+  //     "const real = db.query.bind(db); db.query = mock (delegates to real)"
+  //     recurse infinitely (mock → real → target.query → mock → …).
+  //  2. If someone REPLACES a method on the handle (target.query !==
+  //     snapshot), the proxy steps aside and returns their override
+  //     directly — monkey-patch-transparent, and the ceiling never fights
+  //     an injected mock.
+  const rawQuery = handle['query'] as ((...a: unknown[]) => Promise<unknown>) | undefined;
+  const rawExec = handle['exec'] as ((sql: string) => Promise<unknown>) | undefined;
+  const rawTransaction = handle['transaction'] as (
+    ((fn: (tx: unknown) => Promise<unknown>) => Promise<unknown>)
+  ) | undefined;
+  const origQuery = rawQuery?.bind(handle);
+  const origExec = rawExec?.bind(handle);
+  const origTransaction = rawTransaction?.bind(handle);
+
   const wrapped = new Proxy(handle, {
     get(target, prop, receiver) {
       if (prop === 'query') {
+        if (!origQuery || (target['query'] as unknown) !== rawQuery) {
+          // absent, or externally replaced — return the override untouched
+          const override = Reflect.get(target, prop, target);
+          return typeof override === 'function' ? override.bind(target) : override;
+        }
         return (sql: string, params?: unknown[]) =>
           racePgliteCall(
             typeof sql === 'string' ? sql : String(sql),
-            target.query(sql as string, params),
-          );
+            origQuery(sql, params) as Promise<{ rows: unknown[] }>,
+          ) as unknown as ReturnType<typeof target['query']>;
       }
       if (prop === 'exec') {
+        if (!origExec || (target['exec'] as unknown) !== rawExec) {
+          const override = Reflect.get(target, prop, target);
+          return typeof override === 'function' ? override.bind(target) : override;
+        }
         return (sql: string | string[]) =>
           racePgliteCall(
             Array.isArray(sql) ? (sql[0] ?? 'batch exec') : sql,
-            target.exec(sql as string),
-          );
+            origExec(sql as string),
+          ) as unknown as ReturnType<typeof target['exec']>;
       }
       if (prop === 'transaction') {
+        if (!origTransaction || (target['transaction'] as unknown) !== rawTransaction) {
+          const override = Reflect.get(target, prop, target);
+          return typeof override === 'function' ? override.bind(target) : override;
+        }
         // The raw Transaction handle is structurally a query/exec surface;
         // wrap it so tx bodies race the same ceiling (cast: PGlite's Tx type
         // is structurally compatible for query/exec access).
         return (fn: (tx: never) => Promise<unknown>) =>
-          target.transaction((tx: import('@electric-sql/pglite').Transaction) =>
+          origTransaction((tx: unknown) =>
             fn(wrapPgliteQueryTimeout(tx as unknown as PGlite) as never),
-          );
+          ) as unknown as ReturnType<typeof target['transaction']>;
       }
       const value = Reflect.get(target, prop, target);
       if (typeof value === 'function') return value.bind(target);

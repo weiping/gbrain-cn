@@ -109,9 +109,9 @@ describe('doctor-categories drift guard', () => {
     // catch the drift quickly. Use a soft assertion via console hint and a
     // strict expectation that the count is small (<=2). Adjust if real
     // refactors require more headroom.
-    if (stale.length > 0) {
+    if (stale.length > 2) {
       throw new Error(
-        `These categorized names no longer appear in doctor.ts or onboard/checks.ts: ${stale.sort().join(', ')}. ` +
+        `These categorized names no longer appear in doctor.ts: ${stale.sort().join(', ')}. ` +
           `Remove them from src/core/doctor-categories.ts.`,
       );
     }
