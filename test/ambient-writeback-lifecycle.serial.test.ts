@@ -29,6 +29,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { runHook } from '../src/commands/hook.ts';
+import { RECIPES } from '../src/core/ai/recipes/index.ts';
 import {
   installAmbientWritebackBlockAt,
   renderAmbientInstructionBlock,
@@ -41,8 +42,23 @@ let homeDir: string;     // fake HOME
 let dataDir: string;     // pglite data dir (from init)
 
 function childEnv(): Record<string, string | undefined> {
+  // Hermetic isolation: blank EVERY recipe's required auth env vars.
+  // Why not just DATABASE_URL: on a dev machine the repo root often carries
+  // a .env (gitignored) with real provider keys — bun auto-loads it into the
+  // spawned `gbrain serve` child, and a real key makes the "keyless degraded
+  // posture" this test asserts impossible (e.g. a live ZEROENTROPY_API_KEY
+  // embeds facts at 1280d against a 1024d column and remember 500s with
+  // `expected 1024 dimensions, not 1280`). Bun's .env loader never overrides
+  // variables that are already set, so exporting them as empty strings wins.
+  const blanked: Record<string, string> = {};
+  for (const recipe of RECIPES.values()) {
+    for (const k of recipe.auth_env?.required ?? []) {
+      blanked[k] = '';
+    }
+  }
   return {
     ...process.env,
+    ...blanked,
     GBRAIN_HOME: parent,
     HOME: homeDir,
     DATABASE_URL: undefined,
