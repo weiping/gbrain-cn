@@ -21,6 +21,8 @@
  * test/edge-bundle.test.ts has a drift detection test.
  */
 
+import { GRANT_AUDIT_SCHEMA_SQL } from './grants/schema.ts';
+import { FACT_WITHDRAWAL_SCHEMA_STATEMENTS } from './facts/withdrawal-schema.ts';
 import { applyChunkEmbeddingIndexPolicy } from './vector-index.ts';
 import { applyFtsLanguagePolicy } from './fts-language.ts';
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } from './ai/defaults.ts';
@@ -927,6 +929,12 @@ CREATE TABLE IF NOT EXISTS oauth_clients (
   -- tier names into surface); NULL = server/config surface resolution.
   surface                 TEXT NULL,
   surface_set_by          TEXT NULL,
+  allowed_operations      TEXT[] NULL,
+  delegated_slug_prefixes TEXT[] NULL,
+  delegated_namespace    TEXT NOT NULL DEFAULT 'prefixes',
+  grant_profile           TEXT NULL,
+  grant_revision          INTEGER NOT NULL DEFAULT 0,
+  grant_repair_reasons    TEXT[] NOT NULL DEFAULT '{}',
   created_at              TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 -- v0.34.1 (#861, D13 + #876): source_id is the OAuth client's write-source
@@ -938,6 +946,9 @@ CREATE INDEX IF NOT EXISTS idx_oauth_clients_source_id
   ON oauth_clients(source_id) WHERE source_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_oauth_clients_federated_read
   ON oauth_clients USING GIN (federated_read);
+
+${GRANT_AUDIT_SCHEMA_SQL}
+${FACT_WITHDRAWAL_SCHEMA_STATEMENTS[0]};
 
 CREATE TABLE IF NOT EXISTS oauth_tokens (
   token_hash   TEXT PRIMARY KEY,
@@ -1034,6 +1045,25 @@ CREATE TABLE IF NOT EXISTS session_context_state (
 );
 CREATE INDEX IF NOT EXISTS session_context_state_updated_idx
   ON session_context_state (updated_at);
+
+-- extract_atoms_transcript_state (migration v146 — #4148 follow-on).
+-- Failure streak + tombstone for TRANSCRIPT extraction items, which are files
+-- and so have no page frontmatter to carry it. See src/schema.sql for the full
+-- rationale (why not raw_data, why not dream_verdicts columns, why source_id is
+-- in the key). content_hash is the 16-char prefix, matching
+-- atoms.frontmatter->>'source_hash'.
+CREATE TABLE IF NOT EXISTS extract_atoms_transcript_state (
+  source_id    TEXT        NOT NULL DEFAULT 'default',
+  file_path    TEXT        NOT NULL,
+  content_hash TEXT        NOT NULL,
+  fail_count   INTEGER     NOT NULL DEFAULT 0,
+  tombstoned   BOOLEAN     NOT NULL DEFAULT FALSE,
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (source_id, file_path, content_hash)
+);
+CREATE INDEX IF NOT EXISTS extract_atoms_transcript_state_tombstoned_idx
+  ON extract_atoms_transcript_state (source_id, content_hash)
+  WHERE tombstoned;
 
 -- chat_usage_log (#4218 / migration v140). See src/schema.sql for rationale.
 CREATE TABLE IF NOT EXISTS chat_usage_log (
