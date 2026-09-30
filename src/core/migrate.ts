@@ -2,14 +2,14 @@ import { SOURCE_INGESTION_RECEIPTS_SCHEMA_SQL } from './company-brain/receipt-sc
 import { MANAGED_WRITER_GUARD_SQL } from './persistence/writer-guard-schema.ts';
 import { PERSISTENCE_TOPOLOGY_SCHEMA_SQL } from './persistence/topology-schema.ts';
 import { PERSISTENCE_SCHEMA_STATEMENTS, PERSISTENCE_REQUEST_RECOVERY_INDEX_SQL, PERSISTENCE_DATABASE_PENDING_INDEX_SQL } from './persistence/schema.ts';
-import { PERSISTENCE_EFFECT_SCHEMA_SQL } from './persistence/effect-schema.ts';
+import { PERSISTENCE_EFFECT_PARKED_INDEX_SQL, PERSISTENCE_EFFECT_SCHEMA_SQL } from './persistence/effect-schema.ts';
 import { PAGE_PROJECTION_SCHEMA_SQL, PAGE_PROJECTION_ACTIVATION_SQL } from './page-state/projection-schema.ts';
 import { LEASE_TOKEN_SCHEMA_SQL } from './lease-schema.ts';
 import { PAGE_STATE_SCHEMA_SQL, PAGE_VERSION_DELETION_SCHEMA_SQL } from './page-state/schema.ts';
 import type { BrainEngine } from './engine.ts';
 import { slugifyPath } from './sync.ts';
 import { getFtsLanguage } from './fts-language.ts';
-import { hnswMaxDimsForType } from './vector-index.ts';
+import { hnswMaxDimsForType, readExistingEmbeddingShape } from './vector-index.ts';
 // runMigrations executes while an initialized engine is live. Keep its helper
 // modules in the static graph rather than importing them from async handlers.
 import {
@@ -20,10 +20,11 @@ import { repairTimelineDedupIndex, repairLegacyTimelineSourceRows } from './time
 import { repairPagesUpsertArbiter } from './pages-upsert-arbiter.ts';
 import { repairLinkSourceCheck, LINK_SOURCE_GATE_MIGRATION_VERSION } from './link-source-check-repair.ts';
 import { GRANT_COLUMNS_SQL, GRANT_AUDIT_SCHEMA_SQL, GRANT_SPEND_COLUMNS_SQL } from './grants/schema.ts';
-import { FACT_WITHDRAWAL_SCHEMA_SQL, FACT_WITHDRAWAL_BACKFILL_SQL } from './facts/withdrawal-schema.ts';
+import { FACT_WITHDRAWAL_SCHEMA_SQL, FACT_WITHDRAWAL_BACKFILL_SQL, FACT_WITHDRAWAL_SUBJECT_SQL, FACT_WITHDRAWAL_NORMALIZED_SQL } from './facts/withdrawal-schema.ts';
 import { repairLegacyClientGrants } from './grants/migration.ts';
 import { PROJECTION_STATISTICS_SQL, verifyProjectionStatistics } from './search/projection-statistics.ts';
 import { SHARED_SKILLS_SCHEMA_SQL } from './shared-skills/schema-all.ts';
+import { migrateConnectorCheckpoints } from './persistence/connector-checkpoint-migration.ts';
 
 /**
  * When true, per-migration explanatory notices (e.g. the v123/v124 "here is
@@ -2374,14 +2375,15 @@ export const MIGRATIONS: Migration[] = [
         useHalfvec = true;
       }
 
-      const columnType = useHalfvec ? 'halfvec' : 'vector';
+      const existingShape = await readExistingEmbeddingShape(engine, 'facts');
+      const columnType = existingShape?.type ?? (useHalfvec ? 'halfvec' : 'vector');
       const vecType = columnType.toUpperCase();
       // HNSW operator class must match the column type:
       //   VECTOR(n)  → vector_cosine_ops
       //   HALFVEC(n) → halfvec_cosine_ops
-      const opclass = useHalfvec ? 'halfvec_cosine_ops' : 'vector_cosine_ops';
+      const opclass = columnType === 'halfvec' ? 'halfvec_cosine_ops' : 'vector_cosine_ops';
       const hnswMaxDims = hnswMaxDimsForType(columnType);
-      const factsEmbeddingIndexSql = embeddingDim <= hnswMaxDims
+      const factsEmbeddingIndexSql = (existingShape?.dimensions ?? embeddingDim) <= hnswMaxDims
         ? `CREATE INDEX IF NOT EXISTS idx_facts_embedding_hnsw
           ON facts USING hnsw (embedding ${opclass})
           WHERE embedding IS NOT NULL AND expired_at IS NULL;`
@@ -2873,11 +2875,12 @@ export const MIGRATIONS: Migration[] = [
         useHalfvec = true;
       }
 
-      const columnType = useHalfvec ? 'halfvec' : 'vector';
+      const existingShape = await readExistingEmbeddingShape(engine, 'query_cache');
+      const columnType = existingShape?.type ?? (useHalfvec ? 'halfvec' : 'vector');
       const vecType = columnType.toUpperCase();
-      const opclass = useHalfvec ? 'halfvec_cosine_ops' : 'vector_cosine_ops';
+      const opclass = columnType === 'halfvec' ? 'halfvec_cosine_ops' : 'vector_cosine_ops';
       const hnswMaxDims = hnswMaxDimsForType(columnType);
-      const queryCacheEmbeddingIndexSql = embeddingDim <= hnswMaxDims
+      const queryCacheEmbeddingIndexSql = (existingShape?.dimensions ?? embeddingDim) <= hnswMaxDims
         ? `CREATE INDEX IF NOT EXISTS idx_query_cache_embedding_hnsw
           ON query_cache USING hnsw (embedding ${opclass})
           WHERE embedding IS NOT NULL;`
@@ -6607,6 +6610,167 @@ CREATE TRIGGER minion_queue_protocol BEFORE INSERT OR UPDATE ON minion_jobs
         ? PERSISTENCE_DATABASE_PENDING_INDEX_SQL.replace('CREATE INDEX', 'CREATE INDEX CONCURRENTLY')
         : PERSISTENCE_DATABASE_PENDING_INDEX_SQL);
     },
+  },
+  {
+    version: 166, name: 'fact_embedding_identity', idempotent: true,
+    sql: `ALTER TABLE facts ADD COLUMN IF NOT EXISTS embedding_model TEXT;
+      ALTER TABLE facts ADD COLUMN IF NOT EXISTS embedded_text_hash TEXT;
+      ${MANAGED_WRITER_GUARD_SQL}`,
+  },
+  {
+    // A legacy DB-only row can name a fence row as its successor. The fence
+    // reconcile deletes and reinserts that row, so a NO ACTION reference made
+    // the page fail to reconcile on every cycle. The superseded row stays
+    // expired; only the pointer to the replaced row clears.
+    version: 167,
+    name: 'facts_superseded_by_set_null',
+    idempotent: true,
+    sql: `
+      ALTER TABLE facts DROP CONSTRAINT IF EXISTS facts_superseded_by_fkey;
+      ALTER TABLE facts ADD CONSTRAINT facts_superseded_by_fkey
+        FOREIGN KEY (superseded_by) REFERENCES facts(id) ON DELETE SET NULL NOT VALID;
+      ALTER TABLE facts VALIDATE CONSTRAINT facts_superseded_by_fkey;
+    `,
+  },
+  {
+    // The only record that a transcript was synthesized was its completed
+    // subagent job row, which `jobs prune` deletes after 30 days; the next
+    // cycle then paid to synthesize it again. Prune archives the keys here.
+    version: 168,
+    name: 'dream_synthesis_completions',
+    idempotent: true,
+    sql: `
+      CREATE TABLE IF NOT EXISTS dream_synthesis_completions (
+        source_id TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        completed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (source_id, idempotency_key)
+      );
+    `,
+  },
+  {
+    // A withdrawal keyed only on the claim text expired and blocked that claim
+    // for every entity in the source. New withdrawals carry the forgotten
+    // row's subject; existing rows keep the source-wide '*' subject.
+    version: 169,
+    name: 'fact_withdrawal_subject',
+    idempotent: true,
+    sql: FACT_WITHDRAWAL_SUBJECT_SQL,
+  },
+  {
+    version: 170, name: 'index_parked_persistence_effects', idempotent: true, transaction: false, sql: '',
+    handler: async engine => {
+      if (engine.kind === 'postgres') await dropInvalidConcurrentIndex(engine, 170, 'persistence_effects_parked');
+      await engine.runMigration(170, engine.kind === 'postgres'
+        ? PERSISTENCE_EFFECT_PARKED_INDEX_SQL.replace('CREATE INDEX', 'CREATE INDEX CONCURRENTLY')
+        : PERSISTENCE_EFFECT_PARKED_INDEX_SQL);
+    },
+  },
+  {
+    version: 171,
+    name: 'content_chunks_embedding_input_hash',
+    // #5553: per-chunk embedding-input provenance, written in the same
+    // statement as the vector (src/core/embedding-input-hash.ts). A projection
+    // rebuild keeps a vector only when the stored hash equals the recomputed
+    // one. Same shape as v133 and v166's fact provenance: nullable, no
+    // backfill (a hash cannot be proven for an existing vector), no index
+    // (read only per page during a rebuild; bootstrap-coverage: column-only).
+    // NULL on a contextual page is nulled once and stamped by its re-embed.
+    // Keep in sync with src/schema.sql (regenerate schema-embedded.ts via
+    // build:schema) and src/core/pglite-schema.ts.
+    idempotent: true,
+    sql: `
+      ALTER TABLE content_chunks ADD COLUMN IF NOT EXISTS embedding_input_hash TEXT;
+    `,
+  },
+  {
+    version: 172, name: 'pages_safe_chunk_pending_index', idempotent: true, transaction: false, sql: '',
+    // #5050/#5247: the safe_index_pending probe (ops/search.ts) runs on every
+    // remote search and now counts pages of every kind below the safe-chunk
+    // fence, so the markdown-only partial pages_chunker_version_idx no longer
+    // serves it. This partial index holds only unsealed pages (empty on a
+    // sealed brain). The literal 4 is SAFE_FENCE_CHUNKER_VERSION when this
+    // migration shipped; a later fence bump needs its own index.
+    handler: async engine => {
+      if (engine.kind === 'postgres') await dropInvalidConcurrentIndex(engine, 172, 'pages_safe_chunk_pending_idx');
+      await engine.runMigration(172, `CREATE INDEX ${engine.kind === 'postgres' ? 'CONCURRENTLY ' : ''}IF NOT EXISTS pages_safe_chunk_pending_idx
+        ON pages (source_id) WHERE chunker_version < 4`);
+    },
+  },
+  {
+    // Paid-loop breaker (dream-breaker.ts) and its doctor check count dead
+    // subagent submissions by finish time over the last 24 h.
+    version: 173, name: 'minion_jobs_dead_subagent_finished_index', idempotent: true, transaction: false, sql: '',
+    handler: async engine => {
+      if (engine.kind === 'postgres') await dropInvalidConcurrentIndex(engine, 173, 'idx_minion_jobs_dead_subagent_finished');
+      await engine.runMigration(173, `CREATE INDEX ${engine.kind === 'postgres' ? 'CONCURRENTLY ' : ''}IF NOT EXISTS idx_minion_jobs_dead_subagent_finished
+        ON minion_jobs (finished_at) WHERE name = 'subagent' AND status = 'dead'`);
+    },
+  },
+  {
+    // Exact-text fingerprints let a punctuation or casing variant of a
+    // forgotten claim come back on re-extraction (write-path audit B-9).
+    // Fingerprints now fold punctuation; legacy exact rows keep matching.
+    version: 174,
+    name: 'fact_withdrawal_normalized_fingerprint',
+    idempotent: true,
+    sql: FACT_WITHDRAWAL_NORMALIZED_SQL,
+  },
+  {
+    // Frontmatter tags were add-only because a tag row carried no provenance:
+    // removing a tag from frontmatter never removed it. The importer stamps
+    // 'frontmatter' and deletes only those rows; explicit adds stamp 'added'
+    // and legacy rows stay NULL — neither is ever deleted by an import.
+    version: 175,
+    name: 'tags_tag_source',
+    idempotent: true,
+    sql: `ALTER TABLE tags ADD COLUMN IF NOT EXISTS tag_source TEXT;`,
+  },
+  {
+    // #5686: connector checkpoints were keyed on the raw sources.config, which
+    // the cycle stamp rewrites after every run. Re-key each source's newest
+    // committed checkpoint receipt to the stable parsed-config identity, seed
+    // its connector state row (resumed or re-walking once), record the cutoff
+    // that classifies retired-format connector intents, and remove orphan
+    // checkpoint rows. Handler-only, statement-at-a-time, rerun-safe.
+    version: 176, name: 'connector_checkpoint_stable_identity', idempotent: true, sql: '',
+    handler: async engine => { await migrateConnectorCheckpoints(engine); },
+  },
+  {
+    // #5254: a page written database-only while its filesystem source had no
+    // canonical owner (persistence.unbound_write=database_only) is stamped
+    // 'unbound_source', so writes and sync after binding keep it database-only
+    // instead of materializing or overwriting it. Nullable, no backfill (no
+    // earlier binary could write such a page), no index (read per page; the
+    // doctor count scans only non-NULL rows; bootstrap-coverage: column-only).
+    // Keep in sync with src/schema.sql (regenerate schema-embedded.ts via
+    // build:schema) and src/core/pglite-schema.ts.
+    version: 177,
+    name: 'pages_database_only_reason',
+    idempotent: true,
+    sql: `ALTER TABLE pages ADD COLUMN IF NOT EXISTS database_only_reason TEXT;`,
+  },
+  {
+    // Writer-version stamps: each request records the binary version and host
+    // that admitted it and the ones that published it, so doctor's
+    // writer_version advisory can name an older writer still on the brain.
+    // Nullable and never backfilled (a past writer cannot be proven). The
+    // cutoff is the database clock at migration time: only requests admitted
+    // or published after it are expected to carry stamps. persistence_requests
+    // and persistence_brain are migration-created on PGLite and no index
+    // references these columns (bootstrap-coverage: column-only exemptions).
+    version: 178,
+    name: 'persistence_writer_version_stamps',
+    idempotent: true,
+    sql: `
+      ALTER TABLE persistence_requests ADD COLUMN IF NOT EXISTS admitter_version text;
+      ALTER TABLE persistence_requests ADD COLUMN IF NOT EXISTS admitter_host_id uuid;
+      ALTER TABLE persistence_requests ADD COLUMN IF NOT EXISTS consumer_version text;
+      ALTER TABLE persistence_requests ADD COLUMN IF NOT EXISTS consumer_host_id uuid;
+      ALTER TABLE persistence_requests ADD COLUMN IF NOT EXISTS published_at timestamptz;
+      ALTER TABLE persistence_brain ADD COLUMN IF NOT EXISTS writer_version_cutoff timestamptz;
+      UPDATE persistence_brain SET writer_version_cutoff=now() WHERE writer_version_cutoff IS NULL;
+    `,
   },
 ];
 
