@@ -33,8 +33,6 @@ eval/data/amara-life-v1/_cache/
 test/.cache/
 
 .claude/
-.pi/
-.github/
 export/
 
 # Conductor workspace-local agent artifacts: plans, todos, run-unit-parallel
@@ -56,22 +54,14 @@ test/fixtures/pglite-snapshot-default.version
 test/fixtures/.pglite-snapshot*.lock*
 test/fixtures/pglite-snapshot*.tmp
 
-.gbrain
-
 # Private brain reports — never check these in (per CLAUDE.md privacy rule)
 reports/network-intelligence/
-
-# Auto-managed by gbrain (db_only directories)
-media/x/
-media/articles/
-meetings/transcripts/
-
-.codegraph/
-.understand-anything/
 graphify-out/
-.agents/
-.codex/
+
 # Coverage lane output (COVERAGE_DIR opt-in in test-shard.sh /
 # run-serial-tests.sh / run-e2e.sh; merged by scripts/merge-lcov.ts)
 .coverage/
-export-test/
+
+# Local eval run ledger (gbrain eval run-all / longmemeval / canary --record);
+# each machine keeps its own, so it is never committed.
+/.gbrain-evals/eval-results.jsonl

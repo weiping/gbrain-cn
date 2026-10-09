@@ -33,7 +33,8 @@ import {
   existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync, rmSync, statSync, renameSync,
 } from 'fs';
 import { join, dirname, relative, isAbsolute } from 'path';
-import { execFile, execFileSync, execSync, type ExecFileException } from 'child_process';
+import { execFileSync, execSync } from 'child_process';
+import { execFileBounded } from './bounded-child-exec.ts';
 import {
   GIT_ENV, GIT_ENV_AUTH, divergenceSafePull, detectDefaultBranch, pushProbe,
   type PullOutcome, type PushProbeResult,
@@ -43,9 +44,14 @@ import { redactSecretsInText } from './minions/handlers/shell-redact.ts';
 import { ensureGbrainHome, resolveGbrainHome } from './gbrain-home.ts';
 import { binaryOnPath } from './execution-env.ts';
 import { loadFilingRules, type FilingRulesDoc } from './filing-audit.ts';
+import { classifyGitCheckout } from './git-checkout.ts';
+import { OperationError, opError } from './ops/contract.ts';
+import { readFix } from './ops/op-fix.ts';
 // Bundled into the --compile binary as the fallback taxonomy for repos that
 // don't ship their own — see resolveFilingRules().
 import filingRulesDoc from '../../skills/_brain-filing-rules.json';
+
+export { execFileBounded, type BoundedExecOptions } from './bounded-child-exec.ts';
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -393,6 +399,11 @@ function gitDirPath(repoPath: string, rel: string): string {
   return join(repoPath, '.git', rel);
 }
 
+function pathContains(parent: string, child: string): boolean {
+  const rel = relative(parent, child);
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+}
+
 function resolveHooksDir(repoPath: string): { dir: string; tracked: boolean } {
   let hooksPath = '';
   try {
@@ -402,8 +413,10 @@ function resolveHooksDir(repoPath: string): { dir: string; tracked: boolean } {
   } catch { /* unset — normal */ }
   if (hooksPath) {
     const dir = isAbsolute(hooksPath) ? hooksPath : join(repoPath, hooksPath);
-    // A hooksPath outside .git/ (e.g. .githooks) is a TRACKED location.
-    const tracked = !dir.includes(`${join('.git', '')}`) && !dir.endsWith('.git/hooks');
+    // A hooksPath in the working tree but outside the git dir (e.g. .githooks)
+    // is a TRACKED location. Classify by path containment, never by a '.git'
+    // substring, which matches '.githooks' and checkouts like 'site.github.io'.
+    const tracked = pathContains(repoPath, dir) && !pathContains(gitDirPath(repoPath, ''), dir);
     return { dir, tracked };
   }
   return { dir: gitDirPath(repoPath, 'hooks'), tracked: false };
@@ -431,6 +444,7 @@ function installLocalHook(repoPath: string, dryRun: boolean): { status: StepStat
   if (existsSync(hookPath)) {
     const cur = readFileSync(hookPath, 'utf-8');
     if (cur.includes(HOOK_BANNER)) {
+      if (tracked && !dryRun) ensureExcluded(repoPath, relative(repoPath, hookPath));
       if (cur === script) return { status: 'ok', detail: `${relative(repoPath, hookPath)} already current` };
       if (dryRun) return { status: 'fixed', detail: `would refresh ${relative(repoPath, hookPath)} (dry-run)` };
       writeFileSync(hookPath, script); chmodSync(hookPath, 0o755);
@@ -474,67 +488,53 @@ export function isDurabilityHardened(repoPath: string): boolean {
   }
 }
 
-export interface BoundedExecOptions {
-  timeout: number;
-  env?: NodeJS.ProcessEnv;
-  maxBuffer?: number;
-  signal?: AbortSignal;
-}
-
 /**
- * `execFile` that settles within `timeout` or on abort even when the runtime
- * never delivers the child's exit or pipe close. Bun through 1.3.x drops
- * one-shot pidfd and pipe events when a callback re-enters the event loop
- * (bun:test `expect().resolves/.rejects`, oven-sh/bun#30301): execFile's
- * callback and its own `timeout` then never fire and the child stays a zombie,
- * so the deadline and abort are enforced with our own timer.
+ * #6210: the durability probe never reads a failure as "not hardened". A
+ * failed probe is `git_unavailable` and the caller keeps its Git effect
+ * unfinished; only a directory that is positively not a Git checkout
+ * (`classifyGitCheckout`) or a hook file that is absent reads as false.
  */
-export function execFileBounded(file: string, args: string[], options: BoundedExecOptions): Promise<{ error: ExecFileException | null; stdout: string }> {
-  const { timeout, signal, ...rest } = options;
-  return new Promise(resolve => {
-    let settled = false;
-    const finish = (error: ExecFileException | null, stdout: string) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      signal?.removeEventListener('abort', onAbort);
-      resolve({ error, stdout });
-    };
-    const child = execFile(file, args, { ...rest, encoding: 'utf8' }, (error, stdout) => finish(error, stdout));
-    const stop = (message: string, code: string) => {
-      child.kill('SIGKILL');
-      finish(Object.assign(new Error(message), { code, killed: true, signal: 'SIGKILL' as const }), '');
-    };
-    const timer = setTimeout(() => stop(`${file} did not finish within ${timeout}ms`, 'ETIMEDOUT'), timeout);
-    const onAbort = () => stop(`${file} was aborted`, 'ABORT_ERR');
-    if (signal?.aborted) onAbort();
-    else signal?.addEventListener('abort', onAbort, { once: true });
-  });
+function durabilityProbeFailure(detail: string): OperationError {
+  return opError('git_unavailable', 'Cannot determine whether native Git durability is enabled.',
+    `${detail} This does not show that durability is off, so the Git effect stays unfinished and retries; nothing was committed or pushed for it yet. Check that the checkout is readable and that git works there (git status in the checkout), then read the owner's effect status.`,
+    { fix: readFix('Shows the canonical owner and its pending Git effects, read-only.', { argv: ['gbrain', 'sources', 'writer', 'status', '--json'] }) });
 }
 
-/** A git probe that does not block the event loop; a failed probe reads as ''. */
-async function gitOutput(repoPath: string, args: string[]): Promise<string> {
-  const { error, stdout } = await execFileBounded('git', ['-C', repoPath, ...args], { timeout: 10_000, env: { ...process.env, ...GIT_ENV } });
-  return error ? '' : stdout.trim();
+/** A git probe that does not block the event loop. Exit 1 is an unset key for `config --get`; every other failure throws. */
+async function gitProbe(repoPath: string, args: string[]): Promise<string> {
+  const { error, stdout } = await execFileBounded('git', ['-C', repoPath, ...args],
+    { timeout: 10_000, env: { ...process.env, ...GIT_ENV, LC_ALL: 'C', LANGUAGE: 'C' } });
+  if (!error) return stdout.trim();
+  if (error.code === 1 && args[0] === 'config' && args[1] === '--get') return '';
+  const status = typeof error.code === 'number' ? `exit ${error.code}` : typeof error.code === 'string' && /^[A-Z_]+$/.test(error.code) ? error.code : 'no exit status';
+  throw durabilityProbeFailure(`git ${args.slice(0, 2).join(' ')} failed (${status}).`);
 }
 
 /**
  * {@link isDurabilityHardened} for long-running owners: the same two git
  * probes, run concurrently as child processes the event loop does not wait on.
+ * Rejects with `git_unavailable` when it cannot tell (#6210).
  */
 export async function isDurabilityHardenedAsync(repoPath: string): Promise<boolean> {
+  const checkout = classifyGitCheckout(repoPath);
+  if (checkout === 'not_git') return false;
+  if (checkout === 'unknown') throw durabilityProbeFailure('The checkout directory, or a parent directory, could not be read.');
+  const [hooksPath, gitHooks] = await Promise.all([gitProbe(repoPath, ['config', '--get', 'core.hooksPath']),
+    gitProbe(repoPath, ['rev-parse', '--git-path', 'hooks'])]);
+  const reported = hooksPath || gitHooks;
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- repoPath is a registered local worktree root and the hooks path comes from git itself, resolved exactly as resolveHooksDir/gitDirPath do
+  const dir = !reported ? join(repoPath, '.git', 'hooks') : isAbsolute(reported) ? reported : join(repoPath, reported);
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- fixed hook filename inside the git-reported hooks directory, as in isDurabilityHardened
+  const hookPath = join(dir, 'post-commit');
+  let hook: string;
   try {
-    const [hooksPath, gitHooks] = await Promise.all([gitOutput(repoPath, ['config', '--get', 'core.hooksPath']),
-      gitOutput(repoPath, ['rev-parse', '--git-path', 'hooks'])]);
-    const reported = hooksPath || gitHooks;
-    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- repoPath is a registered local worktree root and the hooks path comes from git itself, resolved exactly as resolveHooksDir/gitDirPath do
-    const dir = !reported ? join(repoPath, '.git', 'hooks') : isAbsolute(reported) ? reported : join(repoPath, reported);
-    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- fixed hook filename inside the git-reported hooks directory, as in isDurabilityHardened
-    const hookPath = join(dir, 'post-commit');
-    return existsSync(hookPath) && readFileSync(hookPath, 'utf-8').includes(HOOK_BANNER);
-  } catch {
-    return false;
+    hook = readFileSync(hookPath, 'utf-8');
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return false;
+    throw durabilityProbeFailure(`The post-commit hook could not be read (${typeof code === 'string' && /^E[A-Z]+$/.test(code) ? code : 'read error'}).`);
   }
+  return hook.includes(HOOK_BANNER);
 }
 
 /**

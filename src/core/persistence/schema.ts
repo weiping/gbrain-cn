@@ -4,6 +4,61 @@ export const PERSISTENCE_REQUEST_RECOVERY_INDEX_SQL = `CREATE INDEX IF NOT EXIST
   ON persistence_requests(worktree_id,sequence) WHERE recovery IS NOT NULL`;
 export const PERSISTENCE_DATABASE_PENDING_INDEX_SQL = `CREATE INDEX IF NOT EXISTS persistence_requests_database_pending
   ON persistence_requests(source_incarnation,sequence) WHERE worktree_id IS NULL AND state IN ('queued','running','recovering')`;
+/**
+ * #5762: the managed sync checkpoint validation probes (sync-prepare.ts) read a
+ * run's open page receipts and its committed siblings through these. Postgres
+ * builds them CONCURRENTLY in a schema migration (never inside the blob);
+ * PGLite and a brand-new request table (v151) build them inline.
+ */
+export const PERSISTENCE_SYNC_RUN_OPEN_INDEX_SQL = `CREATE INDEX IF NOT EXISTS persistence_requests_sync_run_open
+  ON persistence_requests(worktree_id,(intent->>'runId')) WHERE state<>'committed' AND intent->>'kind' IN ('managed_sync_import','managed_sync_delete')`;
+export const PERSISTENCE_SYNC_RUN_COMMITTED_INDEX_SQL = `CREATE INDEX IF NOT EXISTS persistence_requests_sync_run_committed
+  ON persistence_requests(source_id,(intent->>'runId'),(intent->>'index')) WHERE state='committed' AND intent ? 'runId'`;
+export const PERSISTENCE_SYNC_RUN_INDEXES = [
+  { name: 'persistence_requests_sync_run_open', sql: PERSISTENCE_SYNC_RUN_OPEN_INDEX_SQL },
+  { name: 'persistence_requests_sync_run_committed', sql: PERSISTENCE_SYNC_RUN_COMMITTED_INDEX_SQL },
+] as const;
+/**
+ * #6317: the movement watermark (the newest committed receipt of a worktree)
+ * that `writer movement`, `data_moving` and doctor `managed_sync_not_moving`
+ * read; the baseline indexes cover pending, recovery and principal reads
+ * only. Postgres builds it CONCURRENTLY in migration v222; PGLite inline.
+ */
+export const PERSISTENCE_COMMITTED_WATERMARK_INDEX_SQL = `CREATE INDEX IF NOT EXISTS persistence_requests_committed_watermark
+  ON persistence_requests(worktree_id,completed_at DESC) WHERE state='committed'`;
+export const PERSISTENCE_COMMITTED_WATERMARK_INDEX = { name: 'persistence_requests_committed_watermark', table: 'persistence_requests', sql: PERSISTENCE_COMMITTED_WATERMARK_INDEX_SQL } as const;
+/**
+ * #6317: one row per process that runs a full persistence consumer on a host
+ * (consumer-heartbeat.ts). The primary key carries the process nonce, so a
+ * reused pid after a container restart is a new row; `pid_ns` tells pid
+ * namespaces apart. `renewed_at` is the liveness signal (live within 30 s,
+ * lapsed at 60 s, purged by a renewal after 90 s); `restart_required` and
+ * `root_barrier_age_ms` are the owner's own wedge report; `host_json_path`,
+ * `persistence_home` and `minted_under` let doctor name the owner's identity
+ * file without reading its filesystem.
+ */
+export const PERSISTENCE_CONSUMERS_TABLE_SQL = `CREATE TABLE IF NOT EXISTS persistence_consumers (
+    host_id uuid NOT NULL,
+    pid integer NOT NULL,
+    nonce text NOT NULL,
+    pid_ns text,
+    kind text NOT NULL,
+    mode text NOT NULL CHECK (mode IN ('probing','full','waiter_only','promoted')),
+    started_at timestamptz NOT NULL DEFAULT now(),
+    renewed_at timestamptz NOT NULL DEFAULT now(),
+    restart_required boolean NOT NULL DEFAULT false,
+    root_barrier_age_ms integer,
+    pool jsonb,
+    host_json_path text NOT NULL,
+    persistence_home text NOT NULL,
+    minted_under jsonb,
+    version text NOT NULL,
+    PRIMARY KEY(host_id,pid,nonce)
+  )`;
+/** Indexes the Postgres blob omits because a migration builds them CONCURRENTLY. */
+export const POSTGRES_CONCURRENT_PERSISTENCE_INDEXES: ReadonlySet<string> = new Set([
+  PERSISTENCE_DATABASE_PENDING_INDEX_SQL, PERSISTENCE_SYNC_RUN_OPEN_INDEX_SQL, PERSISTENCE_SYNC_RUN_COMMITTED_INDEX_SQL, PERSISTENCE_COMMITTED_WATERMARK_INDEX_SQL,
+]);
 /** Durable infrastructure: never reconstruct or discard these rows during page reindexing. */
 export const PERSISTENCE_SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS persistence_brain (
@@ -91,6 +146,9 @@ export const PERSISTENCE_SCHEMA_STATEMENTS = [
     WHERE state IN ('queued','running','recovering')`,
   PERSISTENCE_REQUEST_RECOVERY_INDEX_SQL,
   PERSISTENCE_DATABASE_PENDING_INDEX_SQL,
+  PERSISTENCE_SYNC_RUN_OPEN_INDEX_SQL,
+  PERSISTENCE_SYNC_RUN_COMMITTED_INDEX_SQL,
+  PERSISTENCE_COMMITTED_WATERMARK_INDEX_SQL,
   `CREATE INDEX IF NOT EXISTS persistence_requests_principal ON persistence_requests(principal_kind,principal_id,sequence DESC)`,
   `CREATE TABLE IF NOT EXISTS persistence_effects (
     id bigserial PRIMARY KEY,
@@ -103,5 +161,6 @@ export const PERSISTENCE_SCHEMA_STATEMENTS = [
     updated_at timestamptz NOT NULL DEFAULT now(),
     UNIQUE(request_id,kind)
   )`,
+  PERSISTENCE_CONSUMERS_TABLE_SQL,
   MANAGED_WRITER_GUARD_SQL,
 ] as const;

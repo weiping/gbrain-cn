@@ -48,6 +48,12 @@ const CONN_PATTERNS = [
   // retry, the checkpoint write (and every other pool-contending write) is
   // dropped during the exact spike #1794's resumable sync must survive.
   /EMAXCONNSESSION/i,
+  // #6340: the socket errnos postgres.js surfaces as "write <ERRNO> host:port" when a
+  // session-mode pooler drops the connection mid-statement (ECONNABORTED was the one
+  // that ended four managed catch-up runs in one afternoon). Same class as ECONNRESET.
+  /ECONNABORTED/i,
+  /ETIMEDOUT/i,
+  /EPIPE/i,
   /too many clients already/i,
   /max.*clients?.*in session mode/i,
   /remaining connection slots are reserved/i,
@@ -157,6 +163,23 @@ export function isConnectionEndedError(err: unknown): boolean {
   if (code === 'CONNECTION_ENDED') return true;
   const msg = getMessage(err);
   return /CONNECTION_ENDED/i.test(msg);
+}
+
+/**
+ * Did postgres.js abandon a connection handshake because its own
+ * `connect_timeout` timer fired? It reports that as code `CONNECT_TIMEOUT`
+ * with the message "write CONNECT_TIMEOUT <host>:<port>" (the host and port
+ * read "undefined:undefined" once the socket has been upgraded to TLS).
+ *
+ * Kept OUT of `isRetryableConnError` on purpose: on a process's first connect
+ * a handshake timeout usually means the host does not route, which
+ * pg-access-classify reports as `network_unreachable`, and retrying cannot
+ * fix that. A caller that has already reached the same URL in this process
+ * opts in through connectWithRetry's `retryConnectTimeout`.
+ */
+export function isConnectTimeoutError(err: unknown): boolean {
+  if (getCode(err) === 'CONNECT_TIMEOUT') return true;
+  return /\bCONNECT_TIMEOUT\b/.test(getMessage(err));
 }
 
 /**
