@@ -727,6 +727,7 @@ export async function runEmbedCore(engine: BrainEngine, opts: EmbedOpts): Promis
         }, drainSignal);
         if (opts.stale && !isAborted(drainSignal)) await embedTakesForStaleDrain(engine, {
           dryRun: !!opts.dryRun, signal: drainSignal, sourceId: opts.sourceId, assertOwned: opts.assertOwned, quiet: opts.quiet,
+          batchSize: opts.batchSize, // gbrain-cn: thread --batch-size into the takes lane (Zhipu caps input arrays at 64)
           takes: opts.takes, onProgress: (_done, _total, embedded) => { takesEmbedded = embedded; },
         }, result);
       } catch (e) {

@@ -27,11 +27,26 @@ export function detectTini(): string {
     // inherit the current process env by default (Bun snapshots env at
     // startup). Without this, runtime mutations to PATH (including in
     // tests) are invisible to `which`.
-    return execFileSync('which', ['tini'], {
+    const candidate = execFileSync('which', ['tini'], {
       encoding: 'utf8',
       timeout: 2000,
       env: process.env,
     }).trim();
+    if (!candidate) return '';
+    // A `which` hit is not enough: container tooling drops Linux ELF tini
+    // builds at /usr/local/bin/tini on macOS hosts, and spawning one fails
+    // with ENOEXEC — the worker then never starts and the queue wedges.
+    // Prove the candidate actually executes before adopting it.
+    try {
+      execFileSync(candidate, ['--version'], {
+        stdio: 'ignore',
+        timeout: 2000,
+        env: process.env,
+      });
+    } catch {
+      return '';
+    }
+    return candidate;
   } catch {
     return '';
   }
