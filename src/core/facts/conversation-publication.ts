@@ -71,6 +71,11 @@ import { waitForWrite } from '../persistence/service.ts';
 import { catalogueError } from '../error-catalogue.ts';
 import { CONVERSATION_EXTRACTOR_VERSION, NON_EXTRACTABLE_AUDIT_SOURCE, TERMINAL_AUDIT_SOURCE, stampExtractorVersion } from './audit-sources.ts';
 import { ALLOWED_TYPES, pageTypesForAllowed, type AllowedType } from './conversation-types.ts';
+import { withWriteTrust } from '../persistence/context.ts';
+import { conversationDerivation } from '../persistence/derived-facts.ts';
+import { recordTaintEdges } from '../trust/taint.ts';
+import { applyGateDecision, derivedGateConfig, derivedGateInput } from '../trust/derived-gate.ts';
+import { decideFactWrite, recordFlaggedRow } from '../write-gate-store.ts';
 
 export const CONVERSATION_FACTS_INTENT = 'managed_maintenance_conversation_facts';
 export const CONVERSATION_FACTS_PROTOCOL = 1;
@@ -96,8 +101,14 @@ const ROW_BYTES = 4096;
 /** One embedding dimension as JSON text ("-0.012345678901234567,"). */
 const DIMENSION_BYTES = 24;
 
-/** Request error codes that fail the same way on every retry. */
-const DETERMINISTIC_CODES = new Set(['invalid_params', 'permission_denied', 'request_too_large', 'payload_too_large']);
+/**
+ * Request error codes that fail the same way on every retry. `invalid_params`
+ * is not one (#6500): the envelope validator refuses a batch that names a page
+ * twice, which is the run's fault, never a member's, so the stored entries
+ * resubmit (de-duplicated) and MAX_GENERATION_ATTEMPTS bounds a genuinely
+ * malformed envelope.
+ */
+const DETERMINISTIC_CODES = new Set(['permission_denied', 'request_too_large', 'payload_too_large']);
 /** Retryable codes whose stored entries are stale: the next attempt extracts again. */
 const REEXTRACT_CODES = new Set(['embedding_configuration', 'revision_conflict', 'page_identity_changed', 'page_not_found']);
 const OUTCOME_SOURCES = new Set([TERMINAL_AUDIT_SOURCE, NON_EXTRACTABLE_AUDIT_SOURCE]);
@@ -197,11 +208,16 @@ export async function loadGenerationIndex(engine: BrainEngine, authority: Mainte
   [authority.writer.principal.kind, authority.writer.principal.id, authority.writer.sourceId, ANCHOR_SLUG]);
   const index = new Map<string, GenerationHistory>();
   for (const row of rows) {
-    for (const member of row.members ?? []) {
-      const history = index.get(member.generation) ?? { pending: null, failed: [] };
-      if (!isTerminal(row as unknown as WriteRequest)) history.pending = { id: row.id, attempt: Number(member.attempt) };
-      else history.failed.push({ id: row.id, requestId: row.request_id, code: row.error_code ?? row.state, attempt: Number(member.attempt) });
-      index.set(member.generation, history);
+    // One history entry per DISTINCT request (#6500): an envelope that listed a
+    // generation several times failed once, not once per member, so it counts
+    // once toward MAX_GENERATION_ATTEMPTS; the member attempt is the largest.
+    const attempts = new Map<string, number>();
+    for (const member of row.members ?? []) attempts.set(member.generation, Math.max(attempts.get(member.generation) ?? 0, Number(member.attempt)));
+    for (const [generation, attempt] of attempts) {
+      const history = index.get(generation) ?? { pending: null, failed: [] };
+      if (!isTerminal(row as unknown as WriteRequest)) history.pending = { id: row.id, attempt };
+      else history.failed.push({ id: row.id, requestId: row.request_id, code: row.error_code ?? row.state, attempt });
+      index.set(generation, history);
     }
   }
   return index;
@@ -386,18 +402,18 @@ async function mergedEntities(tx: BrainEngine, sourceId: string, slugs: string[]
  * Shared by the managed apply and the unmanaged writer.
  */
 export async function replaceConversationFacts(tx: BrainEngine, sourceId: string, slug: string,
-  rows: Array<Omit<ConversationFactRow, 'row_num' | 'source_markdown_slug'>>): Promise<{ deleted: number; inserted: number }> {
+  rows: Array<Omit<ConversationFactRow, 'row_num' | 'source_markdown_slug'>>): Promise<{ deleted: number; inserted: number; ids: number[] }> {
   const deleted = await clearConversationFacts(tx, sourceId, slug);
-  if (!rows.length) return { deleted, inserted: 0 };
+  if (!rows.length) return { deleted, inserted: 0, ids: [] };
   const [top] = await tx.executeRaw<{ n: number | string | null }>(
     'SELECT max(row_num) AS n FROM facts WHERE source_id=$1 AND source_markdown_slug=$2', [sourceId, slug]);
   const start = top?.n == null ? 0 : Number(top.n) + 1;
-  const { inserted } = await tx.insertFacts(rows.map((fact, i) => ({ ...fact, row_num: start + i, source_markdown_slug: slug })), { source_id: sourceId }); // gbrain-allow-direct-insert: a conversation page's derived fact batch replaced under its page lock (inside the receipted publication on a managed brain)
+  const { inserted, ids } = await tx.insertFacts(rows.map((fact, i) => ({ ...fact, row_num: start + i, source_markdown_slug: slug })), { source_id: sourceId }); // gbrain-allow-direct-insert: a conversation page's derived fact batch replaced under its page lock (inside the receipted publication on a managed brain)
   if (inserted !== rows.length) {
     throw opError('storage_error', 'A conversation fact insert was lost; the page\'s prior facts were kept.',
       `Only ${inserted} of ${rows.length} fact rows of ${slug} in source ${sourceId} were inserted, so the replacement rolled back. Run the extraction for the page again; report this if it repeats.`);
   }
-  return { deleted, inserted };
+  return { deleted, inserted, ids };
 }
 
 /** Context marker `gbrain repair conversation-labels` appends to the rows it retires. */
@@ -459,9 +475,21 @@ async function applyEntry(tx: BrainEngine, row: WriteRequest, entry: Conversatio
     embedding: vectors && fact.embedding ? new Float32Array(fact.embedding) : null,
     embedding_model: vectors && fact.embedding ? entry.embedding!.model : null,
   }));
-  const { deleted } = await replaceConversationFacts(tx, row.source_id, entry.slug, rows);
+  // #5575 I2/B3: the rows carry the conversation page's tier and pass the write gate at it; outcome audit rows are not gated.
+  const derivation = await conversationDerivation(tx, row.source_id, entry.slug);
+  const cfg = await derivedGateConfig(tx);
+  const decisions = rows.map(fact => OUTCOME_SOURCES.has(fact.source) ? null : decideFactWrite(fact,
+    { sourceId: row.source_id, slug: entry.slug, payload: { ...fact, embedding: null }, input: derivedGateInput(derivation.trust, row.id), cfg }));
+  for (const d of decisions) if (d && d.action !== 'insert') await applyGateDecision(tx, d, { table: 'facts', sourceId: row.source_id }, async () => null);
+  const kept = rows.filter((_, i) => decisions[i]?.action !== 'hold' && decisions[i]?.action !== 'reject');
+  const flags = decisions.filter(d => d?.action !== 'hold' && d?.action !== 'reject');
+  const { deleted, ids } = await withWriteTrust(tx, derivation.trust, () => replaceConversationFacts(tx, row.source_id, entry.slug, kept));
+  for (const [i, id] of ids.entries()) {
+    await recordTaintEdges(tx, { table: 'facts', id, sourceId: row.source_id }, derivation.inputs);
+    if (flags[i] && ids.length === kept.length) await recordFlaggedRow(tx, flags[i]!, { table: 'facts', id, sourceId: row.source_id });
+  }
   const outcome = entry.rows.find(fact => OUTCOME_SOURCES.has(fact.source));
-  return { ...base, status: 'committed', deleted, facts_inserted: rows.filter(fact => !OUTCOME_SOURCES.has(fact.source)).length,
+  return { ...base, status: 'committed', deleted, facts_inserted: kept.filter(fact => !OUTCOME_SOURCES.has(fact.source)).length,
     page_outcome: outcome ? (outcome.source === TERMINAL_AUDIT_SOURCE ? 'complete' : 'non_extractable') : null, newest_end: entry.newest_end,
     vectors_dropped: vectors ? 0 : entry.rows.filter(fact => fact.embedding).length };
 }
@@ -521,6 +549,8 @@ const RUN_STOPPING = new WeakSet<object>();
 export interface ManagedRunCounters {
   pages_processed: number; pages_marked_non_extractable: number; pages_skipped_too_large: number; pages_failed: number;
   orphan_facts_cleaned: number; facts_inserted: number; pages_pending?: number; pages_blocked?: number;
+  /** Pages the run listed more than once and extracted once (#6500). */
+  pages_skipped_duplicate_listing?: number;
 }
 
 interface ManagedRunState {
@@ -650,6 +680,20 @@ export async function enqueueManagedPage(state: ManagedRunState, snapshot: PageS
 
 async function enqueueEntry(state: ManagedRunState, entry: ConversationPageEntry): Promise<void> {
   const m = state.managed!;
+  // De-dup before the byte-cap flush (#6500): the envelope validator refuses a
+  // batch naming a page twice. The same generation is the same frozen rows, so
+  // the newcomer is dropped; a different generation means the page moved
+  // between the two reads, so the earlier entry publishes first (apply skips it
+  // as stale) and the newcomer opens the next batch.
+  const held = m.batch.find(e => e.slug === entry.slug);
+  if (held) {
+    if (held.generation === entry.generation) {
+      state.result.pages_skipped_duplicate_listing = (state.result.pages_skipped_duplicate_listing ?? 0) + 1;
+      log(`${entry.slug}: already frozen in this run's batch at the same generation; the second listing is dropped`);
+      return;
+    }
+    await flushManagedBatch(state);
+  }
   const bytes = jsonBytes(entry);
   const cap = Math.min(batchCaps.bytes, await conversationIntentByteLimit(m.engine) - 65_536);
   if (m.batch.length && m.bytes + bytes > cap) await flushManagedBatch(state);

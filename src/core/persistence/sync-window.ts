@@ -15,6 +15,16 @@ import { completeWrite, lockCounters } from './journal.ts';
 import { isTerminal, principalKey, requestPrincipal, type Principal, type WriteRequest } from './model.ts';
 
 export const WINDOW_CANCEL_MESSAGE = 'An earlier page of the same sync did not commit; this page was not published and is re-frozen after that failure is resolved.';
+/** #6402 residual (P4.3): the lane fault a group released or cancelled under, kept on its rows as `blocked_reason` / the cancel message. */
+export type LaneFault = 'lock_timeout' | 'statement_timeout';
+export const laneFaultBlockedReason = (fault: LaneFault) => `lane_${fault}` as const;
+export const laneFaultOf = (blockedReason: string | null | undefined): LaneFault | null =>
+  blockedReason === 'lane_lock_timeout' ? 'lock_timeout' : blockedReason === 'lane_statement_timeout' ? 'statement_timeout' : null;
+export const laneFaultCancelMessage = (fault: LaneFault) =>
+  `An earlier page of the same sync did not commit after ${fault} on its lane group; this page was not published and is re-frozen on the next sync pass.`;
+/** The lane fault a recorded cancel names, so `sync status --json` carries it as the failure's detail (#6402 residual). */
+export const laneFaultInMessage = (message: string | null | undefined): LaneFault | null =>
+  message?.includes(' after lock_timeout on its lane group') ? 'lock_timeout' : message?.includes(' after statement_timeout on its lane group') ? 'statement_timeout' : null;
 
 /** The request a window group waits for, or null for any other request. */
 export function windowPredecessor(row: Pick<WriteRequest, 'intent'>): string | null {
@@ -110,7 +120,14 @@ export async function claimedHeadOrder(engine: BrainEngine, head: WriteRequest, 
   const group = typeof head.intent?.group === 'string' ? head.intent.group : head.request_id;
   const members = await engine.executeRaw<WriteRequest>(`SELECT * FROM persistence_requests WHERE worktree_id=$1::uuid AND intent->>'group'=$2
     AND state='queued' AND id<>$3::uuid ORDER BY sequence`, [head.worktree_id, group, head.id]);
-  return cancelRows(engine, [head, ...members]);
+  const missing = prior === 'missing' ? windowPredecessor(head) : null;
+  // #6402 (P4.3): a group released after a lane fault names that fault when its predecessor then ended uncommitted. The
+  // claim cleared the head's own `blocked_reason`; its still-queued members keep the one the release stamped.
+  const fault = laneFaultOf(head.blocked_reason) ?? members.map(member => laneFaultOf(member.blocked_reason)).find(Boolean) ?? null;
+  if (!missing) return fault ? cancelRows(engine, [head, ...members], laneFaultCancelMessage(fault)) : cancelRows(engine, [head, ...members]);
+  // #6402: a predecessor that was never admitted is named, never reported as "an earlier page did not commit".
+  return [...await cancelRows(engine, [head], `Its predecessor request ${missing} was never admitted; this page was not published and is re-frozen on the next sync pass.`),
+    ...await cancelRows(engine, members, `The first page of its group (request ${head.request_id}) was cancelled because its predecessor request ${missing} was never admitted; this page was not published and is re-frozen on the next sync pass.`)];
 }
 
 /** The sync side's cancellation of the window after a failed page: every member nobody claimed yet. */
@@ -149,14 +166,14 @@ export async function cancelOrphanedLaneRows(engine: BrainEngine, run: string, s
 }
 
 /** Cancels unpublished rows (queued, or claimed with the given token) with the window reason. */
-export async function cancelRows(engine: BrainEngine, rows: WriteRequest[]): Promise<WriteRequest[]> {
+export async function cancelRows(engine: BrainEngine, rows: WriteRequest[], message = WINDOW_CANCEL_MESSAGE): Promise<WriteRequest[]> {
   const settled: WriteRequest[] = [];
   for (const row of rows) {
     const done = await engine.transaction(async tx => {
       await lockCounters(tx, ['brain', principalKey(requestPrincipal(row)), ...(row.worktree_id ? [`worktree:${row.worktree_id}`] : [])]);
       const [current] = await tx.executeRaw<WriteRequest>('SELECT * FROM persistence_requests WHERE id=$1::uuid FOR UPDATE', [row.id]);
       if (!current || isTerminal(current) || current.execution_token !== row.execution_token || current.publication_started || current.recovery) return current ?? null;
-      return completeWrite(tx, current, 'cancelled', {}, { code: 'cancelled', message: WINDOW_CANCEL_MESSAGE });
+      return completeWrite(tx, current, 'cancelled', {}, { code: 'cancelled', message });
     });
     if (done) settled.push(done);
   }

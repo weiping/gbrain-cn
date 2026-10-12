@@ -35,21 +35,23 @@ import type { BrainEngine } from '../engine.ts';
 import { OperationError } from '../ops/contract.ts';
 import { authorizeStoredRequest, storedAuthorizationReads } from './authority.ts';
 import { localHostId } from './identity.ts';
-import { acquireWorktree, acquireWorktreeShared, getWorktreeBinding, guardOwnership, joinWorktreeLease } from './ownership.ts';
+import { acquireWorktree, acquireWorktreeShared, getWorktreeBinding, guardOwnership, joinWorktreeLease, MANAGED_MODE_SQL } from './ownership.ts';
+import { isLockOpenFailure, type NativeLockHandle } from './native-lock.ts';
 import { awaitLaneBegin, awaitLaneTurn, LaneAbort, laneApplyBegin, laneClaimed, laneFinished, lanePolicy, stepDownLanes, type LaneState } from './sync-lanes.ts';
-import { cancelRows, windowPredecessor } from './sync-window.ts';
+import { cancelRows, laneFaultBlockedReason, laneFaultCancelMessage, windowPredecessor } from './sync-window.ts';
 import { clearResolvedRecoveries, completeWrite, ENSURE_COUNTERS_SQL, getWriteRequestById, LOCK_COUNTERS_SQL, markDispatched, markRecovering, prepareRecoveries,
-  foregroundPriority, publicationGroupKey, reclaimReleasedWrite, releaseUnpublishedClaim, renewGroupClaims } from './journal.ts';
+  foregroundPriority, independentGroup, publicationGroupKey, reclaimReleasedWrite, releaseUnpublishedClaim, renewGroupClaims } from './journal.ts';
 import { principalKey, requestPrincipal, type FileRecoveryRecord, type WriteRequest } from './model.ts';
 import { CLAIM_LOST, DEFAULT_CLAIM_LEASE_TIMING, endLostLease, startClaimLease, type ClaimLeaseTiming } from './claim-lease.ts';
 import { claimPhaseStamp, enterClaimPhase, startClaimPhase, type ClaimPhaseClock } from './claim-phase.ts';
 import { DEFAULT_PREPARATION_POLICY, preparationBudgetMs, startPreparation, type PreparationPolicy, type PreparationRun } from './preparation-budget.ts';
 import { setMemberAttribution, withCoordinatedWrite } from './context.ts';
-import { requestAttribution } from './attribution.ts';
+import { publicationAttribution } from './attribution.ts';
 import { tryAcquirePublicationCapacity } from './pool-capacity.ts';
 import { queuePublicationEffects, queuesMentionLinks, reconcileFinishedBatch } from './effect-journal.ts';
 import { assertUnboundPublication, classifyUnboundPage } from './unbound-source.ts';
 import { declareDurablePersistence } from './protocol.ts';
+import { bindPublicationTimeouts, boundPublication, publicationTransaction, type PublicationBound } from './publication-deadline.ts';
 import { classifyMirrorPage, sourceMirrorReadOnly } from './mirror-read-only.ts';
 import { authorizePageVisibility } from './page-visibility.ts';
 import { withFilesystemPublication } from './filesystem-guard.ts';
@@ -66,8 +68,10 @@ import { recordPublicationFenceTrend } from '../fence-repair/census-store.ts';
 import { faultPoint, type PublicationBoundary } from './fault-points.ts';
 import { assertMutationProtocol } from './protocol.ts';
 import { writeSwitchOn } from './switches.ts';
+import { importGroupReads, type ImportGroupReads } from './import-reads.ts';
+import { withScreeningPaths } from './screening-paths.ts';
 
-/** A `put_pages` group publishes at most this many pages per transaction, so one commit stays a few seconds long. */
+/** A `put_pages` or managed import group publishes at most this many pages per transaction, so one commit stays a few seconds long. */
 export const PAGE_BATCH_GROUP_MAX = 8;
 
 function syncMember(row: WriteRequest): boolean {
@@ -84,10 +88,20 @@ export function singleWrite(row: Pick<WriteRequest, 'operation' | 'intent'>): bo
 export function groupable(row: WriteRequest, prepared: PreparedMutation): boolean {
   if ((row.target_kind ?? 'page') !== 'page' || prepared.target === 'skill_bundle' || prepared.sourceExclusive || prepared.exclusiveSources?.length) return false;
   if (syncMember(row)) return !prepared.file && typeof prepared.validate === 'function';
-  return publicationGroupKey(row)?.startsWith('batch:') === true || singleWrite(row);
+  return independentGroup(publicationGroupKey(row)) || singleWrite(row);
 }
 
-const flat = (sql: string) => sql.replace(/\s+/g, ' ').trim();
+const flattened = new Map<string, string>();
+/** A statement's whitespace-normalized text, remembered for the (bounded) set of statements the memos see. */
+const flat = (sql: string) => {
+  let text = flattened.get(sql);
+  if (text === undefined) {
+    if (flattened.size >= 1024) flattened.clear();
+    text = sql.replace(/\s+/g, ' ').trim();
+    flattened.set(sql, text);
+  }
+  return text;
+};
 /**
  * Reads a group transaction repeats for every member and whose answer cannot
  * change before it commits: the source's local path (its source row is held
@@ -133,7 +147,7 @@ const STABLE_IN_PREPARATION = new Set([
   'SELECT lane,revoked_at,grant_ceiling FROM persistence_local_writers WHERE id=$1::uuid',
   'SELECT s.source_id,s.source_incarnation,s.worktree_id,s.relative_path, s.topology_generation::text AS topology_generation,w.owner_host_id,w.owner_epoch::text AS owner_epoch,w.state, h.local_path,h.coordination_path FROM persistence_source_bindings s JOIN persistence_worktrees w ON w.id=s.worktree_id LEFT JOIN persistence_host_bindings h ON h.worktree_id=w.id AND h.host_id=$2::uuid WHERE s.source_id=$1',
   'SELECT local_path FROM sources WHERE id=$1',
-  'SELECT enabled FROM persistence_brain WHERE singleton=1',
+  MANAGED_MODE_SQL,
   "SELECT to_regclass('shared_skill_packs') IS NOT NULL AS present",
   'SELECT p.source_id,p.source_incarnation,s.local_path AS source_root, h.local_path AS worktree_root,b.relative_path FROM shared_skill_packs p JOIN sources s ON s.id=p.source_id AND s.incarnation=p.source_incarnation LEFT JOIN persistence_source_bindings b ON b.source_id=p.source_id AND b.source_incarnation=p.source_incarnation LEFT JOIN persistence_host_bindings h ON h.worktree_id=b.worktree_id AND h.host_id=$1::uuid',
   'SELECT id, name, local_path, last_commit, last_sync_at, config, created_at, contextual_retrieval_mode, trust_frontmatter_overrides FROM sources WHERE id = $1',
@@ -145,7 +159,7 @@ const STABLE_IN_PREPARATION = new Set([
  * publication re-checks what it relies on under its locks. It lives only for
  * one group's preparation; a failed read is not kept.
  */
-export function preparationReads(engine: BrainEngine): BrainEngine {
+export function preparationReads(engine: BrainEngine, imports?: ImportGroupReads): BrainEngine {
   const reads = new Map<string, Promise<unknown>>();
   const once = <T>(id: string, read: () => Promise<T>): Promise<T> => {
     let value = reads.get(id) as Promise<T> | undefined;
@@ -158,8 +172,12 @@ export function preparationReads(engine: BrainEngine): BrainEngine {
     if (key === 'executeRaw') return (sql: string, params?: unknown[], opts?: { signal?: AbortSignal; timeoutMs?: number }) =>
       STABLE_IN_PREPARATION.has(flat(sql)) && (!opts?.signal || opts.timeoutMs !== undefined)
         ? once(JSON.stringify([flat(sql), params ?? null]), () => target.executeRaw(sql, params)) : target.executeRaw(sql, params, opts);
-    if (key === 'getConfig') return (name: string) => once(`config:${name}`, () => target.getConfig(name));
+    // GBRA-75 wave 10: every config key a member reads comes from one config read for the group (the same value per key).
+    if (key === 'getConfig') return (name: string) => once('config:*', () => target.getAllConfig()).then(all => Object.hasOwn(all, name) ? all[name]! : null);
     if (key === 'getAllConfig') return () => once('config:*', () => target.getAllConfig()).then(all => ({ ...all }));
+    if (imports && key === 'readPageSnapshot') return (slug: string, opts?: Parameters<BrainEngine['readPageSnapshot']>[1]) =>
+      imports.snapshot(slug, opts) ?? target.readPageSnapshot(slug, opts);
+    if (imports && key === 'findDuplicatePage') return (sourceId: string, opts: Parameters<NonNullable<BrainEngine['findDuplicatePage']>>[1]) => imports.findDuplicate(sourceId, opts);
     const value = Reflect.get(target, key, target);
     return typeof value === 'function' ? value.bind(target) : value;
   } });
@@ -186,7 +204,7 @@ export type TransactionRunner = <T>(fn: (tx: BrainEngine) => Promise<T>) => Prom
 const publishingBeside = new Set<string>();
 
 export async function publishGroup(engine: BrainEngine, rows: WriteRequest[], prepared: PreparedMutation[], hostId = localHostId(),
-  hooks: GroupHooks = {}, lane: LaneState | null = null, transaction: TransactionRunner = fn => engine.transaction(fn)): Promise<{ done: WriteRequest[] | null; requeued: string[]; reason?: GroupFailure }> {
+  hooks: GroupHooks = {}, lane: LaneState | null = null, transaction: TransactionRunner = fn => publicationTransaction(engine, fn)): Promise<{ done: WriteRequest[] | null; requeued: string[]; reason?: GroupFailure }> {
   const head = rows[0];
   const none: { done: null; requeued: string[]; reason?: GroupFailure } = { done: null, requeued: [] };
   if (!head?.worktree_id || rows.some((row, i) => row.worktree_id !== head.worktree_id || row.source_id !== head.source_id || !groupable(row, prepared[i]!)
@@ -197,8 +215,16 @@ export async function publishGroup(engine: BrainEngine, rows: WriteRequest[], pr
   // lease and publishes beside them; everything else takes it exclusively.
   // With this process's lanes open on the worktree but none publishing, it opens the lease for them to join.
   const beside = !lane && rows.length === 1 && singleWrite(head) && await foregroundPriority(engine);
-  const joined = beside ? joinWorktreeLease(binding) ?? ((lanePolicy(head.worktree_id)?.effective ?? 1) > 1 ? await acquireWorktreeShared(binding, engine) : null) : null;
-  const lock = lane ? await acquireWorktreeShared(binding, engine) : joined ?? await acquireWorktree(binding, 0, undefined, engine, { yieldLanes: true });
+  let joined: NativeLockHandle | null, lock: NativeLockHandle | null;
+  try {
+    joined = beside ? joinWorktreeLease(binding) ?? ((lanePolicy(head.worktree_id)?.effective ?? 1) > 1 ? await acquireWorktreeShared(binding, engine) : null) : null;
+    lock = lane ? await acquireWorktreeShared(binding, engine) : joined ?? await acquireWorktree(binding, 0, undefined, engine, { yieldLanes: true });
+  } catch (error) {
+    // #6305: this process cannot open the lock file. A lane group retries as busy; a single write falls through to
+    // publishMutation (row still running, same token), which releases it for an owner as writer_lock_unavailable.
+    if (!isLockOpenFailure(error)) throw error;
+    return lane ? { ...none, reason: 'busy' } : none;
+  }
   if (!lock) return { ...none, reason: 'busy' };
   if (joined) publishingBeside.add(head.id);
   if (lane) lane.coordinationPath ??= binding.coordination_path;
@@ -246,6 +272,7 @@ export async function publishGroup(engine: BrainEngine, rows: WriteRequest[], pr
       const keys = rows.flatMap((row, i) => [{ sourceId: row.source_id, slug: row.slug, incarnation: row.source_incarnation },
         ...(prepared[i]!.additionalPageKeys ?? []).map(key => key.sourceId === row.source_id ? { ...key, incarnation: row.source_incarnation } : key)]);
       const ready = pipelined(tx, [
+        () => bindPublicationTimeouts(opened),
         () => declareDurablePersistence(tx),
         () => guardOwnership(tx, head, hostId),
         // A published file needs recovery even if this transaction rolls back; claims are verified first.
@@ -257,7 +284,7 @@ export async function publishGroup(engine: BrainEngine, rows: WriteRequest[], pr
         () => prepared.some(member => member.file && !member.noop) ? tx.executeRaw(HOST_BINDING_SQL, [head.worktree_id]) : Promise.resolve([]),
         ...storedAuthorizationReads(tx, rows, true),
       ]).then(results => {
-        const [, live, started, readOnly] = results as [unknown, Awaited<ReturnType<typeof guardOwnership>>, unknown[], boolean];
+        const [, , live, started, readOnly] = results as [unknown, unknown, Awaited<ReturnType<typeof guardOwnership>>, unknown[], boolean];
         if (String(live?.owner_epoch) !== String(binding.owner_epoch)) throw new OperationError('owner_unavailable', 'Owner epoch changed before publication.', 'Inspect the source owner with gbrain sources writer status; do not claim or transfer the source to push this write.');
         if (started.length !== members.length) throw new OperationError('write_claim_lost', 'Execution claim changed before publication.', 'Another worker holds the request; inspect it rather than resubmitting.');
         // A file target prepared before the source became a read-only mirror is never published (as in publishMutation, noop included).
@@ -283,7 +310,7 @@ export async function publishGroup(engine: BrainEngine, rows: WriteRequest[], pr
         let effects: (() => Promise<void>) | null = null;
         for (let i = 0; i < rows.length; i++) {
           const row = rows[i]!, member = prepared[i]!, file = recorded.get(i), sync = syncMember(row), previous = effects;
-          // A group of one is already attributed to its only member by the coordinated write.
+          // A group of one is already attributed to its only member (and its declared trust) by the coordinated write.
           const attribute = rows.length > 1;
           // #5984: a member's checks and reads are pipelined and run in their usual order, so the first failing one is reported.
           // A sync member validates alongside (read-only checks); a member that publishes a file sets its attribution after the file.
@@ -298,7 +325,7 @@ export async function publishGroup(engine: BrainEngine, rows: WriteRequest[], pr
               return snapshot;
             },
             async () => { if (sync) await member.validate?.(tx); },
-            async () => { if (!file && attribute) await setMemberAttribution(tx, requestAttribution(row)); },
+            async () => { if (!file && attribute) await setMemberAttribution(tx, publicationAttribution(row, member.trust)); },
           ]) as [unknown, Awaited<ReturnType<BrainEngine['readPageSnapshot']>>];
           if (!sync) await member.validate?.(tx);
           if (file) {
@@ -306,7 +333,7 @@ export async function publishGroup(engine: BrainEngine, rows: WriteRequest[], pr
             await seam('before_publication', row);
             await withFilesystemPublication([file.record.root], async () => publishPersistenceFile(member.file!, file.record.staging?.publication?.path));
             await seam('after_publication', row);
-            if (attribute) await setMemberAttribution(tx, requestAttribution(row));
+            if (attribute) await setMemberAttribution(tx, publicationAttribution(row, member.trust));
           }
           member.postimage = undefined;
           const outcome = await member.apply(tx, snapshot);
@@ -321,7 +348,7 @@ export async function publishGroup(engine: BrainEngine, rows: WriteRequest[], pr
           outcomes.push(outcome);
         }
         await effects?.();
-      }, requestAttribution(head));
+      }, publicationAttribution(head, prepared[0]!.trust));
       // #5984 lanes: applied concurrently, committed in manifest order.
       if (lane) { timed.apply?.turn(); await faultPoint('lane:applied', { requestId: head.request_id, sourceId: head.source_id, operation: head.operation }); await awaitLaneTurn(tx, lane, rows); timed.apply?.turned(); }
       const done = await completeGroup(tx, rows, outcomes);
@@ -413,7 +440,10 @@ function groupFailure(error: unknown): GroupFailure {
  */
 async function laneFallback(engine: BrainEngine, rows: WriteRequest[], reason: GroupFailure | undefined, run: GroupExecution): Promise<boolean | null> {
   if (run.lane) run.lane.fallbacks++;
-  if (reason === 'lock_timeout' || reason === 'statement_timeout') stepDownLanes(rows[0]!.worktree_id!, `${reason} on a lane group`);
+  // #6402 residual (P4.3): a server fault on the lane group is kept on the rows it releases or cancels (`blocked_reason`
+  // `lane_<fault>`, the cancel message), so the ledger and `claimedHeadOrder` name it instead of a generic wait.
+  const laneFault = reason === 'lock_timeout' || reason === 'statement_timeout' ? reason : null;
+  if (laneFault) stepDownLanes(rows[0]!.worktree_id!, `${reason} on a lane group`);
   const after = windowPredecessor(rows[0]!);
   const prior = after ? await engine.executeRaw<{ state: string }>('SELECT state FROM persistence_requests WHERE principal_kind=$1 AND principal_id=$2 AND request_id=$3::uuid',
     [rows[0]!.principal_kind, rows[0]!.principal_id, after]).then(found => found[0]?.state ?? null) : 'committed';
@@ -421,10 +451,10 @@ async function laneFallback(engine: BrainEngine, rows: WriteRequest[], reason: G
   // claimed again as a lane head; publishing its members one at a time would hold the lanes back.
   if (prior === 'committed' && reason !== 'busy') return null;
   if (prior !== null && ['failed', 'conflict', 'cancelled'].includes(prior)) {
-    for (const done of await cancelRows(engine, rows)) run.settled(done);
+    for (const done of await cancelRows(engine, rows, laneFault ? laneFaultCancelMessage(laneFault) : undefined)) run.settled(done);
     return true;
   }
-  for (const row of rows) await releaseUnpublishedClaim(engine, row, 'group_member_waiting');
+  for (const row of rows) await releaseUnpublishedClaim(engine, row, laneFault ? laneFaultBlockedReason(laneFault) : 'group_member_waiting');
   return false;
 }
 
@@ -492,6 +522,8 @@ export interface GroupExecution {
    * or (#6278) a deadline; `abandoned` names the member and its clock for the ceiling.
    */
   leftRunning?(work: Promise<unknown>, blocksRoot: boolean, abandoned?: { row: WriteRequest; clock: ClaimPhaseClock }): void;
+  /** #6288 (P2.3): the publication ceiling and what the owner does at it and past it (publication-deadline.ts); absent, unbounded. */
+  publication?: PublicationBound;
 }
 
 /**
@@ -542,17 +574,19 @@ export async function executeClaimedGroup(engine: BrainEngine, rows: WriteReques
     return (await renewGroupClaims(engine, live.map(([row]) => row), 30_000, signal, live.map(([, i]) => stampOf(i)))).size === live.length;
   }, run.lease ?? DEFAULT_CLAIM_LEASE_TIMING, () => { for (const prep of inFlight.values()) prep.abort({ code: 'claim_lost' }); });
   if (run.lane) laneClaimed(run.lane, rows);
-  // A put_pages batch is independent page writes: one page's failure never cancels its siblings.
-  const independent = publicationGroupKey(rows[0]!)?.startsWith('batch:') === true;
+  // A put_pages batch or a managed import batch is independent page writes: one page's failure never cancels its siblings.
+  const independent = independentGroup(publicationGroupKey(rows[0]!));
   const prepared: MemberOutcome[] = new Array(rows.length);
   // The first member whose deadline passed in an ordered group: nothing after it is dispatched or published this pass.
   let cut: number | null = null;
   const abandon = (i: number, work: Promise<unknown>) => run.leftRunning?.(work, true, { row: rows[i]!, clock: clocks[i]! });
   try {
-    const reads = preparationReads(engine);
-    // A put_pages group prepares all of its (at most PAGE_BATCH_GROUP_MAX) pages at once.
+    // GBRA-75 wave 10: an import group's members read their pages and duplicate candidates through one batch each (import-reads.ts).
+    const reads = preparationReads(engine, publicationGroupKey(rows[0]!)?.startsWith('import:') ? importGroupReads(engine, rows) : undefined);
+    // A put_pages or import group prepares all of its (at most PAGE_BATCH_GROUP_MAX) pages at once.
     const width = independent ? PAGE_BATCH_GROUP_MAX : 4;
-    const preparing = (async () => {
+    // GBRA-75 wave 10: the members' preparations share one memo of root-level path facts; publication re-checks every path.
+    const preparing = withScreeningPaths(async () => {
       for (let start = 0; start < rows.length && (independent || cut === null); start += width) {
         const wave = rows.slice(start, start + width);
         const now = Date.now();
@@ -590,7 +624,7 @@ export async function executeClaimedGroup(engine: BrainEngine, rows: WriteReques
           } finally { inFlight.delete(i); }
         }));
       }
-    })();
+    });
     if (await lease.whileHeld(preparing) === CLAIM_LOST) {
       run.leftRunning?.(preparing, true, { row: rows[0]!, clock: groupClock });
       await endLostLease(lease);
@@ -618,6 +652,10 @@ export async function executeClaimedGroup(engine: BrainEngine, rows: WriteReques
     }
     for (const clock of clocks) if (clock) enterClaimPhase(clock, 'publishing');
     enterClaimPhase(groupClock, 'publishing');
+    const bounded = <T>(publish: () => Promise<T>): Promise<T> => run.publication ? boundPublication(publish, { ...run.publication, onOverdue: () => {
+      for (const clock of [...clocks, groupClock]) if (clock) clock.waitingOn = 'publication_deadline';
+      run.publication!.onOverdue?.();
+    } }) : publish();
     const live = rows.map((row, i) => ({ row, i })).filter(({ row }) => !released.has(row.id));
     if (!live.length) return progressed;
     const liveRows = live.map(({ row }) => row);
@@ -625,7 +663,7 @@ export async function executeClaimedGroup(engine: BrainEngine, rows: WriteReques
     if (live.every(({ i }) => 'ok' in prepared[i]!)) {
       // #6278 lanes: a prefix publishes under the original group's order key, then drops its own begun mark.
       if (run.lane && liveRows.length < rows.length) await awaitLaneBegin(run.lane, rows);
-      const result = await publishGroup(engine, liveRows, live.map(({ i }) => (prepared[i] as { ok: PreparedMutation }).ok), run.hostId, run.hooks, run.lane ?? null);
+      const result = await bounded(() => publishGroup(engine, liveRows, live.map(({ i }) => (prepared[i] as { ok: PreparedMutation }).ok), run.hostId, run.hooks, run.lane ?? null));
       if (run.lane && liveRows.length < rows.length) run.lane.begun.delete(liveRows.at(-1)!.request_id);
       if (result.done) { for (const row of result.done) run.settled(row); return true; }
       requeued = new Set(result.requeued);
@@ -657,7 +695,7 @@ export async function executeClaimedGroup(engine: BrainEngine, rows: WriteReques
       const p = prepared[i]!;
       // #6278: a member aborted by our own cancellation (never a deadline here) is released, not failed.
       if ('released' in p) { await releaseUnpublishedClaim(engine, row, p.released === 'claim_lost' ? 'claim_lost' : 'group_member_waiting'); stop ??= independent ? null : 'release'; continue; }
-      const done = 'ok' in p ? await publishMutation(engine, row, p.ok, run.hostId) : await finishUnpublishedFailure(engine, current, p.error, 'preparation');
+      const done = 'ok' in p ? await bounded(() => publishMutation(engine, row, p.ok, run.hostId)) : await finishUnpublishedFailure(engine, current, p.error, 'preparation');
       run.settled(done);
       if (done.state === 'committed') { progressed = true; continue; }
       if (['conflict', 'failed', 'cancelled'].includes(done.state)) { progressed = true; if (!independent) stop = 'cancel'; } else stop = 'release';

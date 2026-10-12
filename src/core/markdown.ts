@@ -418,11 +418,7 @@ export function parseMarkdown(
   const tags = extractTags(frontmatter);
   const slug = coerceFrontmatterString(frontmatter.slug) || inferSlug(filePath);
 
-  const cleanFrontmatter = { ...frontmatter };
-  delete cleanFrontmatter.type;
-  delete cleanFrontmatter.title;
-  delete cleanFrontmatter.tags;
-  delete cleanFrontmatter.slug;
+  const cleanFrontmatter = comparableFrontmatter(frontmatter);
 
   const result: ParsedMarkdown = {
     frontmatter: cleanFrontmatter,
@@ -1212,6 +1208,21 @@ import { existsSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep as pathSep } from 'node:path';
 
 /** Options for serializePageToMarkdown. */
+/**
+ * #6454: the four top-level frontmatter keys the parser lifts into page
+ * columns (`type`, `title`, `tags`, `slug`) and drops from
+ * `ParsedMarkdown.frontmatter`. A file can never carry them into the stored
+ * frontmatter, so a stored copy of one of them (older imports kept them) is
+ * not drift: every file-versus-database comparison and every render strips
+ * them first, top-level only; nested user keys are left alone.
+ */
+export const RESERVED_FRONTMATTER_KEYS = ['type', 'title', 'tags', 'slug'] as const;
+export function comparableFrontmatter(frontmatter: Record<string, unknown> | null | undefined): Record<string, unknown> {
+  const clean: Record<string, unknown> = { ...(frontmatter ?? {}) };
+  for (const key of RESERVED_FRONTMATTER_KEYS) delete clean[key];
+  return clean;
+}
+
 export interface SerializePageOpts {
   /** Frontmatter fields merged on top of page.frontmatter at render time.
    *  Use this to stamp provenance (`ingested_via: 'webhook'`), identity
@@ -1240,8 +1251,12 @@ export function serializePageToMarkdown(
   tags: string[],
   opts: SerializePageOpts = {},
 ): string {
+  // #6454: the columns are the page's type, title and tags; a stored reserved key (older imports kept
+  // them) never overrides them in the rendered file. A stored `slug` still reaches the #5966 stamp rule, which
+  // replaces one that names another identity with the page's slug.
+  const stored = page.frontmatter ?? {};
   const frontmatter: Record<string, unknown> = {
-    ...((page.frontmatter ?? {}) as Record<string, unknown>),
+    ...slugStampedFrontmatter(page.slug, { ...comparableFrontmatter(stored), ...(stored.slug !== undefined ? { slug: stored.slug } : {}) }),
     ...(opts.frontmatterOverrides ?? {}),
   };
   return serializeMarkdown(
@@ -1254,6 +1269,22 @@ export function serializePageToMarkdown(
       tags,
     },
   );
+}
+
+/**
+ * #5966 (W14 P1.7): the one slug rule every render follows. A slug the file
+ * path cannot derive (a doubled hyphen, which `slugifyPath` collapses to one) is
+ * stamped as `slug:` so every path-derived reader (sync, reconcile, repair)
+ * finds the page again; a `frontmatter.slug` naming another identity is
+ * replaced by the page slug (the export rule, #3772). The stamp is
+ * digest-neutral: `parseMarkdown` drops `frontmatter.slug`, so canonical
+ * fields compare equal with or without it.
+ */
+export function slugStampedFrontmatter(slug: string | undefined, frontmatter: Record<string, unknown>): Record<string, unknown> {
+  if (typeof slug !== 'string' || slug === '') return frontmatter;
+  const declared = frontmatter.slug;
+  if (slugifyPath(slug + '.md') !== slug || (declared !== undefined && declared !== slug)) return { ...frontmatter, slug };
+  return frontmatter;
 }
 
 /**
@@ -1319,11 +1350,26 @@ function safeSlugDirSegments(rawSlug: string | null | undefined): string[] | nul
   return segments.slice(0, -1);
 }
 
+/**
+ * The segments of `localPath` below its nearest ancestor holding `.git` (`[]`
+ * when `localPath` is that Git root), or null when no ancestor holds one. A
+ * caller resolving many pages of one source computes it once and passes it to
+ * `resolveSourceLocalFilePath` as `gitScope`.
+ */
+export function sourceGitScope(localPath: string): string[] | null {
+  const absoluteLocalPath = resolve(localPath);
+  for (let cursor = absoluteLocalPath; ; cursor = dirname(cursor)) {
+    if (existsSync(join(cursor, '.git'))) return splitLocalPathSegments(relative(cursor, absoluteLocalPath));
+    if (dirname(cursor) === cursor) return null;
+  }
+}
+
 export function resolveSourceLocalFilePath(
   localPath: string,
   rawSourcePath: string | null | undefined,
   pageSlug?: string | null,
   slugRootMode?: 'git-root' | 'source-root',
+  gitScope?: string[] | null,
 ): string | null {
   if (!rawSourcePath) return null;
   const value = rawSourcePath.trim();
@@ -1335,21 +1381,14 @@ export function resolveSourceLocalFilePath(
   const absoluteLocalPath = resolve(localPath);
   let sourceScopeSegments: string[] = [];
   let resolvedSegments = sourceSegments;
-  let cursor = absoluteLocalPath;
-  while (true) {
-    if (existsSync(join(cursor, '.git'))) {
-      const scope = splitLocalPathSegments(relative(cursor, absoluteLocalPath));
-      sourceScopeSegments = scope;
-      const scoped = scope.length > 0 && scope.every((segment, index) => segment === sourceSegments[index]);
-      if (scoped && (slugRootMode !== 'source-root'
-        || !!pageSlug && resolveSlugForPath(sourceSegments.slice(scope.length).join('/')) === pageSlug)) {
-        resolvedSegments = sourceSegments.slice(scope.length);
-      }
-      break;
+  const scope = gitScope === undefined ? sourceGitScope(localPath) : gitScope;
+  if (scope) {
+    sourceScopeSegments = scope;
+    const scoped = scope.length > 0 && scope.every((segment, index) => segment === sourceSegments[index]);
+    if (scoped && (slugRootMode !== 'source-root'
+      || !!pageSlug && resolveSlugForPath(sourceSegments.slice(scope.length).join('/')) === pageSlug)) {
+      resolvedSegments = sourceSegments.slice(scope.length);
     }
-    const parent = dirname(cursor);
-    if (parent === cursor) break;
-    cursor = parent;
   }
   const directPath = join(absoluteLocalPath, ...resolvedSegments);
   if (existsSync(directPath)) return directPath;

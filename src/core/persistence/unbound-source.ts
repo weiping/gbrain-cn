@@ -3,8 +3,9 @@ import { opError, OperationError } from '../ops/contract.ts';
 import type { SqlEngine, WriteRequest } from './model.ts';
 
 /**
- * #5254: a Postgres page write to a filesystem source with no canonical owner.
- * Refused by default; `persistence.unbound_write=database_only` lets every
+ * #5254: a Postgres page write to a filesystem source with no canonical owner
+ * (#6449: also a PGLite write to a source activation listed database-only,
+ * where the automatic first-write claim is off). Refused by default; `persistence.unbound_write=database_only` lets every
  * page mutation (#5393) write a page with no recorded canonical file to the
  * database only. Those pages
  * carry `pages.database_only_reason='unbound_source'` so writes and sync after
@@ -18,6 +19,21 @@ export const UNBOUND_PUBLICATION_MESSAGE = 'The source was bound, or the page ga
 export const CONNECTOR_BOUND_HINT = 'Nothing was written. Read the page again and submit the write with a new request_id; the bound source publishes it to its canonical file.';
 export const CONNECTOR_BOUND_MESSAGE = 'The connector source gained a canonical owner after this database-only write was accepted.';
 export const UNBOUND_COLLISION_MESSAGE = 'A database-only page written while its source was unbound already uses this slug.';
+
+/**
+ * #6449: the rooted sources `writer activate` accepted without an owner because
+ * `sync.write_through` was off (activation.ts writes the list, deactivation
+ * clears it). A PGLite page write to one of them never runs the automatic
+ * first-write claim, so turning `sync.write_through` back on refuses with the
+ * claim named instead of starting to publish files into an unreviewed checkout.
+ */
+export const DATABASE_ONLY_SOURCES_KEY = 'persistence.database_only_sources';
+export async function readDatabaseOnlyActivatedSources(engine: Pick<BrainEngine, 'getConfig'>): Promise<string[]> {
+  try {
+    const parsed: unknown = JSON.parse(await engine.getConfig(DATABASE_ONLY_SOURCES_KEY) ?? '[]');
+    return Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === 'string') : [];
+  } catch { return []; }
+}
 
 export function parseUnboundWriteValue(value: string): UnboundWritePolicy {
   if ((UNBOUND_WRITE_VALUES as readonly string[]).includes(value)) return value as UnboundWritePolicy;
@@ -44,7 +60,10 @@ export function unboundSourceError(sourceId: string, path: string | null, scope:
     + '(if an operator has locked writer administration, ask the operator to unlock it first)';
   // #6122: on a brain whose managed persistence is not activated, a claim alone fences classic sync of the source,
   // so the working path is the file plus classic sync; claiming is named with that consequence.
-  const edit = `edit the page's file in the checkout${path ? ` (${path})` : ''} and run gbrain sync --source ${sourceId}, which imports it`;
+  // Classic sync imports commits, not the working tree, so the hint names the commit; a remote caller cannot reach the checkout.
+  const edit = path
+    ? `write the page as ${path}/<slug>.md (check generated frontmatter with gbrain frontmatter validate --stdin --path <slug>.md), commit it in that checkout, then run gbrain sync --source ${sourceId}`
+    : `ask the user to write the page as <slug>.md in the source's checkout on the brain host, commit it, and run gbrain sync --source ${sourceId}`;
   const trap = `For a gbrain-owned checkout instead (a brain-wide change: ask the user first), ${bind}, then activate managed persistence (preview first: gbrain sources writer activate --confirm-quiesced --dry-run --json). `
     + `Managed persistence is not activated on this brain, so a claim without activation blocks classic sync of ${sourceId} until it is activated or the claim is released with gbrain sources writer deactivate.`;
   const suggestion = classic ? scope === 'database_only_eligible'
@@ -59,6 +78,23 @@ export function unboundSourceError(sourceId: string, path: string | null, scope:
       + `${UNBOUND_WRITE_KEY}=database_only does not apply: this page came from a canonical file, and a database-only edit would be lost on the owner's next sync.`;
   const error = new OperationError('owner_unavailable', 'This source has no designated canonical owner.', suggestion, UNBOUND_SOURCE_DOCS);
   error.detail = 'unbound_source';
+  // A configuration state, not a transient one: a retry gets the same refusal, and every way out is the user's choice.
+  error.retryable = false;
+  error.fix = {
+    ask_user: true,
+    consent: [],
+    actor: path ? 'agent' : 'user',
+    why: classic
+      ? `The brain is in classic mode: the checkout of '${sourceId}' is the source of truth and gbrain only reads it, so a page is saved as a committed file followed by gbrain sync. Don't retry, claim the source or activate managed mode to get one write through.`
+      : `Source '${sourceId}' has no canonical owner; binding it or allowing database-only pages is a brain-wide decision for the user.`,
+    user_message: classic
+      ? path
+        ? `Your brain is in classic mode, so pages are saved as files in the checkout. I can write it as <slug>.md in ${path}, commit it and run gbrain sync --source ${sourceId}. Or I can explain the two other options: database-only pages, or managed mode.`
+        : `Your brain is in classic mode, so I can't save pages directly. Save it as <slug>.md in the ${sourceId} folder, commit it, and run gbrain sync --source ${sourceId}. Or I can explain the two other options: database-only pages, or managed mode.`
+      : `Source '${sourceId}' has no canonical owner, so I can't save this page. You can bind the source on the brain host, or allow database-only pages${scope === 'file_backed' ? ' (not for this page, which came from a file)' : ''}; I can explain what each changes.`,
+    docs: UNBOUND_SOURCE_DOCS,
+    requires_exclusive: false,
+  };
   return error;
 }
 

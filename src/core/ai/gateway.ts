@@ -21,7 +21,8 @@
  *     rotation (via configureGateway()) invalidates stale entries.
  */
 
-import { embed as aiEmbed, embedMany, generateObject, generateText, jsonSchema, type JSONSchema7, type Output } from 'ai';
+import type { embedMany, generateObject, generateText, JSONSchema7, Output } from 'ai';
+import { jsonSchema } from '@ai-sdk/provider-utils';
 import { installAiSdkWarningWriter } from './sdk-warnings.ts';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomUUID } from 'node:crypto';
@@ -36,6 +37,7 @@ import { DEFAULT_CHARS_PER_TOKEN, DEFAULT_SAFETY_FACTOR, embedRequestMaxInputTok
 export { splitByTokenBudget, capBatchItems, NO_BATCH_CAP_SUB_BATCH_ITEMS } from './embed-batch-plan.ts';
 import { BudgetTracker, type BudgetReservation } from '../budget/budget-tracker.ts';
 import { failedCallUsage, recordOnTracker } from './budget-record.ts';
+import { estimateChatInputTokens } from './chat-input-estimate.ts';
 import { chatWithFallback, normalizeChatFallbackChain } from './chat-fallback.ts';
 import { applyThinkingOff, thinkingOffMaxOutputTokens } from './thinking-off.ts';
 import type {
@@ -61,7 +63,8 @@ import type { BrainEngine } from '../engine.ts';
 import { dimsProviderOptions } from './dims.ts';
 import { hasAnthropicKey, stashGatewayAnthropicKeyFromEnv } from './anthropic-key.ts';
 import { AIConfigError, AITransientError, isStructuredOutputRejection, isUnbilledEmbeddingRejection, normalizeAIError } from './errors.ts';
-import { isEmbeddingZeroNormError, screenAlignedEmbeddings, screenEmbeddings, sendableEmbeddingInputs } from './embedding-guard.ts';
+import { embeddingModelNotFoundHint, gatewayModelNotFoundHint } from './model-not-found-hint.ts';
+import { fitMatryoshkaPrefix, isEmbeddingZeroNormError, screenAlignedEmbeddings, screenEmbeddings, sendableEmbeddingInputs } from './embedding-guard.ts';
 import { getProviderCapabilities } from './capabilities.ts';
 import { runGuardrails, hasGuardrails, type GuardrailHook } from '../guardrails.ts';
 import { loadConfig } from '../config.ts';
@@ -73,6 +76,7 @@ import { reportEmbeddingAuthFailure } from './key-warnings.ts';
 import { buildGatewayConfig, foldNativeBaseUrlsFromFilePlane } from './build-gateway-config.ts';
 import { invokeAI, sdkInvocationUsage, responseInvocationUsage, hasAIInvocationGuard, isAIInvocationPolicyError } from './invocation-guard.ts';
 import { installAICallLogFromEnv } from './call-log.ts';
+import { cachedQueryEmbedding, clearQueryEmbedCache, queryEmbedCacheKey, queryEmbedGeneration, storeQueryEmbedding } from './query-embed-cache.ts';
 import { createGuardedGeneration, chatInvocation } from './guarded-generation.ts';
 installAiSdkWarningWriter();
 const guardedGeneration = createGuardedGeneration(() => DEFAULT_MAX_OUTPUT_TOKENS);
@@ -163,19 +167,27 @@ export function configureGatewayIfUninitialized(): void {
 
 /**
  * The function the gateway calls to actually run a batch through the AI SDK.
- * Defaults to the imported `embedMany`. Tests inject a stub via
+ * Defaults to the AI SDK's `embedMany`, loaded on the first call. Tests inject a stub via
  * `__setEmbedTransportForTests` to drive recursion + fast-path scenarios
  * without hitting a real provider. Production never reads the override.
  */
 type EmbedManyFn = typeof embedMany;
-let _embedTransport: EmbedManyFn = embedMany;
 type GenerateTextFn = typeof generateText;
-let _generateTextTransport: GenerateTextFn = generateText;
+type GenerateObjectFn = typeof generateObject;
+// The AI SDK (and the OpenTelemetry API it pulls in) loads at the first
+// provider call, not when the gateway is configured, so a command that never
+// calls a model never pays for its module graph.
+let aiSdk: Promise<typeof import('ai')> | undefined;
+const loadAiSdk = () => (aiSdk ??= import('ai'));
+const sdkEmbedMany = (async (opts: Parameters<EmbedManyFn>[0]) => (await loadAiSdk()).embedMany(opts)) as EmbedManyFn;
+const sdkGenerateText = (async (opts: Parameters<GenerateTextFn>[0]) => (await loadAiSdk()).generateText(opts)) as GenerateTextFn;
+const sdkGenerateObject = (async (opts: Parameters<GenerateObjectFn>[0]) => (await loadAiSdk()).generateObject(opts as never)) as GenerateObjectFn;
+let _embedTransport: EmbedManyFn = sdkEmbedMany;
+let _generateTextTransport: GenerateTextFn = sdkGenerateText;
 // Test-only seam for expand()'s structured-output SDK call. Mirrors
 // _generateTextTransport (see __setGenerateObjectTransportForTests). Never
 // swapped in production — expand() always calls the real generateObject.
-type GenerateObjectFn = typeof generateObject;
-let _generateObjectTransport: GenerateObjectFn = generateObject;
+let _generateObjectTransport: GenerateObjectFn = sdkGenerateObject;
 // Adversarial F5 (#4121): recipes that DECLARE structured-output support but
 // reject json_schema at call time would otherwise pay the rejected attempt —
 // and a pessimistic '.failed' budget record — on EVERY expand() call
@@ -403,20 +415,26 @@ export function applyOpenAICompatConfig(
  *
  * Returns undefined when the env provides no base URL, so the SDK's own default
  * (which already includes `/v1`) is preserved untouched — the happy path is not
- * altered. Google is intentionally NOT handled here: its native suffix is
- * unproven (Gemini's OpenAI-compat route is `/v1beta/openai`), so it's deferred
- * to a follow-up rather than risk a regression on a wrong assumption.
+ * altered.
+ *
+ * Google (`GOOGLE_GENERATIVE_AI_BASE_URL`, used by native-google chat,
+ * expansion and embedding): the SDK's default root is
+ * `https://generativelanguage.googleapis.com/v1beta` and it appends
+ * `/models/<id>:<method>`, so a URL with no version segment gets `/v1beta`
+ * (a pass-through proxy then forwards the real path); a URL that already
+ * names a version (`/v1`, `/v1beta`, `/v1alpha`) is kept as written.
  *
  * @internal exported for tests.
  */
 export function resolveNativeBaseUrl(
-  provider: 'anthropic' | 'openai',
+  provider: 'anthropic' | 'openai' | 'google',
   cfg: AIGatewayConfig,
 ): string | undefined {
-  const envKey = provider === 'anthropic' ? 'ANTHROPIC_BASE_URL' : 'OPENAI_BASE_URL';
+  const envKey = provider === 'anthropic' ? 'ANTHROPIC_BASE_URL' : provider === 'openai' ? 'OPENAI_BASE_URL' : 'GOOGLE_GENERATIVE_AI_BASE_URL';
   const raw = cfg.env[envKey];
   if (!raw || !raw.trim()) return undefined;
   const trimmed = raw.trim().replace(/\/+$/, '');
+  if (provider === 'google') return /\/v\d+[a-z]*$/i.test(trimmed) ? trimmed : `${trimmed}/v1beta`;
   return /\/v1$/.test(trimmed) ? trimmed : `${trimmed}/v1`;
 }
 
@@ -462,6 +480,7 @@ export function configureGateway(config: AIGatewayConfig): void {
   };
   stashGatewayAnthropicKeyFromEnv(config.env); // #2119: filter + rationale in anthropic-key.ts
   _modelCache.clear();
+  clearQueryEmbedCache();
   _shrinkState.clear();
   // A (re)configure is a new env snapshot: a key that appeared or vanished
   // since the last no_key audit row deserves a fresh once-per-process row.
@@ -493,6 +512,7 @@ export function refreshGatewayEnvFromFilePlane(): void {
   // DB-plane base_urls never steer native keys.
   _config = { ..._config, env: foldNativeBaseUrlsFromFilePlane(cfg, mergedProviderEnv(cfg, process.env)) };
   _modelCache.clear();
+  clearQueryEmbedCache();
 }
 
 /**
@@ -593,6 +613,7 @@ export async function reconfigureGatewayWithEngine(engine: BrainEngine): Promise
   setGatewayModelSource('expansion', expansionFull, gatewayModelSource('expansion', expansionDetailed, expansionEffective));
   setGatewayModelSource('chat', chatFull, gatewayModelSource('chat', chatDetailed, chatEffective));
   _modelCache.clear();
+  clearQueryEmbedCache();
   _shrinkState.clear();
   return _config;
 }
@@ -675,10 +696,11 @@ function clearGatewayState(): void {
   clearGatewayModelSources();
   stashGatewayAnthropicKeyFromEnv(undefined); // gateway-owned snapshot dies with the config
   _modelCache.clear();
+  clearQueryEmbedCache();
   _shrinkState.clear();
-  _embedTransport = embedMany;
-  _generateTextTransport = generateText;
-  _generateObjectTransport = generateObject;
+  _embedTransport = sdkEmbedMany;
+  _generateTextTransport = sdkGenerateText;
+  _generateObjectTransport = sdkGenerateObject;
   _structuredOutputRejectedRecipes.clear();
   _embedTransportInstalled = false;
   _chatTransport = null;
@@ -731,9 +753,13 @@ export function __unconfigureGatewayForTests(): void {
  * @internal exported for tests; not part of the public gateway API.
  */
 export function __setEmbedTransportForTests(fn: EmbedManyFn | null): void {
-  _embedTransport = fn ?? embedMany;
+  _embedTransport = fn ?? sdkEmbedMany;
   _embedTransportInstalled = fn !== null;
+  clearQueryEmbedCache();
 }
+
+/** @internal exported for tests: drop every cached query embedding. */
+export const __clearQueryEmbedCacheForTests = clearQueryEmbedCache;
 
 /**
  * Test-only seam for the chat() SDK call. Unlike __setChatTransportForTests,
@@ -743,7 +769,7 @@ export function __setEmbedTransportForTests(fn: EmbedManyFn | null): void {
  * @internal exported for tests; not part of the public gateway API.
  */
 export function __setGenerateTextTransportForTests(fn: GenerateTextFn | null): void {
-  _generateTextTransport = fn ?? generateText;
+  _generateTextTransport = fn ?? sdkGenerateText;
 }
 
 /**
@@ -754,7 +780,7 @@ export function __setGenerateTextTransportForTests(fn: GenerateTextFn | null): v
  * @internal exported for tests; not part of the public gateway API.
  */
 export function __setGenerateObjectTransportForTests(fn: GenerateObjectFn | null): void {
-  _generateObjectTransport = fn ?? generateObject;
+  _generateObjectTransport = fn ?? sdkGenerateObject;
 }
 
 /**
@@ -1417,7 +1443,8 @@ function instantiateEmbedding(recipe: Recipe, modelId: string, cfg: AIGatewayCon
         `Google embedding requires GOOGLE_GENERATIVE_AI_API_KEY.`,
         recipe.setup_hint,
       );
-      const client = createGoogleGenerativeAI({ apiKey });
+      const baseURL = resolveNativeBaseUrl('google', cfg);
+      const client = createGoogleGenerativeAI({ apiKey, ...(baseURL ? { baseURL } : {}) });
       return (client as any).textEmbeddingModel
         ? (client as any).textEmbeddingModel(modelId)
         : (client as any).embedding(modelId);
@@ -1747,17 +1774,17 @@ async function embedSubBatch(
       );
     }
 
-    for (const embedding of result.embeddings) {
+    const embeddings: number[][] = result.embeddings.map((e: number[]) => fitMatryoshkaPrefix(recipe, modelId, e, expectedDims)); // PR #5921
+    for (const embedding of embeddings) {
       if (Array.isArray(embedding) && embedding.length !== expectedDims) {
-        throw embeddingDimMismatchError(modelId, embedding.length, expectedDims, `gbrain migrate --embedding-model ${getEmbeddingModel()} --embedding-dimensions ${embedding.length}`,
-          { provider: recipe.id, baseUrl: _config?.base_urls?.[recipe.id], defaultBaseUrl: recipe.base_url_default });
+        throw embeddingDimMismatchError(modelId, embedding.length, expectedDims, `gbrain migrate --embedding-model ${getEmbeddingModel()} --embedding-dimensions ${embedding.length}`, { provider: recipe.id, baseUrl: _config?.base_urls?.[recipe.id], defaultBaseUrl: recipe.base_url_default });
       }
     }
 
     recordSubBatchSuccess(recipe);
     const usageTokens = (result as { usage?: { tokens?: unknown } }).usage?.tokens;
     return {
-      embeddings: result.embeddings.map((e: number[]) => new Float32Array(e)),
+      embeddings: embeddings.map((e: number[]) => new Float32Array(e)),
       reportedTokens: typeof usageTokens === 'number' && Number.isFinite(usageTokens) && usageTokens > 0
         ? usageTokens
         : null,
@@ -1780,7 +1807,7 @@ async function embedSubBatch(
       };
     }
     reportEmbeddingAuthFailure(recipe, err);
-    throw normalizeAIError(err, `embed(${recipe.id}:${modelId})`, redactKeys);
+    throw normalizeAIError(err, `embed(${recipe.id}:${modelId})`, redactKeys, embeddingModelNotFoundHint());
   }
 }
 
@@ -1797,7 +1824,15 @@ export async function embedQuery(
   // #5691: instruction-style models (Qwen3-Embedding, e5, BGE, nomic) take a
   // query instruction. The caller resolves it per brain (search/query-prefix.ts);
   // documents are never prefixed.
-  const [v] = await embed([(opts?.queryPrefix ?? '') + text], {
+  const input = (opts?.queryPrefix ?? '') + text;
+  const cfg = requireConfig();
+  const { recipe, modelId } = await resolveEmbeddingProvider(opts?.embeddingModel ?? getEmbeddingModel());
+  const dims = opts?.dimensions ?? cfg.embedding_dimensions ?? DEFAULT_EMBEDDING_DIMENSIONS;
+  const key = queryEmbedCacheKey(recipe.id, modelId, cfg.base_urls?.[recipe.id] ?? '', dims, input);
+  const cached = hasAIInvocationGuard() ? undefined : cachedQueryEmbedding(key);
+  if (cached) return cached;
+  const generation = queryEmbedGeneration();
+  const [v] = await embed([input], {
     inputType: 'query',
     embeddingModel: opts?.embeddingModel,
     dimensions: opts?.dimensions,
@@ -1806,6 +1841,7 @@ export async function embedQuery(
     // default via withDefaultTimeout (shorter wins).
     abortSignal: opts?.abortSignal,
   });
+  if (v) storeQueryEmbedding(key, v, generation);
   return v;
 }
 
@@ -1835,6 +1871,37 @@ export async function embedMultimodal(
   opts: EmbedMultimodalOpts = {},
 ): Promise<Float32Array[]> {
   if (!inputs || inputs.length === 0) return [];
+  // Fix wave 13 P1.18: reserve on the ambient tracker before any provider call,
+  // as embed() does. An image is reserved at the provider's per-input maximum
+  // (MULTIMODAL_IMAGE_TOKEN_CEILING) and settled at the provider's reported
+  // tokens when it reports them, so a cap is never crossed by an estimate.
+  const tracker = __budgetStore.getStore() ?? null;
+  if (!tracker) return embedMultimodalUnmetered(inputs, opts);
+  const modelStr = requireConfig().embedding_multimodal_model ?? getEmbeddingModel();
+  const { parsed, recipe } = resolveRecipe(modelStr);
+  const mmModelId = `${recipe.id}:${parsed.modelId}`;
+  const charsPerToken = Math.max(recipe.touchpoints.embedding?.chars_per_token ?? DEFAULT_CHARS_PER_TOKEN, 1);
+  const estimatedInputTokens = inputs.reduce((n, input) => n + (input.kind === 'text' ? Math.ceil(input.text.length / charsPerToken) : MULTIMODAL_IMAGE_TOKEN_CEILING), 0);
+  const reservation = tracker.reserve({ modelId: mmModelId, estimatedInputTokens, maxOutputTokens: 0, kind: 'embed', label: 'gateway.multimodal' });
+  const usage: { tokens: number | null } = { tokens: 0 };
+  try {
+    const out = await embedMultimodalUnmetered(inputs, opts, usage);
+    recordOnTracker(tracker, { modelId: mmModelId, reservation, requestedModelId: modelStr, kind: 'embed', label: 'gateway.multimodal',
+      inputTokens: usage.tokens || estimatedInputTokens, outputTokens: 0, estimated: !usage.tokens });
+    return out;
+  } catch (err) {
+    if (err instanceof AIConfigError) tracker.release(reservation);
+    else recordOnTracker(tracker, { modelId: mmModelId, reservation, requestedModelId: modelStr, kind: 'embed', label: 'gateway.multimodal.failed',
+      inputTokens: estimatedInputTokens, outputTokens: 0, failed: true, estimated: true });
+    throw err;
+  }
+}
+
+async function embedMultimodalUnmetered(
+  inputs: MultimodalInput[],
+  opts: EmbedMultimodalOpts,
+  usage: { tokens: number | null } = { tokens: null },
+): Promise<Float32Array[]> {
 
   const cfg = requireConfig();
   // Prefer embedding_multimodal_model when set, so brains using OpenAI for
@@ -1868,6 +1935,7 @@ export async function embedMultimodal(
   // recipe is `openai-compat` per tier but uses its own /multimodalembeddings
   // path, so we still branch on recipe.id for that one.
   if (recipe.id !== 'voyage' && recipe.implementation === 'openai-compatible') {
+    usage.tokens = null;
     return embedMultimodalOpenAICompat(inputs, recipe, parsed.modelId, cfg, opts);
   }
   if (recipe.id !== 'voyage') {
@@ -1960,9 +2028,9 @@ export async function embedMultimodal(
       );
     }
 
-    let parsedBody: { data?: Array<{ embedding: number[] }> };
+    let parsedBody: { data?: Array<{ embedding: number[] }>; usage?: { total_tokens?: unknown } };
     try {
-      parsedBody = (await res.json()) as { data?: Array<{ embedding: number[] }> };
+      parsedBody = (await res.json()) as { data?: Array<{ embedding: number[] }>; usage?: { total_tokens?: unknown } };
     } catch (err) {
       throw new AITransientError(
         `Voyage multimodal returned malformed JSON: ${err instanceof Error ? err.message : String(err)}.`,
@@ -1984,6 +2052,8 @@ export async function embedMultimodal(
       }
       allEmbeddings.push(new Float32Array(row.embedding));
     }
+    const reported = parsedBody.usage?.total_tokens;
+    usage.tokens = usage.tokens !== null && typeof reported === 'number' && reported > 0 ? usage.tokens + reported : null;
   }
 
   return screenAlignedEmbeddings(allEmbeddings, `${recipe.id}:${parsed.modelId}`);
@@ -2297,7 +2367,8 @@ function instantiateExpansion(recipe: Recipe, modelId: string, cfg: AIGatewayCon
     case 'native-google': {
       const apiKey = cfg.env.GOOGLE_GENERATIVE_AI_API_KEY;
       if (!apiKey) throw new AIConfigError(`Google expansion requires GOOGLE_GENERATIVE_AI_API_KEY.`, recipe.setup_hint);
-      return createGoogleGenerativeAI({ apiKey }).languageModel(modelId);
+      const baseURL = resolveNativeBaseUrl('google', cfg);
+      return createGoogleGenerativeAI({ apiKey, ...(baseURL ? { baseURL } : {}) }).languageModel(modelId);
     }
     case 'native-anthropic': {
       const apiKey = cfg.env.ANTHROPIC_API_KEY;
@@ -2353,6 +2424,14 @@ export function parseExpansionResponse(text: string): string[] | null {
 // by the image token cost, NOT its base64 length (bytes are not tokens).
 const EXPANSION_FAILED_PESSIMISTIC_OUTPUT_TOKENS = 512;
 const OCR_IMAGE_INPUT_TOKEN_ESTIMATE = 1600;
+/** Fix wave 13 P1.18: OCR's explicit output bound, the same number its tracker reservation holds. */
+const OCR_MAX_OUTPUT_TOKENS = 4096;
+/**
+ * Fix wave 13 P1.18: the tokens one image input can cost a multimodal embedding
+ * provider at most, reserved before the call (Voyage: 16M pixels at 560 pixels
+ * per token). The provider's reported usage settles it when present.
+ */
+const MULTIMODAL_IMAGE_TOKEN_CEILING = Math.ceil(16_000_000 / 560);
 
 /**
  * #4121 — the v6/legacy AI-SDK usage shapes (`inputTokens|promptTokens`,
@@ -2562,7 +2641,7 @@ export async function expand(query: string): Promise<string[]> {
   } catch (err) {
     if (isAIInvocationPolicyError(err)) throw err;
     // Expansion is best-effort: on failure, fall back to the original query alone.
-    const normalized = normalizeAIError(err, 'expand', redactKeys);
+    const normalized = normalizeAIError(err, `expand(${_config?.expansion_model ?? ''})`, redactKeys, gatewayModelNotFoundHint('expansion', _config?.expansion_model ?? ''));
     if (normalized instanceof AIConfigError) {
       console.warn(`[ai.gateway] expansion disabled: ${normalized.message}`);
     }
@@ -2613,12 +2692,15 @@ export async function generateOcrText(imageBytes: Buffer, mime: string): Promise
   const estimatedOcrInputTokens =
     estimateChatInputTokens({ system: systemPrompt, messages: [{ content: 'Extract visible text only.' }] }) +
     OCR_IMAGE_INPUT_TOKEN_ESTIMATE;
+  // Fix wave 13 P1.18: reserve before the call with the explicit output bound the call is sent with.
+  const reservation = tracker?.reserve({ modelId: ocrModelId, estimatedInputTokens: estimatedOcrInputTokens, maxOutputTokens: OCR_MAX_OUTPUT_TOKENS, kind: 'chat', label: 'gateway.ocr' });
   const recordOcr = (label: 'gateway.ocr' | 'gateway.ocr.failed', usage: { inputTokens: number; outputTokens: number }): void =>
-    recordOnTracker(tracker, { modelId: ocrModelId, requestedModelId: ocrModel, label, ...usage });
+    recordOnTracker(tracker, { modelId: ocrModelId, requestedModelId: ocrModel, label, reservation, ...usage });
   let result: Awaited<ReturnType<GenerateTextFn>>;
   try {
     result = await guardedGeneration(ocrModelId, _generateTextTransport, {
       model,
+      maxOutputTokens: OCR_MAX_OUTPUT_TOKENS,
       // v0.42.20.0 (codex) — OCR is a 5th unbounded generateText entry point.
       abortSignal: withDefaultTimeout(undefined, AI_CHAT_TIMEOUT_MS),
       messages: [
@@ -2642,7 +2724,7 @@ export async function generateOcrText(imageBytes: Buffer, mime: string): Promise
     if (isAIInvocationPolicyError(err)) throw err;
     recordOcr('gateway.ocr.failed', failedCallUsage(err, {
       inputTokens: estimatedOcrInputTokens,
-      outputTokens: DEFAULT_MAX_OUTPUT_TOKENS,
+      outputTokens: OCR_MAX_OUTPUT_TOKENS,
     }));
     // Throw-to-caller contract unchanged: importImageFile routes this to
     // ocr_failed_other. A cap breach surfaces there as a real import failure.
@@ -2677,23 +2759,6 @@ export function getCurrentBudgetTracker(): BudgetTracker | null {
   return __budgetStore.getStore() ?? null;
 }
 
-/** Internal helper: estimate input tokens from messages + system. Heuristic only
- * (~4 chars/token); cap math is best-effort because we pre-flight reservation
- * before the SDK has counted anything. */
-function estimateChatInputTokens(opts: { system?: string; messages?: Array<{ content?: unknown }> }): number {
-  let chars = (opts.system ?? '').length;
-  for (const m of opts.messages ?? []) {
-    if (typeof m.content === 'string') chars += m.content.length;
-    else if (Array.isArray(m.content)) {
-      for (const block of m.content) {
-        const t = (block as { text?: unknown }).text;
-        if (typeof t === 'string') chars += t.length;
-      }
-    }
-  }
-  return Math.ceil(chars / 4);
-}
-
 // ---- Chat (commit 1) ----
 
 /**
@@ -2723,7 +2788,10 @@ export type ChatRole = 'system' | 'user' | 'assistant' | 'tool';
  * on turn 2 without this: `chat()` previously never captured the part at all.
  */
 export type ChatBlock =
-  | { type: 'text'; text: string; providerMetadata?: Record<string, unknown> }
+  // `cache: true` (PR #6341): an explicit prompt-cache breakpoint after this block, so a
+  // single-turn caller's stable USER prefix (page-summary's title + document) caches. Honoured
+  // only when the call derives a cache-control value; other routes see a plain text block.
+  | { type: 'text'; text: string; cache?: true; providerMetadata?: Record<string, unknown> }
   | { type: 'reasoning'; text: string; providerMetadata?: Record<string, unknown> }
   | { type: 'tool-call'; toolCallId: string; toolName: string; input: unknown; providerMetadata?: Record<string, unknown> }
   | { type: 'tool-result'; toolCallId: string; toolName: string; output: unknown; isError?: boolean; providerMetadata?: Record<string, unknown> };
@@ -2856,7 +2924,10 @@ function ensureToolCallId(id: unknown, toolName: string): string {
   return `glmfix-${toolName}-${randomUUID()}`;
 }
 
-export function toModelMessages(messages: ChatMessage[]): unknown[] {
+export function toModelMessages(
+  messages: ChatMessage[],
+  cacheControl?: { type: 'ephemeral'; ttl?: '5m' | '1h' },
+): unknown[] {
   return messages.map((m) => {
     if (typeof m.content === 'string') return { role: m.role, content: m.content };
     const blocks = m.content;
@@ -2893,10 +2964,13 @@ export function toModelMessages(messages: ChatMessage[]): unknown[] {
           // Gemini 3.x thoughtSignature, OpenAI reasoning-item id) — attached
           // only when captured.
           if (b.type === 'text') {
+            const providerOptions = b.cache && cacheControl
+              ? { ...b.providerMetadata, anthropic: { ...(b.providerMetadata?.anthropic as Record<string, unknown> | undefined), cacheControl } }
+              : b.providerMetadata;
             return {
               type: 'text' as const,
               text: b.text,
-              ...(b.providerMetadata ? { providerOptions: b.providerMetadata } : {}),
+              ...(providerOptions ? { providerOptions } : {}),
             };
           }
           if (b.type === 'reasoning') {
@@ -3215,7 +3289,8 @@ function instantiateChat(recipe: Recipe, modelId: string, cfg: AIGatewayConfig):
     case 'native-google': {
       const apiKey = cfg.env.GOOGLE_GENERATIVE_AI_API_KEY;
       if (!apiKey) throw new AIConfigError(`Google chat requires GOOGLE_GENERATIVE_AI_API_KEY.`, recipe.setup_hint);
-      return createGoogleGenerativeAI({ apiKey }).languageModel(modelId);
+      const baseURL = resolveNativeBaseUrl('google', cfg);
+      return createGoogleGenerativeAI({ apiKey, ...(baseURL ? { baseURL } : {}) }).languageModel(modelId);
     }
     case 'native-anthropic': {
       const apiKey = cfg.env.ANTHROPIC_API_KEY;
@@ -3674,7 +3749,7 @@ async function chatAdmitted(opts: ChatOpts, admitted: {
   const generate = (out: typeof output) => guardedGeneration(modelStr, _generateTextTransport, {
     model,
     system: systemParam,
-    messages: toModelMessages(repairToolPairing(opts.messages)) as any,
+    messages: toModelMessages(repairToolPairing(opts.messages), cacheControlValue) as any,
     tools: opts.tools && opts.tools.length > 0 ? tools : undefined,
     maxOutputTokens,
     ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
@@ -3784,7 +3859,7 @@ async function chatAdmitted(opts: ChatOpts, admitted: {
     };
   } catch (err) {
     if (isAIInvocationPolicyError(err)) throw err;
-    const normalized = normalizeAIError(err, `chat(${recipe.id}:${modelId})`, redactKeys);
+    const normalized = normalizeAIError(err, `chat(${recipe.id}:${modelId})`, redactKeys, gatewayModelNotFoundHint('chat', modelStr));
     // Fallback chain: a transient/infrastructure error (AITransientError —
     // timeout, connection, 5xx, 429) advances to the next candidate.
     // AIConfigError (4xx, bad model id, bad key) throws at once: the same
@@ -3932,7 +4007,7 @@ export type TurnPermit =
   | (() => Promise<void> | void)
   | { release: () => Promise<void> | void; signal?: AbortSignal };
 
-export type ToolLoopStopReason = 'end' | 'length' | 'max_turns' | 'refusal' | 'content_filter' | 'aborted' | 'unrecoverable';
+export type ToolLoopStopReason = 'end' | 'length' | 'max_turns' | 'refusal' | 'content_filter' | 'aborted' | 'unrecoverable' | 'empty_response';
 
 export interface ToolLoopResult {
   finalText: string;
@@ -4066,8 +4141,9 @@ export async function toolLoop(opts: ToolLoopOpts): Promise<ToolLoopResult> {
       // #4088: an output-cap hit is NOT a clean finish. Folding 'length' into
       // 'end' made truncated zero-tool-call runs indistinguishable from the
       // model choosing to stop — the exact honesty bug #2778 fixed on the
-      // direct Anthropic path.
-      stopReason = chatResult.stopReason === 'length' ? 'length' : 'end';
+      // direct Anthropic path. #6448: a clean stop with no text (refusal
+      // body, thinking-only turn) is 'empty_response', not 'end'.
+      stopReason = chatResult.stopReason === 'length' ? 'length' : chatResult.text.trim() === '' ? 'empty_response' : 'end';
       finalText = chatResult.text;
       break;
     }
@@ -4370,7 +4446,8 @@ export async function rerank(input: RerankInput): Promise<RerankResult[]> {
   // Timeout via AbortController; merges with caller-supplied signal.
   const ctrl = new AbortController();
   const timeoutMs = input.timeoutMs ?? DEFAULT_RERANK_TIMEOUT_MS;
-  const t = setTimeout(() => ctrl.abort(new Error('rerank timed out')), timeoutMs);
+  let timedOut = false;
+  const t = setTimeout(() => { timedOut = true; ctrl.abort(new Error('rerank timed out')); }, timeoutMs);
   if (input.signal) {
     if (input.signal.aborted) ctrl.abort(input.signal.reason);
     else input.signal.addEventListener('abort', () => ctrl.abort(input.signal!.reason), { once: true });
@@ -4419,7 +4496,7 @@ export async function rerank(input: RerankInput): Promise<RerankResult[]> {
           : 'unknown';
       throw new RerankError(msg, reason, resp.status);
     }
-    const json: any = await resp.json();
+    const json: any = await resp.json().catch((err: unknown) => { throw timedOut ? err : new RerankError('rerank: malformed response (body is not JSON)', 'unknown'); });
     // v0.46.3: two response dialects share the item shape {index,
       // `results[]`, Voyage's REST returns `data[]` ({object: "list", data:
     // [...]}, live-wire verified 2026-08-15; Voyage's Python SDK renames it
@@ -4442,14 +4519,12 @@ export async function rerank(input: RerankInput): Promise<RerankResult[]> {
     if (isAIInvocationPolicyError(err)) throw err;
     _rerankRecord(true);
     if (err instanceof RerankError) throw err;
-    // AbortError on timeout — classify cleanly.
-    if (err && typeof err === 'object' && (err as any).name === 'AbortError') {
-      const msg = (err as Error).message || 'rerank aborted';
-      throw new RerankError(msg, msg.toLowerCase().includes('timed out') ? 'timeout' : 'unknown');
-    }
-    // Network errors (DNS, connection refused, etc.) become network class.
+    // fetch rejects with the abort reason itself (a plain Error, not an AbortError), so the flag is the tell.
+    if (timedOut) throw new RerankError(`rerank timed out after ${timeoutMs}ms`, 'timeout');
+    if (err && typeof err === 'object' && (err as any).name === 'AbortError') throw new RerankError((err as Error).message || 'rerank aborted', 'unknown');
+    // No HTTP response at all (connection refused, DNS, reset) is `unreachable`; a provider 5xx is `network`.
     const msg = err instanceof Error ? err.message : String(err);
-    throw new RerankError(`rerank: ${msg}`, 'network');
+    throw new RerankError(`rerank: ${msg}`, 'unreachable');
   } finally {
     clearTimeout(t);
     tracker?.release(reservation);
