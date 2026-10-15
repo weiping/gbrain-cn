@@ -130,6 +130,8 @@ CREATE INDEX IF NOT EXISTS idx_pages_type ON pages(type);
 CREATE INDEX IF NOT EXISTS idx_pages_frontmatter ON pages USING GIN(frontmatter);
 CREATE INDEX IF NOT EXISTS idx_pages_trgm ON pages USING GIN(title gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_pages_slug_basename ON pages (source_id, (regexp_replace(slug, '^.*/', '')));
+CREATE INDEX IF NOT EXISTS idx_pages_source_title_lower ON pages (source_id, lower(title));
+CREATE INDEX IF NOT EXISTS idx_pages_slug_trgm ON pages USING GIN (slug gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_pages_source_id ON pages(source_id);
 CREATE INDEX IF NOT EXISTS pages_deleted_at_purge_idx
   ON pages (deleted_at) WHERE deleted_at IS NOT NULL;
@@ -539,6 +541,7 @@ CREATE TABLE IF NOT EXISTS extract_atoms_transcript_state (
   fail_count   INTEGER     NOT NULL DEFAULT 0,
   tombstoned   BOOLEAN     NOT NULL DEFAULT FALSE,
   updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  partial_input_chars INTEGER,
   PRIMARY KEY (source_id, file_path, content_hash)
 );
 CREATE INDEX IF NOT EXISTS extract_atoms_transcript_state_tombstoned_idx
@@ -634,15 +637,15 @@ CREATE OR REPLACE FUNCTION update_page_search_vector() RETURNS trigger SET searc
 DECLARE
   timeline_text TEXT;
 BEGIN
-  SELECT coalesce(string_agg(summary || ' ' || detail, ' '), '')
+  SELECT coalesce(string_agg(summary || ' ' || detail, ' ' ORDER BY id), '')
   INTO timeline_text
   FROM timeline_entries
   WHERE page_id = NEW.id;
 
   NEW.search_vector :=
     setweight(to_tsvector('english', gbrain_fts_input(coalesce(NEW.title, ''))), 'A') ||
-    setweight(to_tsvector('english', gbrain_fts_input(coalesce(NEW.timeline, ''))), 'C') ||
-    setweight(to_tsvector('english', gbrain_fts_input(coalesce(timeline_text, ''))), 'C');
+    setweight(to_tsvector('english', gbrain_fts_input(left(coalesce(NEW.timeline, ''), 65536))), 'C') ||
+    setweight(to_tsvector('english', gbrain_fts_input(left(coalesce(timeline_text, ''), 32768))), 'C');
 
   RETURN NEW;
 END;
@@ -1184,11 +1187,25 @@ CREATE TABLE IF NOT EXISTS extract_atoms_page_state (
   fail_count INTEGER NOT NULL DEFAULT 0 CHECK (fail_count >= 0),
   tombstoned BOOLEAN NOT NULL DEFAULT false,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  partial_input_chars INTEGER,
   PRIMARY KEY (source_incarnation, page_id, content_hash)
 );
 CREATE INDEX IF NOT EXISTS extract_atoms_page_state_tombstoned_idx
   ON extract_atoms_page_state (source_incarnation, content_hash, page_id) WHERE tombstoned;
 CREATE INDEX IF NOT EXISTS extract_atoms_page_state_page_idx ON extract_atoms_page_state (page_id);
+CREATE TABLE IF NOT EXISTS page_embedding_budget (
+  page_id INTEGER PRIMARY KEY REFERENCES pages(id) ON DELETE CASCADE,
+  state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'held', 'capped')),
+  reason TEXT,
+  embedding_signature TEXT,
+  spent_usd DOUBLE PRECISION NOT NULL DEFAULT 0 CHECK (spent_usd >= 0),
+  reserved_usd DOUBLE PRECISION NOT NULL DEFAULT 0 CHECK (reserved_usd >= 0),
+  reserved_at TIMESTAMPTZ,
+  unpriced_calls INTEGER NOT NULL DEFAULT 0 CHECK (unpriced_calls >= 0),
+  cap_usd DOUBLE PRECISION CHECK (cap_usd IS NULL OR cap_usd >= 0),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS page_embedding_budget_state_idx ON page_embedding_budget (state) WHERE state <> 'open';
 CREATE TABLE IF NOT EXISTS chronicle_page_state (
   source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
   page_id INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
@@ -1235,6 +1252,18 @@ CREATE TABLE IF NOT EXISTS dream_synthesis_completions (
   completed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (source_id, idempotency_key)
 );
+CREATE TABLE IF NOT EXISTS page_extraction_state (
+  page_id INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  pipeline TEXT NOT NULL CHECK (pipeline IN ('facts_backstop','extract_atoms','conversation_facts')),
+  pipeline_version INTEGER NOT NULL,
+  watermark_bytes BIGINT CHECK (watermark_bytes >= 0),
+  watermark_sha256 TEXT,
+  input_truncated JSONB,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (page_id, pipeline)
+);
+CREATE INDEX IF NOT EXISTS page_extraction_state_truncated_idx
+  ON page_extraction_state (pipeline, page_id) WHERE input_truncated IS NOT NULL;
 
 -- Durable concurrent persistence (migration 151).
 CREATE TABLE IF NOT EXISTS persistence_brain (
@@ -1333,6 +1362,8 @@ CREATE INDEX IF NOT EXISTS persistence_requests_sync_watermark
   ON persistence_requests(worktree_id,source_incarnation,completed_at DESC) WHERE state='committed' AND COALESCE(intent->>'kind','') LIKE 'managed_sync_%';
 CREATE INDEX IF NOT EXISTS persistence_requests_compactable
   ON persistence_requests(completed_at) WHERE recovery IS NULL AND NOT compacted AND state IN ('committed','conflict','failed','cancelled');
+CREATE INDEX IF NOT EXISTS persistence_requests_slug_intent
+  ON persistence_requests(source_id,slug,sequence) WHERE intent IS NOT NULL AND NOT compacted;
 CREATE INDEX IF NOT EXISTS persistence_requests_principal ON persistence_requests(principal_kind,principal_id,sequence DESC);
 CREATE TABLE IF NOT EXISTS persistence_effects (
     id bigserial PRIMARY KEY,
@@ -1361,6 +1392,8 @@ CREATE TABLE IF NOT EXISTS persistence_consumers (
     persistence_home text NOT NULL,
     minted_under jsonb,
     version text NOT NULL,
+    boot_id text,
+    process_start text,
     PRIMARY KEY(host_id,pid,nonce)
   );
 

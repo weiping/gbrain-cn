@@ -223,8 +223,10 @@ check('inherited cancellation and a released filesystem context never enter the 
 
 check('old inactive sync intents and managed bypass options remain refused', async engine => {
   const f = await fixture(engine);
-  for (const change of [{ noPull: false }, { includeGitignored: true }, { skipFailed: true }]) {
-    await expect(performManagedSync(engine, { ...f.opts, ...change })).rejects.toMatchObject({ code: 'writer_coordinator_required' });
+  await expect(performManagedSync(engine, { ...f.opts, noPull: false })).rejects.toMatchObject({ code: 'writer_coordinator_required' });
+  // #6696 C2: the managed bypass flags refuse by name, before anything runs.
+  for (const [change, flag] of [[{ includeGitignored: true }, '--include-gitignored'], [{ skipFailed: true }, '--skip-failed']] as const) {
+    await expect(performManagedSync(engine, { ...f.opts, ...change })).rejects.toMatchObject({ code: 'managed_sync_flag_refused', detail: flag });
   }
   await engine.transaction(async tx => {
     await tx.executeRaw("SELECT set_config('gbrain.topology_change','on',true)");
@@ -590,7 +592,7 @@ type SyncBarrier = 'discovery' | 'discovery-commit' | 'foreground' | 'freeze' | 
 function matchesSyncBarrier(boundary: SyncBarrier, sql: string, params: unknown[] | undefined, transactional: boolean): boolean {
   if (boundary === 'discovery') return sql.startsWith('SELECT slug,source_path,id FROM pages WHERE source_id=');
   if (boundary === 'foreground') return sql.includes("NOT(COALESCE(intent->>'kind','') LIKE 'managed_sync_%') LIMIT 1");
-  if (boundary === 'freeze') return sql.startsWith('SELECT id,slug,source_path FROM pages WHERE source_id=') && !transactional;
+  if (boundary === 'freeze') return sql.startsWith('SELECT id,slug,source_path,deleted_at FROM pages WHERE source_id=') && !transactional;
   if (boundary === 'request-lookup') return sql.startsWith('SELECT') && sql.includes('FROM persistence_requests') && sql.includes('request_id=') && !transactional;
   if (boundary === 'admission-commit') return sql.includes('UPDATE persistence_counters SET outstanding_count=outstanding_count+1');
   // A won cursor swap is the saved cursor (#5984 feeder, no read-back): the freeze transaction's last statement is its manifest touch.

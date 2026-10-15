@@ -5,6 +5,7 @@ import type { BrainEngine } from '../engine.ts';
 import type { SyncOpts } from '../../commands/sync.ts';
 import { parseMarkdown } from '../markdown.ts';
 import { OperationError, opError } from '../ops/contract.ts';
+import { managedForbiddenFlag, managedSyncFlagRefusal } from './managed-sync-flags.ts';
 import type { Action } from '../agent-output.ts';
 import type { RegistryCode } from '../error-registry.ts';
 import { buildDetachedWorkingTreeManifest, computeSyncDelta } from '../sync-delta.ts';
@@ -19,11 +20,11 @@ import { isWindowsColonTarget } from './native-file-target.ts';
 import { ERROR_CATALOGUE } from '../error-catalogue.ts';
 import { currentCompanyBrainSync } from '../company-brain/profile.ts';
 import type { CompanyBrainPlan } from '../company-brain/types.ts';
-import { assertDistinctSyncOrigins, legacySyncOrigin, sameSyncOrigin, syncOriginPath, type SyncOriginScope } from './sync-origin.ts';
+import { assertDistinctSyncOrigins, legacySyncOrigin, sameSyncOrigin, selectOriginClaimant, sharedOriginExit, syncOriginPath, type SyncOriginScope } from './sync-origin.ts';
 import { assertManagedSyncActive } from './sync-authority.ts';
 import { isReservedSkillBundlePath } from '../skill-reserved-paths.ts';
 import { holdRescreenDue, readGitHoldRetryPaths, readGitSourceHolds, readSyncImportProvenances } from './sync-holds.ts';
-import { readBlobContents, readTreeBlobs } from './sync-blobs.ts';
+import { readBlobContents, readTreeBlobs, SYNC_READ_BOUND } from './sync-blobs.ts';
 import { gitChildEnv } from '../git-env.ts';
 import { readSyncSlice, sliceEntries, syncCursorOptions, type SyncSliceCursor, type SyncSliceState } from './sync-slices.ts';
 
@@ -101,8 +102,8 @@ export function readSyncFile(root: string, path: string): Buffer | null {
     }
     if (!lstatSync(absolute).isFile()) throw syncTargetRefusal('source_changed', 'Sync target is not a regular file.',
       `${path} is not a regular file.`);
-    if (lstatSync(absolute).size > 10 * 1024 ** 2) throw opError('request_too_large', 'Sync file exceeds the bounded import size.',
-      `${path} is larger than the 10 MiB sync import bound, so nothing was imported from it. Shrink or split the file, or add it to the sync.exclude config, then sync its source again.`);
+    if (lstatSync(absolute).size > SYNC_READ_BOUND) throw opError('request_too_large', 'Sync file exceeds the bounded import size.',
+      `${path} is larger than the ${SYNC_READ_BOUND}-byte (24 MiB) page ceiling, so nothing was imported from it. Pages up to that size are chunked and searchable; above it, add the file to the sync.exclude config (or keep it outside the brain repo), then sync its source again. See docs/guides/memory-boundaries.md#large-pages.`);
     return readFileSync(absolute);
   } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
 }
@@ -162,8 +163,8 @@ export async function resolveManagedSyncContext(engine: BrainEngine, opts: SyncO
   const sourceId = opts.sourceId ?? 'default';
   if (!opts.noPull && !opts.dryRun) throw managedSyncRefusal(sourceId, 'Managed sync requires skipping the Git pull (CLI `--no-pull`, sync_brain `no_pull: true`); Git pull/rebase needs an explicit drained maintenance window.',
     `Sync without pulling to import the checkout as it is (CLI: gbrain sync --no-pull --source ${sourceId}; MCP: sync_brain with no_pull: true), or fast-forward and sync the checkout with gbrain sources refresh ${sourceId}.`);
-  if (opts.includeGitignored || opts.skipFailed) throw managedSyncRefusal(sourceId, 'Managed sync cannot bypass ignored-file or failed-receipt guards.',
-    `Run gbrain sync --no-pull --source ${sourceId} without --include-gitignored or --skip-failed; resolve failed files with --retry-failed after fixing them.`);
+  const forbidden = managedForbiddenFlag(opts);
+  if (forbidden) throw managedSyncFlagRefusal(forbidden, sourceId, ['--source', sourceId, '--no-pull']);
   const [source] = await engine.executeRaw<{ incarnation: string; archived: boolean; local_path: string | null; last_commit: string | null; config: Record<string, unknown> }>(
     'SELECT incarnation,archived,local_path,last_commit,config FROM sources WHERE id=$1', [sourceId]);
   const binding = await getWorktreeBinding(engine, sourceId);
@@ -446,8 +447,8 @@ export async function discoverManagedSync(engine: BrainEngine, opts: SyncOpts, c
     ...(workingTreeKept ? { workingTreeKept } : {}) };
   // Freeze all logical identities in one database statement, before yielding
   // between pages. A later interactive edit must conflict with this scan.
-  const identities = await engine.executeRaw<{ id: number; slug: string; source_path: string | null; knowledge_revision: string }>(
-    'SELECT id,slug,source_path,knowledge_revision FROM pages WHERE source_id=$1', [sourceId]);
+  const identities = await engine.executeRaw<{ id: number; slug: string; source_path: string | null; knowledge_revision: string; deleted_at: Date | string | null }>(
+    'SELECT id,slug,source_path,knowledge_revision,deleted_at FROM pages WHERE source_id=$1', [sourceId]);
   const bySlug = new Map(identities.map(p => [p.slug, p]));
   const byPath = new Map<string, typeof identities>();
   const storableIdentities = identities.filter(storable);
@@ -460,25 +461,24 @@ export async function discoverManagedSync(engine: BrainEngine, opts: SyncOpts, c
   const claims = new Map<string, SyncEntry[]>();
   for (const entry of selected) {
     const legacy = legacySyncOrigin(originScope, syncOriginPath(entry.sourcePath));
-    const origins = [...byPath.get(syncOriginPath(entry.sourcePath)) ?? [],
+    const claimants = [...byPath.get(syncOriginPath(entry.sourcePath)) ?? [],
       ...(legacy ? byPath.get(legacy) ?? [] : []).filter(page => sameSyncOrigin(page.source_path!, entry.sourcePath, originScope, page.slug))];
-    if (origins.length > 1) throw opError('page_identity_changed', 'Several pages claim the same imported origin.',
-      `Pages ${origins.map(page => page.slug).join(', ')} in ${sourceId} all record ${entry.sourcePath} as their origin; nothing was written. Keep one, remove or re-point the others, then run gbrain sync --no-pull --source ${sourceId}.`,
-      { fix: { argv: ['gbrain', 'get', '--source', sourceId, '--', origins[0]!.slug], consent: [], actor: 'agent', requires_exclusive: false,
-        why: 'Shows one of the pages that claim the origin, to decide which one keeps it.' } });
-    let slug = entry.slug ?? origins[0]?.slug ?? resolveSlugForPath(entry.sourcePath);
+    // #6517: one origin rule (sync-origin.ts): a live page wins over tombstones; several live pages, or several tombstones, refuse.
+    const { winner: origin, ambiguous } = selectOriginClaimant(claimants);
+    if (ambiguous) throw ambiguousOriginRefusal(sourceId, entry.sourcePath, ambiguous === 'several_live' ? claimants.filter(page => page.deleted_at == null) : claimants, ambiguous);
+    let slug = entry.slug ?? origin?.slug ?? resolveSlugForPath(entry.sourcePath);
     if (!slug && entry.action === 'import') slug = parseMarkdown(readSyncContent(discovered, entry), '').slug;
     if (!slug) throw opError('invalid_params', 'The imported file has no usable page slug.',
       `${entry.sourcePath} in ${sourceId} yields no page slug from its path or frontmatter; nothing was written. Rename the file or set a frontmatter slug and commit, then run gbrain sync --no-pull --source ${sourceId}.`);
-    if (!company && entry.action === 'import' && !origins.length && !isCodeFilePath(entry.sourcePath)) {
+    if (!company && entry.action === 'import' && !origin && !isCodeFilePath(entry.sourcePath)) {
       entry.slug = slug;
       claims.set(slug, [...(claims.get(slug) ?? []), entry]);
       continue;
     }
-    const page = origins[0] ?? bySlug.get(slug);
+    const page = origin ?? bySlug.get(slug);
     const foreignOrigin = page?.source_path != null && !sameSyncOrigin(page.source_path, entry.sourcePath, originScope, page.slug);
     // Deleting a file that no page records (a skipped slug twin) must not delete the page another file backs.
-    const unownedDeletion = foreignOrigin && entry.action === 'delete' && !origins.length && !company;
+    const unownedDeletion = foreignOrigin && entry.action === 'delete' && !origin && !company;
     if (foreignOrigin && !unownedDeletion) {
       const error = new OperationError('page_identity_changed', 'A different origin occupies the imported slug.',
         `Page ${slug} in source ${sourceId} records the origin '${page.source_path}', but sync found it at '${entry.sourcePath}'. On the brain host, rename or move one of the two files so each page has one origin, commit, then run gbrain sync --source ${sourceId} --no-pull --retry-failed.`);
@@ -553,6 +553,14 @@ export async function discoverManagedSync(engine: BrainEngine, opts: SyncOpts, c
     if (uncommitted.added || uncommitted.modified || uncommitted.deleted) discovered.uncommitted = uncommitted;
   }
   return discovered;
+}
+/** #6517: several live pages (the soft-delete exit is named) or several tombstones record one imported origin. */
+function ambiguousOriginRefusal(sourceId: string, sourcePath: string, named: Array<{ slug: string }>, ambiguous: 'several_live' | 'several_tombstones'): OperationError {
+  return opError('page_identity_changed', 'Several pages claim the same imported origin.',
+    `Pages ${named.map(page => page.slug).join(', ')} in ${sourceId} all record ${sourcePath} as their origin; nothing was written. `
+    + (ambiguous === 'several_live' ? `${sharedOriginExit(sourceId, named.map(page => page.slug))} Then` : 'Keep one, remove or re-point the others, then') + ` run gbrain sync --no-pull --source ${sourceId}.`,
+    { fix: { argv: ['gbrain', 'get', '--source', sourceId, '--', named[0]!.slug], consent: [], actor: 'agent', requires_exclusive: false,
+      why: 'Shows one of the pages that claim the origin, to decide which one keeps it.' } });
 }
 export function readSyncContent(discovery: SyncDiscovery, entry: SyncEntry): string {
   if (entry.working) {

@@ -41,14 +41,26 @@
  * `test/e2e/postgres-bootstrap.test.ts`) to catch step 2 oversights.
  */
 
-import { test, expect } from 'bun:test';
+import { test, expect, beforeAll, afterAll } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { surfaceFileSource } from './helpers/source-surface.ts';
 
 // Tier 3 opt-out: this file tests the bootstrap coverage contract explicitly,
 // running applyForwardReferenceBootstrap against fresh PGlite instances. A
-// snapshot-loaded engine would skip the bootstrap entirely.
-delete process.env.GBRAIN_PGLITE_SNAPSHOT;
+// snapshot-loaded engine would skip the bootstrap entirely. Unset for this
+// file's tests and restore afterwards: a CI shard runs hundreds of files in
+// ONE bun process (scripts/test-shard.sh), so a module-scope delete would
+// cold-boot every later engine in the shard (check:test-env-opt-ins pins
+// this shape).
+let savedSnapshot: string | undefined;
+beforeAll(() => {
+  savedSnapshot = process.env.GBRAIN_PGLITE_SNAPSHOT;
+  delete process.env.GBRAIN_PGLITE_SNAPSHOT;
+});
+afterAll(() => {
+  if (savedSnapshot === undefined) delete process.env.GBRAIN_PGLITE_SNAPSHOT;
+  else process.env.GBRAIN_PGLITE_SNAPSHOT = savedSnapshot;
+});
 
 // Single home for the bootstrap's source path (moved twice: #4477, then E1
 // merged both engines' copies — keep every source-pinning test below on one
@@ -903,6 +915,12 @@ const COLUMN_EXEMPTIONS = new Set<string>([
   // the schema blob carries a comment, no CREATE TABLE column and no index
   // reads it, so there is no forward reference for the bootstrap to trip on.
   'content_chunks.embedding_pending_since',
+  // Large pages (Wave A) content_chunks.projected_byte_start/end (migration
+  // chunk_projected_spans): same posture as embedding_pending_since,
+  // migration-only so fresh and upgraded catalogs share column ordinals; no
+  // CREATE TABLE column or index in the blob reads them.
+  'content_chunks.projected_byte_start',
+  'content_chunks.projected_byte_end',
   // #5504 (wave 14 P4.1) open_loops.counterparty_source_id (migration
   // open_loops_counterparty_source): same posture as embedding_pending_since,
   // migration-only so fresh and upgraded brains share column ordinals; the

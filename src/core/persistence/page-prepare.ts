@@ -1,8 +1,9 @@
 import { isEmbedSkipped } from '../embed-skip.ts';
+import { sizeStateField } from '../page-embedding-budget.ts';
 import { enterClaimStep, type ClaimPhaseClock } from './claim-phase.ts';
 import { boundedReads } from './bounded-reads.ts';
 import { isQuarantined, quarantineOutcome } from '../quarantine.ts';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
 import { matchesAnyGlob } from '../sync.ts';
 import { syncExcludePatterns } from './sync-discovery.ts';
@@ -11,13 +12,15 @@ import type { GBrainConfig } from '../config.ts';
 import type { Page, PageVersion } from '../types.ts';
 import { importFromContent, verifyPageReadable, type ParsedPage } from '../import-file.ts';
 import { comparableFrontmatter, frontmatterHoldMessageWithoutKeys, parseMarkdown, resolveParsedSubtype, serializePageToMarkdown, resolveSourceLocalFilePath, type ParseOpts } from '../markdown.ts';
+import { assertLargePageReplacement } from './large-page-guard.ts';
 import { OperationError, opError } from '../ops/contract.ts';
+import { CANONICAL_FILE_MISSING } from './publication-failure.ts';
 import { readFix } from '../ops/op-fix.ts';
 import { isOpPageSlug } from '../ops/context.ts';
 import { shellQuote, type Action } from '../agent-output.ts';
 import type { RegistryCode } from '../error-registry.ts';
 import { pageIdentityError } from './page-identity.ts';
-import { contentRefusalError } from '../import-screen.ts';
+import { contentRefusalError, PAGE_OVER_LIMIT_SUGGESTION } from '../import-screen.ts';
 import { ContentSanityBlockError } from '../content-sanity.ts';
 import { assertPageRevision, type PageSnapshot } from '../page-state/types.ts';
 import { gitHoldFix, readGitHold } from './sync-holds.ts';
@@ -27,7 +30,8 @@ import { isWriteTargetContained } from '../path-confine.ts';
 import { recordedPathFromFileUri, scannerSlugRootMode, scannerSourcePath } from '../write-through.ts';
 import { engineMutationPrecondition, parseMutationPrecondition } from './preconditions.ts';
 import { assertPurgeParams } from './purge-params.ts';
-import { authorizeWrite } from './authority.ts';
+import { authorizeWrite, slugDisclosable } from './authority.ts';
+import { findLiveFileClaimants, type FileClaimant, type FileClaimTarget } from './file-claims.ts';
 import { digest, sha256 } from './digest.ts';
 import { getWorktreeBinding } from './ownership.ts';
 import type { PreparedContentImport } from './prepared-import.ts';
@@ -57,11 +61,12 @@ import { fenceWhere } from '../fence-repair/refusal.ts';
 import { pageFencesNormalized } from '../fence-repair/report.ts';
 import { parseFenceRepairReceipt } from '../fence-repair/receipt.ts';
 import { fenceRepairCommit } from './effect-model.ts';
-import { purgePageInTransaction } from './page-purge.ts';
+import { preparePagePurge, purgePageInTransaction, type PreparedPagePurge } from './page-purge.ts';
 import { withTrustKeep } from './context.ts';
 import { isFenceEditWrite, pageGateTrust, pageWriteTrust, recordAgentPageLowering, stampPageTrustMarker, storedPageTier } from '../trust/page-write.ts';
 import { suppliedTrustMarkerView } from '../trust/channel.ts';
 import { gateField, gateInput } from '../trust/gate-outcomes.ts';
+import { PUSH_SCAN_MAX_FILE_BYTES } from '../page-size-policy.ts';
 
 
 const ownerStatusFix = (sourceId: string): Action => readFix(`Shows source ${sourceId}'s canonical owner with its pending, failed and recovering requests, read-only.`,
@@ -125,7 +130,7 @@ function isNeverFiledDerivedPage(slug: string, page: { source_path?: string | nu
  * A live page whose canonical file is absent publishes to the database only
  * when its slug is a declared db_only path or a never-filed derive-phase page.
  */
-export function publishesDatabaseOnly(root: string, slug: string, snapshot: PageSnapshot | null): boolean {
+export function publishesDatabaseOnly(root: string, slug: string, snapshot: { page: Pick<PageSnapshot['page'], 'deleted_at' | 'source_path' | 'source_uri'> } | null): boolean {
   if (!snapshot || snapshot.page.deleted_at) return false;
   return isSourceDbOnlySlug(root, slug, 'refuse') || isNeverFiledDerivedPage(slug, snapshot.page);
 }
@@ -156,8 +161,13 @@ export async function fileMatchesSnapshot(engine: BrainEngine, slug: string, byt
 export async function prepareFileTarget(engine: BrainEngine, row: Pick<WriteRequest, 'source_id' | 'worktree_id' | 'slug'>, snapshot: PageSnapshot | null,
   content: string | null, hostId?: string, options: { allowMissing?: boolean; deleting?: boolean; capture?: { path: string; hash: string }; activePack?: ParseOpts['activePack']; remote?: boolean;
     /** #6368: a tombstone purge whose file matches these sync.exclude globs (relative to the source root) owns no file. */
-    excludeTombstone?: { patterns: string[]; onExcluded: (path: string) => void } } = {}): Promise<PreparedMutation['file']> {
+    excludeTombstone?: { patterns: string[]; onExcluded: (path: string) => void };
+    /** #6517: a delete whose file another live page of the source records owns no file; the census target and claimants are reported. */
+    sharedOrigin?: { onShared: (shared: SharedOrigin) => void } } = {}): Promise<PreparedMutation['file']> {
   if (!row.worktree_id) return undefined;
+  // A canonical file over the pre-push secret-scan cap would block every later push of the brain repo.
+  if (content !== null && Buffer.byteLength(content, 'utf-8') > PUSH_SCAN_MAX_FILE_BYTES) throw opError('request_too_large', 'The canonical file would exceed the pre-push secret-scan cap.',
+    `Nothing was written. The rendered file of ${row.slug} is over ${PUSH_SCAN_MAX_FILE_BYTES} bytes, which the pre-push secret scan cannot scan, so it would block every push of source ${row.source_id}. Keep the page under the 24 MiB page ceiling (docs/guides/memory-boundaries.md#large-pages).`);
   // #6212: a legacy slug (admitted only to delete or restore its existing row) never owns a file: its recorded
   // source_uri or source_path may name the file of another page, such as the one sync now slugs it to.
   if (!isOpPageSlug(row.slug)) return undefined;
@@ -191,6 +201,12 @@ export async function prepareFileTarget(engine: BrainEngine, row: Pick<WriteRequ
     if (matchesAnyGlob(rel, options.excludeTombstone.patterns)) { options.excludeTombstone.onExcluded(rel); return undefined; }
   }
   const before = existsSync(path) ? readFileSync(path) : null;
+  if (options.deleting === true && options.sharedOrigin && snapshot && before) {
+    const target: FileClaimTarget = { sourceId: row.source_id, slug: row.slug, pageId: snapshot.page.id, root, path, canonicalPath: realpathSync(path),
+      mode: mode ?? await scannerSlugRootMode(engine, row.source_id, root), recordedUri: capturedPath ? snapshot.page.source_uri ?? null : null };
+    const claimants = await findLiveFileClaimants(engine, target);
+    if (claimants.length) { options.sharedOrigin.onShared({ target, claimants }); return undefined; }
+  }
   if (!before && snapshot && !snapshot.page.deleted_at && !options.allowMissing) {
     // A declared db_only page has no canonical file by design and publishes to
     // the database only. gbrain.yml is consulted only here, where the write
@@ -201,8 +217,9 @@ export async function prepareFileTarget(engine: BrainEngine, row: Pick<WriteRequ
     // missing still refuses below.
     if (publishesDatabaseOnly(root, row.slug, snapshot)) return undefined;
     if (options.deleting === true && content === null && !snapshot.page.source_path && !capturedPath) return undefined;
-    throw new OperationError('source_changed', 'The canonical file was removed outside coordinated publication.',
-      'Import the local deletion or recover the canonical file before editing this page.');
+    // #6696 (A12): tagged, so a producer can refuse this before admission and the receipt says which refusal it was.
+    throw opError('source_changed', 'The canonical file was removed outside coordinated publication.',
+      'Import the local deletion or recover the canonical file before editing this page.', { detail: CANONICAL_FILE_MISSING });
   }
   // A normal edit may replace only the bytes represented by its read snapshot.
   // Unknown local edits require explicit import/recovery, even for force writes.
@@ -277,18 +294,86 @@ async function pageDatabaseOnlyPublication(engine: SqlEngine, row: WriteRequest,
  * database-only: the file is neither compared nor removed. `excludedPath` names that file; the apply re-checks it.
  */
 async function prepareDeleteFileTarget(engine: BrainEngine, row: WriteRequest, snapshot: PageSnapshot, purge: boolean,
-  options: Parameters<typeof prepareFileTarget>[5]): Promise<{ file: PreparedMutation['file']; excludedPath: string | null }> {
-  let excludedPath: string | null = null;
+  options: Parameters<typeof prepareFileTarget>[5]): Promise<{ file: PreparedMutation['file']; excludedPath: string | null; shared: SharedOrigin | null }> {
+  let excludedPath: string | null = null, shared: SharedOrigin | null = null;
   const exclude = purge && snapshot.page.deleted_at != null ? await syncExcludePatterns(engine) : [];
   const file = await prepareFileTarget(engine, row, snapshot, null, undefined, { ...options,
-    ...(exclude.length ? { excludeTombstone: { patterns: exclude, onExcluded: (path: string) => { excludedPath = path; } } } : {}) });
-  return { file, excludedPath };
+    ...(exclude.length ? { excludeTombstone: { patterns: exclude, onExcluded: (path: string) => { excludedPath = path; } } } : {}),
+    sharedOrigin: { onShared: value => { shared = value; } } });
+  return { file, excludedPath, shared };
+}
+
+/** #6517: the recorded-origin census of a delete's file (file-claims.ts) and the other live pages that record it. */
+export interface SharedOrigin { target: FileClaimTarget; claimants: FileClaimant[] }
+export const sharedOriginReceipt = (sourceId: string) => 'The selected database page is hidden; the file and the surviving page remain. This does not erase that file\'s contents. '
+  + `The file's current content will be imported into the surviving page by the next sync that imports it (gbrain sync --source ${sourceId} --no-pull --full imports every file now); edit the file first if it holds the deleted page's text.`;
+/**
+ * #6517 [R8]: the survivor is revalidated under publication: the kept file must still resolve to the same real file and the
+ * same live pages must still record it; otherwise the delete refuses and the file is never removed as a fallback.
+ * [R9]: the receipt names a surviving slug only to the trusted local owner, or to a remote writer whose grant and visibility cover it.
+ */
+async function validateSharedOrigin(tx: BrainEngine, row: WriteRequest, shared: SharedOrigin): Promise<string> {
+  let canonicalPath: string;
+  try { canonicalPath = realpathSync(shared.target.path); }
+  catch { throw sharedOriginChanged(row, 'the shared file was moved or removed'); }
+  const claimants = await findLiveFileClaimants(tx, { ...shared.target, canonicalPath });
+  if (claimants.map(page => page.id).join(',') !== shared.claimants.map(page => page.id).join(',')) throw sharedOriginChanged(row, 'the pages recording the shared file changed');
+  const named: string[] = [];
+  for (const page of claimants) if (await slugDisclosable(tx, row.authority, page.slug)) named.push(page.slug);
+  const who = named.length ? `Another page of this source records the same file: ${named.join(', ')}.` : 'Another page of this source records the same file.';
+  return `${who} ${sharedOriginReceipt(row.source_id)}`;
+}
+function sharedOriginChanged(row: WriteRequest, what: string): OperationError {
+  const error = pageRefusal('source_changed', `The shared canonical file changed while the delete was prepared: ${what} before it published, so nothing was written and the file was not removed. Submit the delete again with a new request_id; it re-reads the file's claimants.`, row,
+    `Page ${row.slug}'s file in source ${row.source_id} was recorded by another live page when this delete was prepared.`, pageFix(row.source_id, row.slug));
+  error.detail = 'shared_origin';
+  return error;
 }
 
 async function assertStillSyncExcluded(tx: BrainEngine, row: WriteRequest, excludedPath: string): Promise<void> {
   if (matchesAnyGlob(excludedPath, await syncExcludePatterns(tx))) return;
   throw pageRefusal('source_changed', 'sync.exclude changed while the purge was prepared.', row,
     `${excludedPath} was excluded from sync when the purge of ${row.slug} was prepared and is not any more, so nothing was purged. Run the purge again; it re-reads the exclusion.`, pageFix(row.source_id, row.slug));
+}
+
+/** The `delete_page` preparation: soft delete, or purge with its journal sweep (#6511) run under the preparation budget. */
+async function prepareDeletePageMutation(engine: BrainEngine, row: WriteRequest, snapshot: PageSnapshot | null,
+  options: { activePack?: ParseOpts['activePack']; clock?: ClaimPhaseClock; allowMissingFile?: boolean }): Promise<PreparedMutation> {
+  const p = row.intent!, source = { sourceId: row.source_id }, clock = options.clock;
+  assertPurgeParams(p, row.authority.remote);
+  if (!snapshot) throw pageRefusal('page_not_found', 'Page not found.', row,
+    `Page ${row.slug} does not exist in source ${row.source_id}, so nothing was deleted. Check the slug and the source.`, pageFix(row.source_id, row.slug));
+  const observedRevision = snapshot.revision;
+  const purge = p.purge === true;
+  const noop = !purge && snapshot.page.deleted_at != null;
+  // Always-loaded core pages: a remote caller cannot delete one (owner-only).
+  if (!noop) { enterClaimStep(clock, 'core_guard', undefined, 'db'); await prepareCoreGuard(engine, { row, snapshot, incoming: null }); }
+  enterClaimStep(clock, 'file_target', undefined, 'fs');
+  // Tombstones still own their recorded artifact. Purge always attempts its
+  // removal before the guarded hard-delete and receipt commit; failure rolls
+  // back to the prior row, and replay survives the eventual absence of that row.
+  const { file, excludedPath, shared } = await prepareDeleteFileTarget(engine, row, snapshot, purge, { allowMissing: purge || options.allowMissingFile, deleting: true, activePack: options.activePack, remote: row.authority.remote });
+  // #6517: a purge tombstones content hashes source-wide, so a page whose file another live page records is only soft-deleted.
+  if (shared && purge) {
+    const error = pageRefusal('source_changed', 'The page\'s canonical file is shared with another live page, so a purge (which tombstones its content source-wide) was refused and nothing was removed, tombstoned or redacted. '
+      + `Soft-delete it instead (gbrain delete ${row.slug} --source-id ${row.source_id} --expected-revision <rev>): the page is hidden, the file and the surviving page remain, and nothing is erased.`, row,
+      `Another live page of source ${row.source_id} records the file of ${row.slug}.`, pageFix(row.source_id, row.slug));
+    error.detail = 'shared_origin';
+    throw error;
+  }
+  // #6511: the purge's journal sweep runs here, under the preparation budget, never inside the 5 s publication transaction.
+  const preparedPurge: PreparedPagePurge | null = purge ? await preparePagePurge(engine, row, snapshot, clock) : null;
+  const prepared: PreparedMutation = { observedRevision, noop, file, ...await pageDatabaseOnlyPublication(engine, row, file),
+    ...(excludedPath !== null ? { databaseOnlyReason: 'sync_excluded' as const } : {}), ...(shared ? { databaseOnlyReason: 'shared_origin' as const } : {}),
+    ...(shared ? { validate: async (tx: BrainEngine) => { prepared.databaseOnlyWarning = await validateSharedOrigin(tx, row, shared); } } : {}),
+    apply: async tx => {
+      if (purge && excludedPath !== null) await assertStillSyncExcluded(tx, row, excludedPath);
+      if (preparedPurge) return purgePageInTransaction(tx, row, snapshot, preparedPurge);
+      if (!noop) { await tx.createVersion(row.slug, source); await tx.softDeletePage(row.slug, source); }
+      return { status: 'soft_deleted', slug: row.slug, source_id: row.source_id, noop,
+        recoverable_until: 'now + 72h via restore_page (remove immediately instead: gbrain delete <slug> --purge, local CLI only)' };
+    } };
+  return prepared;
 }
 
 /**
@@ -324,35 +409,16 @@ export async function preparePageMutation(unbounded: BrainEngine, row: WriteRequ
   if ((snapshot?.page.id ?? null) !== row.page_id) throw pageIdentityError(snapshot != null || row.page_id === null, 'The accepted page identity changed.');
   const observedRevision = snapshot?.revision ?? null;
   const activePack = pack?.manifest;
-  if (row.operation === 'put_page' && p.allow_empty !== true && snapshot && !snapshot.page.deleted_at
-    && typeof p.content === 'string' && `${snapshot.page.compiled_truth}\n${snapshot.page.timeline ?? ''}`.trim()) {
+  if (row.operation === 'put_page' && snapshot && !snapshot.page.deleted_at && typeof p.content === 'string'
+    && `${snapshot.page.compiled_truth}\n${snapshot.page.timeline ?? ''}`.trim()) {
     const incoming = parseMarkdown(p.content, row.slug, { activePack });
-    if (!`${incoming.compiled_truth}\n${incoming.timeline ?? ''}`.trim()) {
+    if (!preparedIntent && row.authority.remote) assertLargePageReplacement(row.slug, row.source_id, p, snapshot, incoming);
+    if (p.allow_empty !== true && !`${incoming.compiled_truth}\n${incoming.timeline ?? ''}`.trim()) {
       throw new OperationError('invalid_params', `Refusing to overwrite existing non-empty page '${row.slug}' with empty content. Use capture --file PATH --slug SLUG for file input; set allow_empty:true to intentionally clear it.`,
         'Use capture --file PATH --slug SLUG for file input, or pass allow_empty:true with the expected revision to intentionally clear it.');
     }
   }
-  if (row.operation === 'delete_page') {
-    assertPurgeParams(p, row.authority.remote);
-    if (!snapshot) throw pageRefusal('page_not_found', 'Page not found.', row,
-      `Page ${row.slug} does not exist in source ${row.source_id}, so nothing was deleted. Check the slug and the source.`, pageFix(row.source_id, row.slug));
-    const purge = p.purge === true;
-    const noop = !purge && snapshot.page.deleted_at != null;
-    // Always-loaded core pages: a remote caller cannot delete one (owner-only).
-    if (!noop) { enterClaimStep(clock, 'core_guard', undefined, 'db'); await prepareCoreGuard(engine, { row, snapshot, incoming: null }); }
-    enterClaimStep(clock, 'file_target', undefined, 'fs');
-    // Tombstones still own their recorded artifact. Purge always attempts its
-    // removal before the guarded hard-delete and receipt commit; failure rolls
-    // back to the prior row, and replay survives the eventual absence of that row.
-    const { file, excludedPath } = await prepareDeleteFileTarget(engine, row, snapshot, purge, { allowMissing: purge || options.allowMissingFile, deleting: true, activePack, remote: row.authority.remote });
-    return { observedRevision, noop, file, ...await pageDatabaseOnlyPublication(engine, row, file), ...(excludedPath !== null ? { databaseOnlyReason: 'sync_excluded' as const } : {}), apply: async tx => {
-      if (purge && excludedPath !== null) await assertStillSyncExcluded(tx, row, excludedPath);
-      if (purge) return purgePageInTransaction(tx, row, snapshot);
-      if (!noop) { await tx.createVersion(row.slug, source); await tx.softDeletePage(row.slug, source); }
-      return { status: 'soft_deleted', slug: row.slug, source_id: row.source_id, noop,
-        recoverable_until: 'now + 72h via restore_page (remove immediately instead: gbrain delete <slug> --purge, local CLI only)' };
-    } };
-  }
+  if (row.operation === 'delete_page') return prepareDeletePageMutation(engine, row, snapshot, { activePack, clock, allowMissingFile: options.allowMissingFile });
   // #6188: a trusted local fence repair's receipt (admission refuses it from every other caller) rides the outcome and the file's commit.
   const fenceRepair = row.operation === 'put_page' && !row.authority.remote ? parseFenceRepairReceipt(p.fence_repair) : null;
   const fenceRepairOutcome = fenceRepair ? { fence_repair: fenceRepair } : {};
@@ -469,7 +535,7 @@ export async function preparePageMutation(unbounded: BrainEngine, row: WriteRequ
     // A remote caller's refusal names the line, never a key: keys can be private, and the receipt keeps the message.
     const refusal = result.refusal && row.authority.remote && result.refusal.code === 'invalid_frontmatter'
       ? { ...result.refusal, key: undefined, message: frontmatterHoldMessageWithoutKeys(result.refusal.message) } : result.refusal;
-    if (refusal?.code === 'file_too_large') throw contentRefusalError(refusal, 'Split the content into smaller pages, then submit each with its own request_id.', { legacy_error: 'request_too_large' });
+    if (refusal?.code === 'file_too_large') throw contentRefusalError(refusal, PAGE_OVER_LIMIT_SUGGESTION, { legacy_error: 'request_too_large' });
     if (refusal?.code === 'invalid_fence') throw contentRefusalError(refusal, `Page ${row.slug} was not written. Fix ${fenceWhere(refusal.fence)} as the message says (fence_issues lists every row and column; use the allowed values), `
       + 'or write facts with remember and takes with takes_add instead of a hand-built table, then submit the corrected content with a new request_id.', { legacy_error: 'invalid_params' });
     if (refusal) throw contentRefusalError(refusal, `Correct ${refusal.line !== undefined ? `frontmatter line ${refusal.line}${refusal.key ? ` (key "${refusal.key}")` : ''}` : 'the frontmatter'}: one line per key with its whole value quoted, then submit the corrected content with a new request_id.`,
@@ -584,10 +650,13 @@ export async function preparePageMutation(unbounded: BrainEngine, row: WriteRequ
     }
     const coreUsage = core?.usage();
     const gate = noop ? undefined : gateField(ready.result.gate, `p:${row.source_id}/${row.slug}`, null);
+    // #6722: a large or embed_skip page says what this write left its embedding in.
+    const sizeState = noop ? {} : await sizeStateField(tx, row.source_id, row.slug, ready.parsedPage);
     return { ...advisories, ...(autoLinks ? {auto_links:autoLinks} : {}), ...(coreUsage ? { core: coreUsage } : {}),
       ...(removedTimeline ? { timeline_rows_removed: timelineRowsRemovedAdvisory(row, removedTimeline) } : {}),
       status: noop ? 'skipped' : row.operation === 'restore_page' ? 'restored' : row.operation === 'revert_version' ? 'reverted' : 'created_or_updated',
       slug: row.slug, source_id: row.source_id, chunks: ready.result.chunks, noop,
+      ...sizeState,
       ...(ready.result.chunks === 0 ? {chunk_skip_reason: noop ? 'write_skipped'
         : isEmbedSkipped(ready.parsedPage.frontmatter) || isQuarantined(ready.parsedPage.frontmatter) ? 'embed_skip' : 'empty_body'} : {}),
       // #6259: say the gate hid the page, not only why it has no chunks.

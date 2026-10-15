@@ -254,7 +254,7 @@ test('repeated slices reuse one manifest and hold an intervening page identity c
     const executeRaw = engine.executeRaw;
     let manifestReads = 0;
     engine.executeRaw = async function (this: BrainEngine, sql: string, params?: unknown[]) {
-      if (params?.[0] === f.id && sql.includes('SELECT id,slug,source_path,knowledge_revision FROM pages')) manifestReads++;
+      if (params?.[0] === f.id && sql.includes('SELECT id,slug,source_path,knowledge_revision,deleted_at FROM pages')) manifestReads++;
       return executeRaw.call(this, sql, params);
     } as BrainEngine['executeRaw'];
     try {
@@ -456,7 +456,7 @@ test.each([false, true])('managed terminal receipts survive a missing ledger and
         expect(unavailable).toMatchObject({ status: 'blocked_by_failures', managedWrite: { ledger_recorded: false,
           write_request: { request_id: id, state: 'conflict' } } });
       });
-      await expect(performManagedSync(engine, { ...opts, skipFailed: true })).rejects.toMatchObject({ code: 'writer_coordinator_required' });
+      await expect(performManagedSync(engine, { ...opts, skipFailed: true })).rejects.toMatchObject({ code: 'managed_sync_flag_refused', detail: '--skip-failed' });
       const corrected = await performManagedSync(engine, { ...opts, retryFailed: true });
       expect(corrected.status).toBe('synced');
       expect(loadSyncFailures().filter(row => row.source_id === f.id)).toHaveLength(0);

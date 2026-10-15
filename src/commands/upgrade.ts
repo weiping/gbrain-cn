@@ -8,7 +8,8 @@ import { opError, type OperationError } from '../core/ops/contract.ts';
 import { writeCliError } from '../cli/cli-error.ts';
 import { VERSION } from '../version.ts';
 import type { InteractiveProbe } from '../core/interaction.ts';
-import { migrationLedgerSummary } from '../core/migration-ledger.ts';
+import { forwardProgressPast, migrationLedgerSummary } from '../core/migration-ledger.ts';
+import { loadCompletedMigrations } from '../core/preferences.ts';
 import { MIGRATIONS_RUNNING_EXIT_CODE, readMigrationLockHolder } from '../core/migration-orchestration-lock.ts';
 import {
   BUN_FLOOR_EXIT_CODE,
@@ -383,11 +384,13 @@ export async function describeMigrationFailure(error: unknown, newVersion: strin
     return `Migrations: running (host ${holder?.host ?? 'unknown'}, pid ${holder?.pid ?? 'unknown'}) in another apply-migrations. `
       + 'Wait for it to finish; `gbrain doctor` shows migration progress.';
   }
-  const wedged = newVersion ? migrationLedgerSummary(newVersion).wedged : [];
-  const command = wedged.length > 0
-    ? `${wedged.map(v => `gbrain apply-migrations --force-retry ${v}`).join(' && ')} && gbrain apply-migrations --yes`
-    : 'gbrain apply-migrations --yes';
-  return `Migrations: failed. Run: ${command}`;
+  const ledger = newVersion ? loadCompletedMigrations() : [];
+  const wedged = newVersion ? migrationLedgerSummary(newVersion).wedged.filter(v => forwardProgressPast(v, ledger) === null) : [];
+  if (wedged.length > 0) {
+    return `Migrations: wedged (${wedged.map(v => `v${v}`).join(', ')} ended partial 3+ times in a row). Fix the cause in ~/.gbrain/upgrade-errors.jsonl, then run: `
+      + `${wedged.map(v => `gbrain apply-migrations --force-retry ${v}`).join(' && ')} && gbrain apply-migrations --yes`;
+  }
+  return 'Migrations: failed. Run: gbrain apply-migrations --yes';
 }
 
 export function resolveBunGlobalRoot(): string {
@@ -541,17 +544,16 @@ function saveUpgradeState(oldVersion: string, newVersion: string) {
  * installs do.
  */
 /**
- * v0.32.3 search-lite mode banner, moved out of runPostUpgrade unchanged.
+ * The search-mode banner for a brain that never chose a mode (copy: core/search/mode-advice.ts).
  */
-async function printSearchModeUpgradeBanner(engine: BrainEngine): Promise<void> {
+export async function printSearchModeUpgradeBanner(engine: BrainEngine): Promise<void> {
   // One-shot: fires at most once per install (state persisted via `search.mode_upgrade_notice_shown`).
-  // Reframes from "behavior is regressing" to "named modes available" per [CDX-1+2+3]: the production
-  // query op still defaults expand=true and limit=20.
+  // A brain with no search.mode resolves to the default (balanced); the banner says so and relays the matrix.
   try {
     const shown = await engine.getConfig('search.mode_upgrade_notice_shown');
     const existingMode = await engine.getConfig('search.mode');
     if (shown !== 'true' && !existingMode) {
-      printSearchModeBanner();
+      await printSearchModeBanner();
       await engine.setConfig('search.mode_upgrade_notice_shown', 'true');
     }
   } catch {
@@ -715,6 +717,8 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
         await (await import('../core/feedback/upgrade-notice.ts')).printRetrievalFeedbackUpgradeNotice(engine);
         // Entity mention index: [AGENT] catch-up line while pages are due (best-effort).
         await (await import('../core/mentions/upgrade-notice.ts')).printMentionIndexUpgradeNotice(engine);
+        // Large pages: re-index pages an older gbrain stored chunkless for size (keyless-safe, time-boxed, resumable).
+        await (await import('../core/oversized-backfill.ts')).printOversizedBackfillUpgradeNotice(engine);
 
         // Temporal typed edges: one-shot [AGENT] notice (live-by-default graph reads + relationship check), best-effort.
         await (await import('../core/temporal-edges-upgrade-notice.ts')).printTemporalEdgesUpgradeNotice(engine);
@@ -897,40 +901,10 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
   if (json) await writeJsonDocument(JSON.stringify(report));
 }
 
-/** The v0.32.3 one-shot search-mode banner post-upgrade prints (stdout; stderr under --json). */
-function printSearchModeBanner(): void {
-  console.log('');
-  console.log('═══════════════════════════════════════════════════════════════');
-  console.log('[gbrain] v0.32.3 added named search modes (conservative/balanced/tokenmax).');
-  console.log('[gbrain] Your current behavior is unchanged — the `query` op still defaults');
-  console.log('[gbrain] expand=true and limit=20, same as v0.31.x.');
-  console.log('═══════════════════════════════════════════════════════════════');
-  console.log('');
-  console.log('[AGENT] Relay this matrix to your operator and ask which mode they want.');
-  console.log('[AGENT] Recommended default: tokenmax (preserves current retrieval shape).');
-  console.log('[AGENT] Run `gbrain config set search.mode <mode>` after they decide.');
-  console.log('');
-  console.log('Per-query cost @ 10K queries/mo (typical single-user volume):');
-  console.log('');
-  console.log('                  Haiku 4.5    Sonnet 4.6   Opus 4.7');
-  console.log('                  ($1/M)       ($3/M)       ($5/M)');
-  console.log('  conservative    $40/mo       $120/mo      $200/mo');
-  console.log('  balanced        $100/mo      $300/mo      $500/mo');
-  console.log('  tokenmax        $200/mo      $600/mo      $1,000/mo');
-  console.log('');
-  console.log('  (scales linearly — multiply by 10 for 100K/mo)');
-  console.log('  25x corner-to-corner spread. Natural diagonal pairings span ~4x.');
-  console.log('');
-  console.log('To pick:');
-  console.log('  gbrain search modes              # see what is running');
-  console.log('  gbrain config set search.mode <conservative|balanced|tokenmax>');
-  console.log('  gbrain search tune               # data-driven recommendations');
-  console.log('');
-  console.log('tokenmax bumps limit to 50 (current default is 20). To preserve');
-  console.log('your EXACT current shape:');
-  console.log('  gbrain config set search.mode tokenmax');
-  console.log('  gbrain config set search.searchLimit 20');
-  console.log('');
+/** The one-shot search-mode banner post-upgrade prints for a brain with no search.mode (stdout; stderr under --json). */
+async function printSearchModeBanner(): Promise<void> {
+  const { upgradeBannerLines } = await import('../core/search/mode-advice.ts');
+  for (const line of upgradeBannerLines()) console.log(line);
 }
 
 interface PostUpgradeReport {

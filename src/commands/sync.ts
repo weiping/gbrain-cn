@@ -19,6 +19,10 @@ export interface SyncResult {
   failures?: ManagedSyncFailure[];
   runId?: string;
   managedWrite?: import('../core/persistence/sync-run.ts').ManagedSyncWriteDiagnostic;
+  /** #6643: the request a `--retry-failed` rediscovery waits for (its producer and slug), instead of a silent no-op. */
+  retryWait?: import('../core/persistence/sync-run.ts').RetryWait;
+  /** #6643: knock-on pages this run re-froze automatically, and the limits that bound it. */
+  knockOns?: { refrozen: number }; /** #6722: pages this run left large or embed_skip (chunked, keyword-searchable) and their embedding state. */ size_states?: import('../core/page-embedding-budget.ts').SyncSizeStates;
   status: 'up_to_date' | 'synced' | 'first_sync' | 'dry_run' | 'blocked_by_failures' | 'partial';
   fromCommit: string | null;
   toCommit: string;
@@ -47,7 +51,7 @@ export interface SyncResult {
    */
   malformedSkipped?: number;
   /** #5751: unchanged managed working-tree files skipped although a no-op publication cannot resolve their admit reason. */
-  legacySkips?: { contextualMode: number; canonicalBytes: number }; /** #5984: managed entries advanced without a write (DX-A7), and how a still-unfinished managed write's wait ended (DX-A3). */ waived?: { imports: number; deletes: number }; writeWait?: import('../core/persistence/sync-run.ts').ManagedSyncWriteWait;
+  legacySkips?: { contextualMode: number; canonicalBytes: number }; /** #5984: managed entries advanced without a write (DX-A7), and how a still-unfinished managed write's wait ended (DX-A3). */ waived?: { imports: number; deletes: number }; writeWait?: import('../core/persistence/sync-write-diagnostic.ts').ManagedSyncWriteWait;
   /** Managed sync: files skipped because another origin keeps their slug, and links derived after the checkpoint. */
   slugCollisions?: import('../core/persistence/sync-discovery.ts').SyncSlugCollision[];
   fileRefusals?: import('../core/persistence/sync-discovery.ts').SyncFileRefusal[]; links?: import('../core/persistence/links-maintenance.ts').ManagedLinkExtraction;
@@ -170,8 +174,12 @@ export interface SyncOpts {
    * Threaded through performSync AND syncOneSource so `sync --all` honors it.
    */
   noSchemaPack?: boolean;
+  /** #6696 (A7): server-only; the drain's first pass checks the run's estimated receipts against the capacity left before admitting. */
+  capacityPreflight?: boolean;
   /** Processing options this caller set; an unfinished managed cursor supplies the rest (unset = all explicit). */
   explicitProcessing?: Array<'noEmbed' | 'noExtract' | 'noSchemaPack'>;
+  /** #6696: a runtime paid-work constraint (the cost gate deferred this run's embedding); never a processing option, never lifted by cursor adoption. */
+  embedDeferred?: boolean;
   /**
    * v0.18.0 Step 5 — sync a specific named source. When set, sync reads
    * local_path + last_commit from the sources table (not the global
@@ -339,10 +347,10 @@ export interface SyncOpts {
   /**
    * #5984: managed sync only. Re-enter the single-pass managed sync until the
    * cursor is done, the caller's signal/deadline stops it, or it is blocked
-   * (src/core/persistence/sync-drain.ts). Set by the CLI; jobs and library
-   * callers keep the single-pass contract.
+   * (src/core/persistence/sync-drain.ts). Set by the CLI, serve and the `sync` job (#6706); others stay single-pass.
    */
   drain?: boolean;
+  /** #6706: absolute epoch ms a managed drain stops before (`resumable / deadline`). */ deadlineAtMs?: number;
   /** #5984: wall-clock ms the current drain started; managed cursors measure their rate from it. */
   drainStartedAt?: number;
   /** #5984: `--no-bulk`; and the drain's resolved bulk settings (internal; absent = one request per pass step). */ noBulk?: boolean; bulk?: import('../core/persistence/sync-group.ts').BulkSettings;

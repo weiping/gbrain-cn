@@ -110,6 +110,7 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'embedding_provider',
   // #5691: query-instruction advisory for instruction-style embedding models.
   'embedding_query_prefix',
+  'embedding_state',
   'embedding_width_consistency',
   'embeddings',
   'entity_link_coverage',
@@ -118,6 +119,8 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   // #6325: managed atom origins held after repeated extraction failures.
   'extract_atoms_held_failed',
   'extract_health',
+  // Large pages A7: page extractions that read only part of their input.
+  'extraction_input_truncated',
   'facts_embedding_width_consistency',
   'facts_extraction_health',
   'facts_health',
@@ -135,6 +138,8 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'extraction_date_grounding',
   'hidden_by_search_policy',
   'image_assets',
+  // #6529: image pages without an image vector, apart from text coverage (plus NULL source_path and held images).
+  'image_embedding_coverage',
   'integrity',
   'jsonb_integrity',
   // #4222 — near-empty entity pages that accreted huge edge counts (junk
@@ -149,6 +154,7 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'orphan_ratio',
   'oversized_pages',
   'parked_effects',
+  'partial_embedding',
   'pglite_scratch_probe',
   'quarantined_pages',
   'raw_provenance',
@@ -184,6 +190,8 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   // #5254 — pages written database-only to a source with no canonical owner.
   'unbound_source',
   'undeclared_db_only_pages',
+  // #6696 B5: live pages whose canonical file is missing on the owner host (doctor/checks/ghost-pages.ts).
+  'ghost_pages',
   'unified_multimodal_coverage',
   'unverified_extractions',
   'voice_gate_health',
@@ -220,6 +228,8 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'chat_fallback_chain',
   // Agent operator wave: is an agent harness wired to this brain (registration read; --only adds the smoke test).
   'harness_wiring',
+  // Cat 41: the provider-use decision gbrain setup recorded; declined = no provider request (discovery, probe).
+  'provider_consent',
   'frontmatter_hook',
   // F4b: PGLite row-delta planner statistics / Postgres autovacuum ANALYZE lag on the hot tables.
   'planner_stats_stale',
@@ -255,6 +265,8 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'oauth_confidential_client_health',
   'orphan_clones',
   'persistence_capacity',
+  'persistence_compaction',
+  'persistence_counter_drift',
   'worktree_refresh_stuck',
   'managed_guard_schema_drift',
   'publication_refusals',
@@ -262,15 +274,21 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'persistence_request_indexes',
   'persistence_write_stall',
   'lost_caller_writes',
+  // #6650: terminal write receipts that block work or are a gbrain-defect class (doctor/checks/persistence-requests.ts).
+  'persistence_terminal_failures',
   'stale_frontmatter_keys',
+  'maintenance_write_drift',
   'managed_sync_not_moving',
   'persistence_session_timeouts',
   // #6317: consumer heartbeat rows and host identity (doctor/checks/persistence-consumers.ts).
   'two_consumers_on_host',
   'consumers_without_heartbeat',
   'host_identity_mismatch',
+  // #6696 C6: a live serve or worker on an older build than this checkout (doctor/checks/persistence-consumers.ts).
+  'serve_build_drift',
   'stale_embedding_effects',
   'vector_plan',
+  'keyword_plan',
   'writer_version',
   'pgbouncer_prepare',
   'pglite_data_dir',

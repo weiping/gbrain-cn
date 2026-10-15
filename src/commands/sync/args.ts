@@ -86,7 +86,9 @@ Options:
                        and screen errors separately (screen_skipped).
   --skip-failed        Legacy sync only: acknowledge previously-recorded
                        sync failures so the bookmark can advance. Held files
-                       never need it; managed sync refuses it.
+                       never need it; a managed source refuses it
+                       (managed_sync_flag_refused), as it does
+                       --include-gitignored.
   --acknowledge-managed <request_id|path>
                        Managed sync, owner host only: remove a recorded
                        failure (for example a --full run's) that the imported
@@ -94,14 +96,18 @@ Options:
   --retry-failed       Re-attempt previously-failed files; clear on success.
                        Not needed for held files, which re-screen on the next
                        sync when they change (or with 'gbrain sources
-                       retry-held <id>').
+                       retry-held <id>'). On a managed source, failures held
+                       under another run's options are listed with the action
+                       that settles each: a replay or fresh discovery under
+                       their options, the orphan repair, or what is unresolved.
   --reset-checkpoint   Connector source only: re-walk its window once from an empty
                        checkpoint; unchanged pages are not admitted again.
   --watch              Re-sync continuously on an interval.
   --interval N         Watch-mode interval in seconds (default 60).
-  --no-pull            Skip 'git pull' before the sync. Required on managed
-                       brains: 'gbrain sources refresh <id>' moves the
-                       checkout, and sync catches the index up to it.
+  --no-pull            Skip 'git pull' before the sync. Implied on managed
+                       brains, which never pull during sync: 'gbrain sources
+                       refresh <id>' moves the checkout, and sync catches the
+                       index up to it.
   --no-bulk            Managed Postgres sync: publish one page per transaction
                        instead of bulk groups (each page keeps its own write
                        request either way). Persist with

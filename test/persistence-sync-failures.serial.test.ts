@@ -268,7 +268,7 @@ test('managed failure retry hints name the failed cursor options locally, shell-
     const d = await fixture(engine, { 'note.md': 'A stable discovery observation.\n' });
     const execute = engine.executeRaw;
     engine.executeRaw = function (this: BrainEngine, sql: string, params?: unknown[]) {
-      if (sql.includes('SELECT id,slug,source_path,knowledge_revision FROM pages') && params?.[0] === d.id) throw new OperationError('storage_error', 'Synthetic discovery failure');
+      if (sql.includes('SELECT id,slug,source_path,knowledge_revision,deleted_at FROM pages') && params?.[0] === d.id) throw new OperationError('storage_error', 'Synthetic discovery failure');
       return execute.call(this, sql, params);
     } as BrainEngine['executeRaw'];
     let thrown: Error | undefined;
@@ -312,7 +312,7 @@ test('checkpoint, discovery, and freeze failures remain diagnosable without a fi
     const d = await fixture(engine, { 'note.md': 'A stable discovery observation.\n' });
     const execute = engine.executeRaw;
     engine.executeRaw = function (this: BrainEngine, sql: string, params?: unknown[]) {
-      if (sql.includes('SELECT id,slug,source_path,knowledge_revision FROM pages') && params?.[0] === d.id) throw new OperationError('storage_error', 'Synthetic discovery failure');
+      if (sql.includes('SELECT id,slug,source_path,knowledge_revision,deleted_at FROM pages') && params?.[0] === d.id) throw new OperationError('storage_error', 'Synthetic discovery failure');
       return execute.call(this, sql, params);
     } as BrainEngine['executeRaw'];
     try {
@@ -346,12 +346,16 @@ test('explicit retry leaves a frozen terminal cursor untouched while queued work
       topologyGeneration: row.topology_generation, principal: row.authority.principal, authority: row.authority,
       callerIntent: { ...row.intent, runId: 'another-active-run' }, intent: { ...row.intent, runId: 'another-active-run' } });
     writeFileSync(join(f.root, 'bad.md'), 'Repaired useful source content.\n'); commit(f.root);
-    expect(await performManagedSync(engine, { ...options, retryFailed: true })).toEqual(blocked);
+    // #6643: the retry no longer returns the old blocked result silently; it waits, naming the request it waits for.
+    const waiting = (state: string, recovery: boolean) => ({ status: 'partial', reason: 'writer_pending', runId: blocked.runId,
+      retryWait: { request_id: active.request_id, slug: row.slug, state, recovery } });
+    expect(await performManagedSync(engine, { ...options, retryFailed: true })).toMatchObject(waiting('queued', false));
     expect((await engine.executeRaw<{ run: string }>("SELECT completed_keys->0->>'runId' AS run FROM op_checkpoints WHERE op='managed-sync' AND completed_keys->0->>'sourceId'=$1", [f.id]))[0].run).toBe(blocked.runId!);
     const claimed = await claimNextWrite(engine, localHostId()); expect(claimed?.id).toBe(active.id);
-    expect(await performManagedSync(engine, { ...options, retryFailed: true })).toEqual(blocked);
+    expect(await performManagedSync(engine, { ...options, retryFailed: true })).toMatchObject(waiting('running', false));
     await markRecovering(engine, claimed!, 'Synthetic recovering fixture');
-    expect(await performManagedSync(engine, { ...options, retryFailed: true })).toEqual(blocked);
+    expect(await performManagedSync(engine, { ...options, retryFailed: true })).toMatchObject(waiting('recovering', false));
+    expect((await engine.executeRaw<{ run: string }>("SELECT completed_keys->0->>'runId' AS run FROM op_checkpoints WHERE op='managed-sync' AND completed_keys->0->>'sourceId'=$1", [f.id]))[0].run).toBe(blocked.runId!);
     await engine.transaction(tx => completeWrite(tx, claimed!, 'cancelled', {}, { code: 'storage_error', message: 'Fixture cleanup' }));
     expect((await performManagedSync(engine, { ...options, retryFailed: true })).status).toBe('first_sync');
   }

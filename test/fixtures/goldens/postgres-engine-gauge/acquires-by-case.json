@@ -91,6 +91,12 @@
     "getCallersOf#chunkId": {},
     "getCallersOf#default": {},
     "getCallersOf#sourceId": {},
+    "getChunkPage#default": {
+      "raw": 1
+    },
+    "getChunkPage#sourceIds+excludePrivate": {
+      "raw": 1
+    },
     "getChunkWindows#default": {},
     "getChunkWindows#scopedPrivateSafe": {},
     "getChunks#default": {
@@ -193,6 +199,12 @@
     "listCorpusSample#seed": {
       "tx": 1
     },
+    "listEmbeddingStateRows#default": {
+      "raw": 1
+    },
+    "listEmbeddingStateRows#sourceIds": {
+      "raw": 1
+    },
     "listEnrichCandidates#default": {},
     "listEnrichCandidates#sourceId": {},
     "listEnrichCandidates#sourceIds+reenrich": {},
@@ -277,6 +289,15 @@
       "raw": 4,
       "tx": 1
     },
+    "readEmbeddingStateCounts#full": {
+      "raw": 1
+    },
+    "readEmbeddingStateCounts#full+sourceIds": {
+      "raw": 1
+    },
+    "readEmbeddingStateCounts#ops": {
+      "raw": 1
+    },
     "readPageSnapshot#default": {},
     "readPageSnapshot#sourceId": {},
     "readPageSnapshotsBatch#default": {},
@@ -315,17 +336,19 @@
     "revertToVersion#default": {},
     "revertToVersion#sourceId": {},
     "searchKeyword#cjk": {
-      "raw": 2,
+      "raw": 3,
       "tx": 1
     },
     "searchKeyword#cjk+sourceIds+detailLow": {
-      "raw": 2,
+      "raw": 3,
       "tx": 1
     },
     "searchKeywordChunks#cjk": {
+      "raw": 1,
       "tx": 1
     },
     "searchKeywordChunks#cjk+sourceId": {
+      "raw": 1,
       "tx": 1
     },
     "searchTakes#default": {},
