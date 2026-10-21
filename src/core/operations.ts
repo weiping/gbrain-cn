@@ -89,6 +89,7 @@ import { usageOperations } from './ops/usage.ts';
 import { filesOperations } from './ops/files.ts';
 import { jobsOperations } from './ops/jobs.ts';
 import { orphansOperations } from './ops/orphans.ts';
+import { graphRankOperations } from './ops/graph-rank.ts';
 import { calibrationOperations } from './ops/calibration.ts';
 import { salienceOperations } from './ops/salience.ts';
 
@@ -121,7 +122,9 @@ import { entityIdentityOperations } from './ops/entity-identity.ts';
 import { requestToolsOperations } from './ops/request-tools.ts';
 import { noticesOperations } from './ops/notices.ts';
 import { pageEditOperations } from './ops/page-edit.ts';
+import { pageAppendOperations } from './ops/page-append.ts';
 import { pageBatchOperations } from './ops/page-batch.ts';
+import { pageUploadOperations } from './ops/page-upload.ts';
 import { feedbackOperations } from './ops/feedback.ts';
 import { trustOperations } from './ops/trust.ts';
 
@@ -141,7 +144,7 @@ export const operations: Operation[] = [
   ...verbOperations,
   // Page CRUD (get_page, put_page, delete_page, list_pages + the v0.26.5
   // destructive-guard ops restore_page, purge_deleted_pages) — ops/pages.ts
-  ...pagesOperations, ...pageEditOperations, ...pageBatchOperations,
+  ...pagesOperations, ...pageEditOperations, ...pageAppendOperations, ...pageBatchOperations, ...pageUploadOperations,
   ...persistenceOperations,
   // Search (search, query) — ops/search.ts
   ...searchOperations,
@@ -178,8 +181,8 @@ export const operations: Operation[] = [
   // get_job_progress, pause_job, resume_job, replay_job, send_job_message)
   // + v0.38 Slice 3 agent lane (submit_agent, get_agent_job) — ops/jobs.ts
   ...jobsOperations,
-  // Orphans (find_orphans) — ops/orphans.ts
-  ...orphansOperations,
+  // Orphans (find_orphans) — ops/orphans.ts; rank_entities — ops/graph-rank.ts
+  ...orphansOperations, ...graphRankOperations,
   // v0.36.1.0 (T7) — Hindsight calibration wave (get_calibration_profile) —
   // ops/calibration.ts
   ...calibrationOperations,

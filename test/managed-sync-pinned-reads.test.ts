@@ -31,6 +31,7 @@ import { performSync } from '../src/commands/sync/perform.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { __setPinnedWindowForTests } from '../src/core/persistence/sync-blobs.ts';
 import { syncGitTopLevel } from '../src/core/persistence/sync-prepare.ts';
+import { pinnedBlob } from '../src/core/persistence/sync-screen.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { PAGE_MAX_BYTES } from '../src/core/page-size-policy.ts';
 
@@ -101,19 +102,24 @@ const VOLATILE = new Set(['id', 'created_at', 'updated_at', 'snapshot_at', 'last
   'principal_id', 'revision_principal_id', 'write_principal_id', 'last_write_principal_id', 'archived_principal_id', 'knowledge_revision', 'text_projection_revision',
   'revision', 'expected_revision', 'salience_touched_at', 'last_retrieved_at', 'links_extracted_at', 'emotional_weight_recomputed_at', 'embedding',
   'embedding_image', 'embedding_multimodal', 'edges_backfilled_at', 'search_vector', 'content_hash', 'revision_write_request_id', 'coordination_path',
-  'lastAt', 'startedAt']);
+  'lastAt', 'startedAt', 'duration_ms', 'timings_ms']);
+
+const FOLD_BASE_IDS = new Set(['.intent.stamp.fold.base.xmin', '.intent.stamp.fold.base.snapshot', '.intent.stamp.fold.base.own']);
 
 /** Every page-derived row the sync wrote, with ids, times, UUIDs and the checkout path replaced by labels. */
 async function dump(e: BrainEngine, root: string): Promise<Record<string, string[]>> {
   const pages = await e.executeRaw<{ id: number; slug: string }>('SELECT id,slug FROM pages WHERE source_id=$1', [SOURCE]);
   const slugOf = new Map(pages.map(p => [Number(p.id), p.slug]));
-  const norm = (value: unknown, key = ''): unknown => {
+  const norm = (value: unknown, key = '', path = ''): unknown => {
     if (value === null || value === undefined) return null;
     if (value instanceof Date) return '<time>';
-    if (Array.isArray(value)) return value.map(v => norm(v, key));
+    // #6712 PR 4b: a folded stamp records the Postgres snapshot it read its base under (its xmin, the snapshot and its own
+    // transaction id, GBRA-108), transaction ids as run-specific as a UUID.
+    if (FOLD_BASE_IDS.has(path)) return `<${key}>`;
+    if (Array.isArray(value)) return value.map(v => norm(v, key, path));
     if (typeof value === 'object') {
       return Object.fromEntries(Object.entries(value as Record<string, unknown>).filter(([k]) => !VOLATILE.has(k)).sort(([a], [b]) => a < b ? -1 : 1)
-        .map(([k, v]) => [k, /(^|_)page_id$|^pageId$/.test(k) && v != null ? `page(${slugOf.get(Number(v)) ?? 'other'})` : norm(v, k)]));
+        .map(([k, v]) => [k, /(^|_)page_id$|^pageId$/.test(k) && v != null ? `page(${slugOf.get(Number(v)) ?? 'other'})` : norm(v, k, `${path}.${k}`)]));
     }
     if (typeof value === 'string') {
       const text = value.replaceAll(root, '<root>');
@@ -141,9 +147,10 @@ async function dump(e: BrainEngine, root: string): Promise<Record<string, string
         'outcome',r.outcome,'slug',r.slug,'page_id',r.page_id,'publication_started',r.publication_started,'compacted',r.compacted) AS r
       FROM persistence_requests r WHERE r.source_id=$1`),
     sources: await rows('SELECT to_jsonb(s) - ARRAY[\'last_sync_at\',\'newest_content_at\'] AS r FROM sources s WHERE id=$1'),
-    // A provenance record is keyed by page id, which Postgres bulk groups may assign in another order.
-    checkpoints: await rows(`SELECT jsonb_build_object('op',op,'fingerprint',regexp_replace(regexp_replace(fingerprint,'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}','<uuid>','g'),'[0-9a-f]{32,}','<key>','g'),
-        'page_id',CASE WHEN op='sync-import-provenance' THEN substring(fingerprint from ':([0-9]+)$')::integer END,'record',completed_keys) AS r
+    // A provenance record (and a #7130 sync deletion record, keyed by the bare page id) is keyed by page id, which Postgres
+    // bulk groups may assign in another order.
+    checkpoints: await rows(`SELECT jsonb_build_object('op',op,'fingerprint',regexp_replace(regexp_replace(CASE WHEN op='sync-delete-tombstone' THEN 'page:' || fingerprint ELSE fingerprint END,'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}','<uuid>','g'),'[0-9a-f]{32,}','<key>','g'),
+        'page_id',CASE WHEN op='sync-import-provenance' THEN substring(fingerprint from ':([0-9]+)$')::integer WHEN op='sync-delete-tombstone' THEN fingerprint::integer END,'record',completed_keys) AS r
       FROM op_checkpoints WHERE completed_keys::text LIKE '%' || $1 || '%' OR fingerprint LIKE '%' || $1 || '%'`)
       .then(list => list.map(row => row.replace(/("fingerprint":"[^"]*):\d+"(.*"page_id":"(page\([^)]*\))")/, '$1:$3"$2'))),
   };
@@ -289,6 +296,63 @@ for (const [backend, open] of backends) {
     expect(count(windowed[0]!.calls!, / rev-parse --show-toplevel$/)).toBeLessThan(imports / 2);
   }, 600_000);
 }
+
+/**
+ * #6712 PR 1 (the forced probes for the windowed bound): the discovery prescreen's `ls-tree` seeds the run's first
+ * pinned window, so a delta round over existing pages lists its pinned tree once; and the entries of one aligned block
+ * share a window whichever of them reaches its pinned read first (concurrent follower freezes finish in any order).
+ * Before: the prescreen listed the tree and the first freeze listed it again (2), and a follower whose freeze read first
+ * started the window at its own index, so the head missed it and listed it again (2).
+ */
+for (const [backend, open] of backends) {
+  test(`${backend}: a delta round over existing pages lists its pinned tree once (the prescreen seeds the window)`, async () => {
+    if (backend === 'postgres' && !process.env.DATABASE_URL) return;
+    const dir = join(home, `${backend}-seeded`), root = join(dir, 'repo');
+    mkdirSync(root, { recursive: true }); git(root, 'init', '-q');
+    const note = (i: number, body: string) => `---\ntitle: Seeded ${i}\ntype: note\n---\n${body}\n`;
+    write(root, { ...Object.fromEntries(Array.from({ length: 6 }, (_, i) => [`vault/notes/s${pad(i)}.md`, note(i, `A synthetic note ${i}.`)])), 'outside/readme.md': '# Not in the source\n' }); commit(root);
+    const sourceRoot = join(root, 'vault');
+    const { engine, close } = await open();
+    const counter = gitCounter(dir);
+    const restore = __setPinnedWindowForTests(null);
+    try {
+      await withEnv({ GBRAIN_HOME: join(dir, 'home'), PATH: counter.path }, async () => {
+        await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
+        await engine.executeRaw('INSERT INTO sources(id,name,local_path,config) VALUES($1,$1,$2,\'{}\')', [SOURCE, sourceRoot]);
+        await claimWorktree(engine, SOURCE, sourceRoot);
+        await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
+        expect((await performSync(engine, { sourceId: SOURCE, noPull: true, noEmbed: true, drain: true })).status).toBe('first_sync');
+        write(root, { ...Object.fromEntries([1, 2, 3].map(i => [`vault/notes/s${pad(i)}.md`, note(i, `An edited synthetic note ${i}.`)])), 'vault/notes/s006.md': note(6, 'A new synthetic note.') });
+        commit(root);
+        const before = counter.calls().length;
+        const delta = await performSync(engine, { sourceId: SOURCE, noPull: true, noEmbed: true, drain: true });
+        expect(delta).toMatchObject({ status: 'synced', added: 1, modified: 3 });
+        expect(counter.calls().slice(before).filter(call => / ls-tree -l /.test(call))).toHaveLength(1);
+        await disposePersistenceConsumer(engine);
+      });
+    } finally { restore(); await close(); }
+  }, 120_000);
+}
+
+test('the entries of one aligned block share a pinned window whichever of them reads first', async () => {
+  if (process.platform === 'win32') return;
+  const dir = join(home, 'block'), root = join(dir, 'repo');
+  mkdirSync(root, { recursive: true }); git(root, 'init', '-q');
+  write(root, { ...Object.fromEntries(Array.from({ length: 5 }, (_, i) => [`vault/notes/b${pad(i)}.md`, `---\ntitle: Block ${i}\n---\nBody ${i}.\n`])), 'outside/readme.md': '# Not in the source\n' }); commit(root);
+  const entries = Array.from({ length: 5 }, (_, i) => ({ path: `notes/b${pad(i)}.md`, sourcePath: `notes/b${pad(i)}.md`, action: 'import' as const, working: false }));
+  const cursor = { root: join(root, 'vault'), gitRoot: root, target: git(root, 'rev-parse', 'HEAD'), entries };
+  const counter = gitCounter(dir);
+  const restore = __setPinnedWindowForTests(null);
+  try {
+    await withEnv({ PATH: counter.path }, async () => {
+      // A follower (index 1) reaches its pinned read before the head (index 0), as concurrent follower freezes may.
+      expect(pinnedBlob({ ...cursor, index: 1 }, entries[1]!.path)).not.toBeNull();
+      expect(pinnedBlob({ ...cursor, index: 0 }, entries[0]!.path)).not.toBeNull();
+      expect(pinnedBlob({ ...cursor, index: 4 }, entries[4]!.path)).not.toBeNull();
+    });
+    expect(counter.calls().filter(call => / ls-tree -l /.test(call))).toHaveLength(1);
+  } finally { restore(); }
+});
 
 test('the Git top level is read once per root and run, and again when the checkout\'s .git changes', async () => {
   mkdirSync(join(home, 'top-level', 'a', 'b'), { recursive: true });

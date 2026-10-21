@@ -9,8 +9,9 @@ import type { SearchOpts } from '../types.ts';
 import { clampSearchLimit } from '../engine.ts';
 import { searchLimitCap } from './eval-pool-depth.ts';
 import { getFtsLanguage } from '../fts-language.ts';
-import { requiresSafeChunks } from './safe-chunks.ts';
+import { chunkGenerationFilter, requiresSafeChunks } from './safe-chunks.ts';
 import { normalizeAlias } from './alias-normalize.ts';
+import { frontmatterWhereSql } from './frontmatter-where.ts';
 import { resolveBoostMap, resolveHardExcludes } from './source-boost.ts';
 import {
   boundWebsearchQuery,
@@ -27,6 +28,10 @@ export interface SearchTitlesDialect {
   relaxedPrefersIndex: boolean;
   /** Project `stale` from timeline_entries (PGLite); otherwise `false`. */
   staleProbe: boolean;
+  /** chunkManifestReads; unset reads the manifest. */
+  chunkManifest?: boolean;
+  /** The relaxed (OR) re-run: match and rank title lexemes only, for local callers too (#7135). */
+  relaxed?: boolean;
 }
 
 export interface SearchTitlesStatement {
@@ -58,8 +63,9 @@ export function buildSearchTitlesStatement(query: string, opts: SearchOpts | und
   // — safe to interpolate into raw SQL.
   const ftsLang = getFtsLanguage();
   const tsq = `websearch_to_tsquery('${ftsLang}', gbrain_fts_input($1))`;
-  const matchSql = safeChunks ? `p.search_vector @@ ${WEIGHT_A_QUERY(ftsLang)}` : `p.search_vector @@ ${tsq}`;
-  const rankSql = safeChunks ? `ts_rank_cd(ts_filter(p.search_vector, '{a}'), ${tsq})` : `ts_rank_cd(p.search_vector, ${tsq})`;
+  const titleOnly = safeChunks || dialect.relaxed === true;
+  const matchSql = titleOnly ? `p.search_vector @@ ${WEIGHT_A_QUERY(ftsLang)}` : `p.search_vector @@ ${tsq}`;
+  const rankSql = titleOnly ? `ts_rank_cd(ts_filter(p.search_vector, '{a}'), ${tsq})` : `ts_rank_cd(p.search_vector, ${tsq})`;
 
   const params: unknown[] = [boundWebsearchQuery(query), normalizeAlias(query), limit, offset];
   let filters = '';
@@ -71,6 +77,7 @@ export function buildSearchTitlesStatement(query: string, opts: SearchOpts | und
     params.push(opts.types);
     filters += ` AND p.type = ANY($${params.length}::text[])`;
   }
+  filters += frontmatterWhereSql('p', opts?.where, json => `$${params.push(json)}`);
   if (opts?.exclude_slugs?.length) {
     params.push(opts.exclude_slugs);
     filters += ` AND p.slug != ALL($${params.length}::text[])`;
@@ -107,7 +114,7 @@ export function buildSearchTitlesStatement(query: string, opts: SearchOpts | und
   const sql = `
     WITH top_pages AS (
       SELECT p.slug, p.id AS page_id, p.title, p.type, p.source_id,
-        p.effective_date, p.effective_date_source, p.updated_at,
+        p.effective_date, p.effective_date_source, p.updated_at, p.body_storage, p.body_generation,
         (lower(btrim(p.title, ' "''' || chr(160))) = $2) AS exact_title,
         ${rankSql} * ${sourceFactorCase} AS score
       FROM pages p
@@ -131,7 +138,7 @@ export function buildSearchTitlesStatement(query: string, opts: SearchOpts | und
     LEFT JOIN LATERAL (
       SELECT cc.id, cc.chunk_index, cc.chunk_text, cc.chunk_source
       FROM content_chunks cc
-      WHERE cc.page_id = tp.page_id
+      WHERE cc.page_id = tp.page_id AND ${chunkGenerationFilter('tp', 'cc', dialect.chunkManifest ?? true)}
         AND cc.modality = 'text'
         ${detailLow ? `AND cc.chunk_source = 'compiled_truth'` : ''}
       ORDER BY (cc.chunk_source = 'compiled_truth') DESC, cc.chunk_index ASC

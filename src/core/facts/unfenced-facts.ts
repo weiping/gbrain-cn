@@ -21,7 +21,8 @@
  * coordinator publishes database-only pages too; archived sources are
  * skipped) or the source has a `local_path` and the page's canonical file
  * exists on this host. Everything else is counted and left alone: a NULL
- * entity slug, a missing page or file, or a source without a checkout here.
+ * entity slug, a missing page or file, a source without a checkout here, or
+ * (unmanaged, #6946) a clone gbrain owns, whose checkout is never written.
  *
  * Adoption oracle (#6278, `adoptableClaim`): the fence codec trims a claim,
  * folds CRLF/CR to LF, reads `~~x~~` as a struck row and `<br>` as a line
@@ -51,7 +52,7 @@
  *   durability-hardened checkout commits the file.
  * A page that fails is reported in `failed_pages`; the others still fence.
  */
-import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 
 import type { BrainEngine } from '../engine.ts';
 import { sanitizeText } from '../batch-rows.ts';
@@ -63,12 +64,22 @@ import { assertSourceFilesystemActive, hasSourceFilesystemLock, withSourceFilesy
 import { withPageLock } from '../page-lock.ts';
 import { maintenanceTransaction } from '../persistence/attribution.ts';
 import { assertLifetimeIdHeadroom } from '../persistence/journal.ts';
-import { OperationError } from '../ops/contract.ts';
+import { OperationError, type OperationContext } from '../ops/contract.ts';
 import { managedPersistenceEnabled } from '../persistence/ownership.ts';
-import { maintenancePreflight, planFactFenceAdoption, submitPlannedFactFenceAdoption, type MaintenanceAuthority } from '../persistence/prepared-maintenance.ts';
+import { maintenancePreflight, planFactFenceAdoption, submitFactFenceAdoption, submitPlannedFactFenceAdoption, type MaintenanceAuthority } from '../persistence/prepared-maintenance.ts';
+import { resolveFactWriteTarget } from '../persistence/fact-write-target.ts';
+import { submissionAuthority } from '../persistence/authority.ts';
+import { currentVerifiedLocalWriter, registerLocalWriter } from '../persistence/identity.ts';
+import { assertPersistenceAccepting } from '../persistence/service.ts';
+import type { WriteAuthority } from '../persistence/model.ts';
+import { UNBOUND_WRITE_KEY } from '../persistence/unbound-source.ts';
 import { contentHash } from '../utils.ts';
-import { resolvePageWriteTarget } from '../write-through.ts';
+import { bodyUnread } from '../page-body/page-shape.ts';
+import { fileBodyMatchesStored, fileDatabaseDriftToken, mirrorFileBody, readStoredBody } from './file-body-guard.ts';
+import { isWriteThroughDisabled, resolvePageWriteTarget } from '../write-through.ts';
 import { commitFactFenceFile, gitPathState } from './fence-write.ts';
+import { isOwnedClone } from '../url-clone.ts';
+import { isSourceDbOnlySlug } from '../persistence/source-storage.ts';
 
 export interface UnfencedFactRow {
   id: string;
@@ -99,13 +110,21 @@ export interface UnfencedFactsOutcome {
   skipped_no_local_path: number;
   skipped_no_page: number;
   skipped_archived: number;
+  /** Unmanaged (#6946): rows of a clone gbrain owns (`sources add --url`), kept database-only so its checkout keeps fast-forwarding. */
+  skipped_url_clone: number;
   pages_touched: number;
   /** `<slug> (<reason>)` per page whose fence write failed; its rows stay unfenced. */
   failed_pages: string[];
   /** Slugs whose fence this run wrote. */
   fenced_slugs: string[];
-  /** Unmanaged: `<slug> (<reason>)` per live page whose canonical file is not on this host (counted in skipped_no_page). */
+  /** Unmanaged: `<slug> (<reason>)` per live page whose recorded canonical file is not on this host (counted in skipped_no_page). */
   missing_files: string[];
+  /**
+   * Unmanaged (#6610): database-only pages (no recorded origin, no file at the slug path) of a source with a checkout
+   * but no canonical owner, whose rows stay unfenced because `persistence.unbound_write` is not `database_only`.
+   * Their rows never gate the run (they are held out of reconciliation only); doctor `fence_integrity` names the opt-in.
+   */
+  unbound_refused: Array<{ source_id: string; slug: string; rows: number }>;
   /** Legacy rows this run left as they are because the fence codec would change them or the page already carries the claim (#6278). */
   unadoptable_rows: UnadoptableFactRecord[];
 }
@@ -206,6 +225,8 @@ export interface UnfencedFactsPlan {
   groups: Map<string, UnfencedFactRow[]>;
   /** Unmanaged: the canonical file per group key. */
   filePaths: Map<string, string>;
+  /** Unmanaged (#6610): groups whose page is database-only, fenced into its database body under this reason (null: a declared `storage.db_only` page, under the writer's own reason). */
+  databaseOnly: Map<string, NonNullable<WriteAuthority['databaseOnlyReason']> | null>;
   localPathById: Map<string, string | null>;
   outcome: UnfencedFactsOutcome;
 }
@@ -215,12 +236,44 @@ export function fenceableRowCount(plan: UnfencedFactsPlan): number {
   return [...plan.groups.values()].reduce((n, group) => n + group.length, 0);
 }
 
+/**
+ * #6610: where an unmanaged page with no canonical file on this host gets its fence. A page that records an origin
+ * (`source_path` or `source_uri`) has a file on some host: `missing`. A page with no recorded origin and no file at its
+ * slug path is database-only, and follows the fact writers' rule (`resolveFactWriteTarget`, #6608): fenced into its
+ * database body when that write is database-only (`fence`), `refused` when the source has a checkout but no owner and
+ * `persistence.unbound_write` is not `database_only`; a bound source, or one PGLite would claim, stays `missing`.
+ */
+async function databaseOnlyPlacement(engine: BrainEngine, sourceId: string, slug: string):
+  Promise<{ kind: 'fence'; reason: NonNullable<WriteAuthority['databaseOnlyReason']> } | { kind: 'refused' } | { kind: 'missing' }> {
+  const [page] = await engine.executeRaw<{ source_path: string | null; source_uri: string | null }>(
+    'SELECT source_path, source_uri FROM pages WHERE source_id=$1 AND slug=$2 AND deleted_at IS NULL', [sourceId, slug]);
+  if (!page || page.source_path?.trim() || page.source_uri?.trim()) return { kind: 'missing' };
+  const [source] = await engine.executeRaw<{ local_path: string | null; kind: string | null }>(
+    "SELECT local_path, config->>'kind' AS kind FROM sources WHERE id=$1", [sourceId]);
+  try {
+    const target = await resolveFactWriteTarget(engine, sourceId, source!, { fileBacked: false, remote: false });
+    return target.kind === 'publish' && !target.binding ? { kind: 'fence', reason: target.databaseOnlyReason ?? 'no_repo_configured' } : { kind: 'missing' };
+  } catch (error) {
+    if (error instanceof OperationError && error.detail === 'unbound_source') return { kind: 'refused' };
+    throw error;
+  }
+}
+
+/** `<slug> (<source>): N row(s)` per page the unbound-source policy keeps unfenced, and the opt-in that fences them. */
+export function unboundRefusedSentence(pages: UnfencedFactsOutcome['unbound_refused']): string {
+  return `${pages.reduce((n, page) => n + page.rows, 0)} unfenced fact row(s) on ${pages.length} database-only page(s) of a source with a checkout but no canonical owner stay unfenced: `
+    + `${pages.slice(0, 5).map(page => `${page.slug} (${page.source_id}): ${page.rows} row(s)`).join('; ')}${pages.length > 5 ? '; …' : ''}. `
+    + `They stay active and searchable and those pages skip destructive fact reconciliation. To fence them into the database page, the user can allow database-only writes to unbound sources `
+    + `with gbrain config set ${UNBOUND_WRITE_KEY} database_only (a brain-wide choice: such pages stay database-only after binding).`;
+}
+
 /** Read the unfenced active rows of one source (or every source) and group the fenceable ones per page. */
 export async function planUnfencedFacts(engine: BrainEngine, opts: { sourceId?: string } = {}): Promise<UnfencedFactsPlan> {
   const managed = await managedPersistenceEnabled(engine);
-  const sources = await engine.executeRaw<{ id: string; local_path: string | null; archived?: boolean }>(
-    'SELECT id, local_path, archived FROM sources',
+  const sources = await engine.executeRaw<{ id: string; local_path: string | null; archived?: boolean; config: unknown }>(
+    'SELECT id, local_path, archived, config FROM sources',
   );
+  const urlClones = new Set(managed ? [] : sources.filter(isOwnedClone).map(s => s.id));
   const localPathById = new Map(sources.map(s => [s.id, s.local_path] as const));
   const archived = new Set(sources.filter(s => s.archived).map(s => s.id));
   const rows = await engine.executeRaw<UnfencedFactRow>(
@@ -237,7 +290,7 @@ export async function planUnfencedFacts(engine: BrainEngine, opts: { sourceId?: 
   );
   const outcome: UnfencedFactsOutcome = {
     scanned: rows.length, fenced: 0, skipped_no_entity: 0, skipped_no_local_path: 0, skipped_no_page: 0,
-    skipped_archived: 0, pages_touched: 0, failed_pages: [], fenced_slugs: [], missing_files: [], unadoptable_rows: [],
+    skipped_archived: 0, skipped_url_clone: 0, pages_touched: 0, failed_pages: [], fenced_slugs: [], missing_files: [], unbound_refused: [], unadoptable_rows: [],
   };
   const groups = new Map<string, UnfencedFactRow[]>();
   for (const row of rows) {
@@ -245,24 +298,34 @@ export async function planUnfencedFacts(engine: BrainEngine, opts: { sourceId?: 
     // A managed brain publishes through the source's maintenance authority,
     // which an archived source does not grant; it never blocks the others.
     if (managed && archived.has(row.source_id)) { outcome.skipped_archived += 1; continue; }
+    if (urlClones.has(row.source_id)) { outcome.skipped_url_clone += 1; continue; }
     if (!localPathById.get(row.source_id) && !managed) { outcome.skipped_no_local_path += 1; continue; }
     if (!row.page_exists) { outcome.skipped_no_page += 1; continue; }
     const key = `${row.source_id}\0${row.entity_slug}`;
     groups.set(key, [...groups.get(key) ?? [], row]);
   }
   const filePaths = new Map<string, string>();
+  const databaseOnly = new Map<string, NonNullable<WriteAuthority['databaseOnlyReason']> | null>();
+  const writeThroughOff = !managed && await isWriteThroughDisabled(engine);
   for (const [key, group] of managed ? [] : [...groups]) {
     const [sourceId, entitySlug] = key.split('\0');
     const target = await resolvePageWriteTarget(engine, entitySlug, sourceId);
-    if (!target.ok || !existsSync(target.filePath)) {
-      outcome.skipped_no_page += group.length;
-      outcome.missing_files.push(`${entitySlug} (${target.ok ? `canonical file ${target.filePath} does not exist on this host` : `no canonical file: ${target.skipped}`})`);
-      groups.delete(key);
+    if (target.ok && existsSync(target.filePath)) {
+      if (writeThroughOff) databaseOnly.set(key, 'disabled_by_config');
+      else filePaths.set(key, target.filePath);
       continue;
     }
-    filePaths.set(key, target.filePath);
+    // A declared storage.db_only page is canonical in the database; its missing file is by design, not a fault.
+    const root = localPathById.get(sourceId);
+    if (root && isSourceDbOnlySlug(root, entitySlug, 'not_db_only')) { databaseOnly.set(key, null); continue; }
+    const placement = await databaseOnlyPlacement(engine, sourceId, entitySlug);
+    if (placement.kind === 'fence') { databaseOnly.set(key, placement.reason); continue; }
+    groups.delete(key);
+    if (placement.kind === 'refused') { outcome.unbound_refused.push({ source_id: sourceId, slug: entitySlug, rows: group.length }); continue; }
+    outcome.skipped_no_page += group.length;
+    outcome.missing_files.push(`${entitySlug} (${target.ok ? `canonical file ${target.filePath} does not exist on this host; the page records it, so the cycle on the host that holds the file fences these rows` : `no canonical file: ${target.skipped}`})`);
   }
-  return { managed, groups, filePaths, localPathById, outcome };
+  return { managed, groups, filePaths, databaseOnly, localPathById, outcome };
 }
 
 /**
@@ -457,14 +520,65 @@ async function fenceManaged(engine: BrainEngine, plan: UnfencedFactsPlan): Promi
   }
 }
 
-/** One unmanaged page: file first (atomic), then the page mirror and row stamps in one maintenance transaction. */
+/**
+ * #6610: one unmanaged database-only page, fenced into its database body through the coordinator as one
+ * `managed_maintenance_adopt_fact_fence` request with no file target, the publication path `remember` uses for the
+ * same page (#6608): the receipt, page version and projection follow, and an `unbound_source` write rechecks at
+ * publication that the source is still unbound and the page still has no canonical file.
+ */
+async function fenceDatabaseOnlyPage(engine: BrainEngine, sourceId: string, entitySlug: string, reason: NonNullable<WriteAuthority['databaseOnlyReason']> | null,
+  group: UnfencedFactRow[], outcome: UnfencedFactsOutcome): Promise<void> {
+  try {
+    const snapshot = await engine.readPageSnapshot(entitySlug, { sourceId });
+    if (!snapshot) { outcome.skipped_no_page += group.length; return; }
+    const fence = await planFence(engine, sourceId, entitySlug, serializePageToMarkdown(snapshot.page, snapshot.tags), group);
+    if ('warnings' in fence) { outcome.failed_pages.push(`${entitySlug} (${fence.warnings.join('; ')})`); return; }
+    recordUnadoptable(outcome, entitySlug, fence.rejected);
+    if (fence.assignments.length === 0) return;
+    assertPersistenceAccepting(engine);
+    if (!currentVerifiedLocalWriter()) await registerLocalWriter(engine, 'cli');
+    const [source] = await engine.executeRaw<{ incarnation: string }>('SELECT incarnation FROM sources WHERE id=$1', [sourceId]);
+    const writer = await submissionAuthority({ engine, remote: false, sourceId } as OperationContext, 'submit_job', sourceId, source!.incarnation, 'maintenance');
+    if (reason) writer.databaseOnlyReason = reason;
+    await submitFactFenceAdoption(engine, { writer, binding: null }, entitySlug, { content: fence.body, expectedRevision: snapshot.revision,
+      assignments: fence.assignments.map(a => ({ id: Number(a.id), row_num: a.row_num })), file: false });
+    outcome.fenced += fence.assignments.length;
+    outcome.pages_touched += 1;
+    outcome.fenced_slugs.push(entitySlug);
+  } catch (err) {
+    outcome.failed_pages.push(`${entitySlug} (${err instanceof Error ? err.message : String(err)})`);
+  }
+}
+
+/**
+ * One unmanaged page (#6982): the fence is planned on the file only when the file and the database body agree
+ * (`fileMatchesSnapshot`, the coordinator's drift comparison), so mirroring the fenced file back can only add the fence.
+ * The page row is then locked and re-read in a maintenance transaction: when the database or the file moved since the
+ * comparison, nothing is written. Otherwise the prior body is kept in page_versions, the body is mirrored, the rows are
+ * stamped, and the `.tmp` is renamed into place last, so a rolled-back transaction leaves the file as it was.
+ */
+/** Thrown inside the fence transaction when the file changed after the mirror, so the mirror and row stamps roll back. */
+class FileChangedDuringFence extends Error {}
+
 async function fenceFilePage(engine: BrainEngine, sourceId: string, entitySlug: string, filePath: string,
   group: UnfencedFactRow[], outcome: UnfencedFactsOutcome, lockRoot?: string): Promise<void> {
   const target = await resolvePageWriteTarget(engine, entitySlug, sourceId);
   if (!target.ok) { outcome.skipped_no_page += group.length; return; }
   const { writeRoot } = target;
   const write = () => withPageLock(entitySlug, async () => {
-    const fence = await planFence(engine, sourceId, entitySlug, readFileSync(filePath, 'utf-8'), group);
+    const bytes = readFileSync(filePath, 'utf-8');
+    const page = await engine.getPage(entitySlug, { sourceId });
+    const stored = page && await readStoredBody(engine, sourceId, entitySlug);
+    if (!page || !stored) { outcome.skipped_no_page += group.length; return; }
+    if (bodyUnread(page)) {
+      outcome.failed_pages.push(`${entitySlug} (page_body_segmented: the page is stored in segments, so its file is not compared or rewritten here; its rows stay unfenced, active and searchable)`);
+      return;
+    }
+    if (!fileBodyMatchesStored(bytes, entitySlug, stored)) {
+      outcome.failed_pages.push(fileDatabaseDriftToken(entitySlug, sourceId, 'before'));
+      return;
+    }
+    const fence = await planFence(engine, sourceId, entitySlug, bytes, group);
     if ('warnings' in fence) {
       outcome.failed_pages.push(`${entitySlug} (${fence.warnings.join('; ')})`);
       return;
@@ -483,17 +597,10 @@ async function fenceFilePage(engine: BrainEngine, sourceId: string, entitySlug: 
       outcome.failed_pages.push(`${entitySlug} (${parsed.warnings.join('; ')})`);
       return;
     }
-    renameSync(tmpPath, filePath);
     // Mirror the file into pages so this run's reconcile and get_page read the
-    // new fence (same body-only mirror as fence-write.ts: the row keeps its
-    // content_hash, so the next sync re-imports and re-chunks the page).
-    const reparsed = parseMarkdown(tmpBody, `${entitySlug}.md`);
-    await maintenanceTransaction(engine, async tx => {
-      const existing = await tx.getPage(entitySlug, { sourceId });
-      if (existing) {
-        await tx.refreshPageBody(entitySlug, sourceId, sanitizeText(reparsed.compiled_truth), sanitizeText(reparsed.timeline),
-          existing.content_hash || contentHash(existing));
-      }
+    // new fence (same body-only mirror as fence-write.ts).
+    const written = await maintenanceTransaction(engine, async tx => {
+      if (readFileSync(filePath, 'utf-8') !== bytes || !await mirrorFileBody(tx, sourceId, entitySlug, tmpBody, stored)) return false;
       // The parsed claim is what the fence projects; the row keeps its id,
       // vectors and provenance (the reconcile would retire a row whose text
       // differs from its fence row).
@@ -504,7 +611,16 @@ async function fenceFilePage(engine: BrainEngine, sourceId: string, entitySlug: 
           [a.row_num, entitySlug, a.id, sourceId, a.fact],
         );
       }
-    });
+      assertSourceFilesystemActive();
+      if (readFileSync(filePath, 'utf-8') !== bytes) throw new FileChangedDuringFence();
+      renameSync(tmpPath, filePath);
+      return true;
+    }).catch(error => { if (error instanceof FileChangedDuringFence) return false; throw error; });
+    if (!written) {
+      rmSync(tmpPath, { force: true });
+      outcome.failed_pages.push(fileDatabaseDriftToken(entitySlug, sourceId, 'during'));
+      return;
+    }
     if (durable) await commitFactFenceFile(writeRoot, filePath, entitySlug, sourceId, prewrite);
     outcome.fenced += fence.assignments.length;
     outcome.pages_touched += 1;
@@ -531,7 +647,7 @@ export async function auditUnadoptableFacts(engine: BrainEngine, plan: UnfencedF
     if (opts.deadline !== undefined && Date.now() > opts.deadline) return { records, complete: false };
     const [sourceId, entitySlug] = key.split('\0');
     let body: string;
-    if (plan.managed) {
+    if (plan.managed || plan.databaseOnly.has(key)) {
       const snapshot = await engine.readPageSnapshot(entitySlug, { sourceId });
       if (!snapshot) continue;
       body = serializePageToMarkdown(snapshot.page, snapshot.tags);
@@ -558,7 +674,8 @@ export async function fenceUnfencedFacts(engine: BrainEngine, plan: UnfencedFact
   }
   for (const [key, group] of plan.groups) {
     const [sourceId, entitySlug] = key.split('\0');
-    await fenceFilePage(engine, sourceId, entitySlug, plan.filePaths.get(key)!, group, plan.outcome, opts.pageLockRoot);
+    if (plan.databaseOnly.has(key)) await fenceDatabaseOnlyPage(engine, sourceId, entitySlug, plan.databaseOnly.get(key)!, group, plan.outcome);
+    else await fenceFilePage(engine, sourceId, entitySlug, plan.filePaths.get(key)!, group, plan.outcome, opts.pageLockRoot);
   }
   return plan.outcome;
 }

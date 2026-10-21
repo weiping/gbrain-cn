@@ -16,8 +16,10 @@
  * Import-cycle note: operations.ts spreads these into its `operations` array
  * at MODULE-EVAL time, so this file must be a RUNTIME LEAF — it may import
  * operations.ts types (erased) but never its values statically. Handlers load
- * verbError/parseTtlParam/sourceScopeOpts via dynamic import (the file's
- * existing style), which resolves after both modules finish evaluating.
+ * verbError/parseTtlParam/sourceScopeOpts via dynamic import from the ops
+ * modules that define them (never the whole operations.ts registry, which a
+ * one-shot CLI call would otherwise evaluate in full, #7147); the import
+ * resolves after both modules finish evaluating.
  * MEMORY_VERBS_VERSION lives HERE (operations.ts imports it from us) for the
  * same reason. Violating this reintroduces the TDZ crash on whichever module
  * evaluates second.
@@ -109,7 +111,7 @@ const remember: Operation = {
   verb: true,
   annotations: { title: 'remember (memory write)', idempotentHint: true },
   handler: async (ctx, p) => {
-    const { verbError, parseTtlParam } = await import('./operations.ts');
+    const [{ verbError }, { parseTtlParam }] = await Promise.all([import('./ops/contract.ts'), import('./ops/facts.ts')]);
     if (p.items !== undefined) {
       const { runRememberBatch } = await import('./remember-batch.ts');
       return runRememberBatch(ctx, p, remember.handler, (code, message, suggestion) => verbError(code as never, message, suggestion));
@@ -194,7 +196,8 @@ const remember: Operation = {
 
     const { submitRememberMutation } = await import('./persistence/memory-mutations.ts');
     const { runMemoryWrite } = await import('./persistence/verb-errors.ts');
-    const result = await runMemoryWrite(() => submitRememberMutation(ctx, { ...p, fact, provenance, kind, visibility, ...(replaces !== undefined ? { replaces } : {}) }));
+    const result = await runMemoryWrite(() => submitRememberMutation(ctx, { ...p, fact, provenance, kind, visibility, ...(replaces !== undefined ? { replaces } : {}) },
+      undefined, { visibilityDefaulted: typeof p.visibility !== 'string' }));
     // F8: the explanation the CLI formatter prints, as a model-visible notice.
     if ((result as { degraded_dedup?: boolean } | null)?.degraded_dedup) {
       const { degradedDedupNotice } = await import('./interop-notices.ts');
@@ -221,12 +224,22 @@ const entity: Operation = {
   params: {
     name: { type: 'string', description: 'Name, alias or slug.' },
     names: { type: 'array', items: { type: 'string' }, description: 'Or up to 50 names/codes at once: compact rows.' },
+    source_id: { type: 'string', description: 'Read only this source. Default: your source first, then every source you can read.', fullSurfaceOnly: true },
+    prefer_source_id: { type: 'string', description: 'Source to try first (thin clients send .gbrain-source here); never narrows.', fullSurfaceOnly: true },
+    variants: { type: 'boolean', description: 'false: exact names only. Default true: with no exact match, one unambiguous name variant (card.match says which).', fullSurfaceOnly: true },
   },
   scope: 'read',
   verb: true,
   annotations: { title: 'entity (card lookup, zero LLM)', readOnlyHint: true },
   handler: async (ctx, p) => {
-    const { verbError } = await import('./operations.ts');
+    const { verbError } = await import('./ops/contract.ts');
+    // #6723: resolve across the caller's readable sources (home first) unless source_id pins one.
+    const { ambientMissNotice, entitySources } = await import('./verbs/entity-source.ts');
+    const walk = await entitySources(ctx, p, 'entity');
+    const ambientMiss = (misses: Array<{ name: string; foundIn?: string }>) => {
+      const notice = ambientMissNotice('entity', walk, misses.filter(m => m.foundIn !== walk.ambient?.sourceId));
+      if (notice) ctx.emitNotice?.(notice);
+    };
     if (p.names !== undefined) {
       const { ENTITY_NAMES_MAX, lookupEntityNames } = await import('./verbs/entity-names.ts');
       const names = Array.isArray(p.names) ? p.names.filter((n): n is string => typeof n === 'string' && n.trim() !== '') : [];
@@ -235,8 +248,9 @@ const entity: Operation = {
           `Pass either name: "Alice Example" for one full card, or names: ["Alice Example", "WGCO"] (up to ${ENTITY_NAMES_MAX}) for compact rows.`);
       }
       const t0 = Date.now();
-      const out = await lookupEntityNames(ctx.engine, ctx.sourceId ?? 'default', names, { remote: ctx.remote !== false, surfaceCeiling: ctx.surfaceCeiling,
+      const out = await lookupEntityNames(ctx.engine, walk.home, names, { remote: ctx.remote !== false, sources: walk.sources, surfaceCeiling: ctx.surfaceCeiling, variants: p.variants !== false,
         emitNotice: n => ctx.emitNotice?.(n) });
+      ambientMiss(out.results.map(r => ({ name: r.name, ...(r.found ? { foundIn: r.source_id } : {}) })));
       return { protocol_version: 1, latency_ms: Date.now() - t0, ...out };
     }
     const name = typeof p.name === 'string' ? p.name.trim() : '';
@@ -249,8 +263,8 @@ const entity: Operation = {
     }
     const t0 = Date.now();
     const { buildEntityCard } = await import('./verbs/entity-card.ts');
-    const result = await buildEntityCard(ctx.engine, ctx.sourceId ?? 'default', name, {
-      remote: ctx.remote !== false, includeReferences: true, surfaceCeiling: ctx.surfaceCeiling,
+    const result = await buildEntityCard(ctx.engine, walk.home, name, {
+      remote: ctx.remote !== false, includeReferences: true, surfaceCeiling: ctx.surfaceCeiling, sources: walk.sources, variants: p.variants !== false,
       omitQuarantined: ctx.remote !== false, // #5575: like get_page, a remote reader never gets a quarantined page's card
       emitNotice: n => ctx.emitNotice?.(n),
     });
@@ -260,6 +274,7 @@ const entity: Operation = {
       const notice = mentionCoverageNotice(coverage, result.card?.entity.type);
       if (notice) ctx.emitNotice?.(notice);
     }
+    ambientMiss([{ name, ...(result.source_id ? { foundIn: result.source_id } : {}) }]);
     if (result.card?.identity_siblings?.capped) {
       const { siblingsCappedNotice } = await import('./verbs/entity-card-identity.ts');
       ctx.emitNotice?.(siblingsCappedNotice(result.card.entity.slug));
@@ -271,6 +286,8 @@ const entity: Operation = {
       ...(result.card ? { card: result.card } : {}),
       ...(result.suggestions !== undefined ? { suggestions: result.suggestions } : {}),
       ...(!result.card && result.coverage ? { coverage: result.coverage } : {}),
+      ...(result.text_mentions ? { text_mentions: result.text_mentions } : {}),
+      ...(result.ambiguous ? { ambiguous: true } : {}),
     };
   },
   cliHints: { name: 'entity', positional: ['name'] },
@@ -305,7 +322,7 @@ const synthesize: Operation = {
   verb: true,
   annotations: { title: 'synthesize (slow, costly — LLM-backed)', readOnlyHint: true },
   handler: async (ctx, p) => {
-    const { verbError, sourceScopeOpts } = await import('./operations.ts');
+    const [{ verbError }, { sourceScopeOpts }] = await Promise.all([import('./ops/contract.ts'), import('./ops/context.ts')]);
     const question = typeof p.question === 'string' ? p.question.trim() : '';
     if (!question) {
       throw verbError(
@@ -316,7 +333,7 @@ const synthesize: Operation = {
     }
     const scope = sourceScopeOpts(ctx);
     const { runThink } = await import('./think/index.ts');
-    const { embedQuery } = await import('./embedding.ts');
+    const { embedQueryWithPrefix } = await import('./search/query-prefix.ts');
     // Remote-safe delegation: save/take are NEVER offered through this verb,
     // for any caller — the verb is a pure read.
     const result = await runThink(ctx.engine, {
@@ -329,7 +346,7 @@ const synthesize: Operation = {
       // Fail-closed: only a context that explicitly says local gets local.
       remote: ctx.remote !== false,
       // #3734: activate takes' vector retrieval arm for the synthesize verb.
-      embedQuestion: (q) => embedQuery(q),
+      embedQuestion: (q) => embedQueryWithPrefix(ctx.engine, q),
     });
 
     // [c10] runThink degrades gracefully to a no-LLM stub RESULT; the protocol
@@ -442,7 +459,7 @@ const forget: Operation = {
   verb: true,
   annotations: { title: 'forget (expire a fact)', destructiveHint: true, idempotentHint: true },
   handler: async (ctx, p) => {
-    const { verbError } = await import('./operations.ts');
+    const { verbError } = await import('./ops/contract.ts');
     const rawId = typeof p.id === 'string' ? p.id.trim() : typeof p.id === 'number' ? String(p.id) : '';
     const numericId = Number(rawId);
     if (!rawId || !Number.isInteger(numericId) || numericId <= 0) {
@@ -581,6 +598,15 @@ export const RESPONSE_SCHEMAS: Record<VerbName, Record<string, unknown>> = {
           unembedded: { type: 'integer', description: 'Facts in scope without a comparable embedding (ranked by word overlap only).' },
         },
       },
+      facts_calibration: {
+        type: 'object',
+        description: 'Informational, present when question ranking used semantic matching on an embedding model whose fact admission floors were never measured: a short facts list is weaker evidence of "nothing matched". Never replaces facts_degraded.',
+        required: ['status', 'model_key'],
+        properties: {
+          status: { type: 'string', enum: ['unmeasured'] },
+          model_key: { type: 'string', description: 'provider:model@dims, the key doctor fact_admission_floors reports.' },
+        },
+      },
       results: {
         type: 'array',
         description: 'Search arm — present only when `query` was passed.',
@@ -650,7 +676,11 @@ export const RESPONSE_SCHEMAS: Record<VerbName, Record<string, unknown>> = {
           entity: {
             type: 'object',
             required: ['slug', 'title', 'type'],
-            properties: { slug: { type: 'string' }, title: { type: 'string' }, type: { type: ['string', 'null'] } },
+            properties: {
+              slug: { type: 'string' }, title: { type: 'string' }, type: { type: ['string', 'null'] },
+              // #6723 — ADDITIVE OPTIONAL: (source_id, slug) is the entity's identity.
+              source_id: { type: 'string' },
+            },
           },
           aka: { type: 'array', items: { type: 'string' } },
           summary: { type: 'string' },
@@ -735,6 +765,7 @@ export const RESPONSE_SCHEMAS: Record<VerbName, Record<string, unknown>> = {
             slug: { type: 'string' },
             title: { type: 'string' },
             create_safety: { type: 'string', enum: CREATE_SAFETY_ENUM },
+            source_id: { type: 'string' },
           },
         },
       },
@@ -822,6 +853,8 @@ export const RESPONSE_SCHEMAS: Record<VerbName, Record<string, unknown>> = {
           required: ['slug', 'title', 'summary', 'open_threads'],
           properties: {
             slug: { type: 'string' },
+            // #6723 — ADDITIVE OPTIONAL: the card page's source; (source_id, slug) is the entity's identity.
+            source_id: { type: 'string' },
             title: { type: 'string' },
             type: { type: ['string', 'null'] },
             summary: { type: 'string' },
@@ -904,6 +937,29 @@ export const RESPONSE_SCHEMAS: Record<VerbName, Record<string, unknown>> = {
             confidence: { type: 'number' },
             fact_id: { type: 'string', description: 'Opaque protocol id — the value forget accepts.' },
             provenance: { type: ['string', 'null'], description: 'The stored source attribution (remember --provenance).' },
+          },
+        },
+      },
+      // #6724 — ADDITIVE OPTIONAL: the packed entities' own facts, keyed to their card's (source_id, slug); `facts` stays hot memory.
+      entity_facts: {
+        type: 'array',
+        items: {
+          type: 'object',
+          required: ['source_id', 'slug', 'fact_id', 'fact', 'kind'],
+          properties: {
+            source_id: { type: 'string' },
+            slug: { type: 'string', description: 'The card this fact is about.' },
+            fact_id: { type: 'string', description: 'Opaque protocol id — the value forget accepts.' },
+            fact: { type: 'string' },
+            kind: { type: 'string' },
+            entity_slug: { type: ['string', 'null'] },
+            valid_from: { type: 'string' },
+            context: { type: ['string', 'null'] },
+            confidence: { type: 'number' },
+            attributed_to: { type: ['string', 'null'] },
+            provenance: { type: ['string', 'null'], description: 'The stored source attribution (remember --provenance).' },
+            trust_tier: { type: 'string' },
+            origin: { type: 'string' },
           },
         },
       },

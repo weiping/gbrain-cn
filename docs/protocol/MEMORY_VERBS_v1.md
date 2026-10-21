@@ -188,6 +188,7 @@ Response — an additive SUPERSET of the plain facts envelope on EVERY call
 | `facts_order` | string | `relevance` (question passed) or `newest` |
 | `facts[].relevance` | number? | question calls only: the ranking score (about 0 to 2.1); not a probability and not comparable across calls |
 | `facts_degraded` | object? | question calls only: `reason` (`keyword_only_no_embedding_provider`, `keyword_only_embedding_disabled`, `embed_timeout`, `embed_unavailable`, `no_query_terms`, `facts_embedding_column_missing`) and `unembedded` (facts in scope without a comparable embedding; the `facts_unembedded` notice carries the `gbrain embed --stale --facts` preview) |
+| `facts_calibration` | object? | question calls only, informational (additive since #6590): present when semantic matching ranked the facts on an embedding model whose fact admission floors were never measured; `status` (`unmeasured`) and `model_key` (`provider:model@dims`, the key doctor `fact_admission_floors` reports). A short or empty `facts[]` is then weaker evidence of "nothing matched". It never replaces `facts_degraded`; one `facts_calibration_unmeasured` notice (kind `info`) per brain per session explains it |
 | `budget_tokens` / `budget_used` / `dropped_count` | int? | present for a positive finite numeric budget, including when its floor is zero |
 | `budget_packing` | object? | present only when a valid `budget_policy` is supplied; effective policy and per-arm accounting |
 
@@ -288,7 +289,10 @@ Save ONE fact with mandatory attribution.
   (local CLI reads only; session hooks push world facts only, so a private
   fact never reaches a new agent session, and a local private save carries the
   `private_fact_not_pushed` notice saying so). The init quickstart carries the
-  consent line.
+  consent line. An omitted `visibility` saves `private` when the target page is
+  private (by `visibility` or a privacy alias such as `access: private`) or the
+  operator set `facts.default_visibility` to private; a save never lands wider
+  than the page it is written into.
 
 Response: `{ id, status, status_text, entity_slug, valid_until,
 protocol_version }` (+ `degraded_dedup: true` when no embedding provider —
@@ -536,6 +540,32 @@ verbatim name-like lines from the remote-sanitized body, 600 characters per
 page and 1,200 per card, `identity_excerpt_omitted[]`); `alias_guidance`
 (`{ text, requires_surface? }`). `recent_facts[]` (`{ id, fact, kind, valid_from, entity_slug? }`, the 5 newest active saved facts, also those saved under an identity sibling or the bare subject slug, which carry that `entity_slug`); `active_fact_count` and `recall {entity}` cover the same slugs.
 
+#### entity source resolution and `source_id` (additive)
+
+Without `source_id`, `name` and each of `names` resolve across every source
+the caller can read: the home source first (the connection's source, or the
+ambient GBRAIN_SOURCE / .gbrain-source binding), then the other readable
+sources sorted by id, so one brain always resolves a name the same way. The
+first source with a hit owns the card, and every read behind it (aliases,
+facts, edges, references, identity) uses that source; sources outside the
+caller's grant are never read and look like a miss. A remote `__all__` names
+no source and still resolves nothing.
+
+`source_id` (one readable source) pins the lookup. A pin outside the grant,
+for a removed source or with a malformed id is refused with recall's selector
+errors: `scope_denied`, `not_found`, `invalid_params`. `prefer_source_id`
+reorders the walk without narrowing it (thin clients send their
+.gbrain-source there). When the ambient binding's source has no match, a
+`source_binding_narrowed` notice names where each name resolved.
+The starter MCP tool list does not advertise `source_id`, `prefer_source_id`
+or `context_pack`'s `entity_refs` (it keeps the list inside its size budget);
+the full surface does, and every surface accepts them.
+
+Every card carries `card.entity.source_id`, every `names` row `source_id`,
+and each suggestion its `source_id`: `(source_id, slug)` is the entity's
+identity, and two pages sharing a slug in two sources are two entities. A
+row's `next` names `source_id` when the page is outside the home source.
+
 #### entity open_threads loop backing (additive)
 
 On brains running the open-loop engine, `open_threads` entries may
@@ -556,7 +586,10 @@ pending-decision loops — the ADDITIVE-FOREVER optional fields disambiguate:
 
 All five are absent on threads not backed by a loop row and on servers that
 do not implement them; a server that omits them still certifies. Same propagation to the
-per-entity cards and top-level `open_threads` of `context_pack`.
+per-entity cards and top-level `open_threads` of `context_pack`. Loop rows carry
+no visibility or source grant of their own, so only the trusted local caller's
+cards derive threads from them (`entity`, and `context_pack` / `delta` with
+`include_private`); a remote caller's card has no loop-backed entries.
 - `edges`: top ~10 typed edges, mentions excluded, out-edges first, live relationships first. Additive fields: `status` (`live`, `ended`, `ended_unknown_date`, `event`, …), `since` / `until` (latest stint). `relationship_note` (additive) summarizes current and ended relationships and flags a summary that still names an ended one ([temporal edges](../guides/temporal-edges.md)).
 - The p99 < 100ms promise is op-layer latency (transport excluded), CI-gated
   on a 20K-page corpus. 200K validation recipe below.
@@ -872,14 +905,43 @@ synced to a cloud model). `include_private` widens ALL arms in
 lockstep, and is honored ONLY for trusted-local callers (`remote === false`); a
 remote caller never widens (fail-closed).
 
-Response: `{ protocol_version, entities, cards[], open_threads[], facts[], text,
+Response: `{ protocol_version, entities, cards[], open_threads[], facts[], entity_facts[], text,
 degraded_reason?, budget_tokens?, budget_used?, dropped_count?, core?, pinned_questions?, withheld?, brief? }`. `text` is the
 envelope-wrapped injectable block, rendered from the packed sets within `budget_tokens`.
 
-`entities` scopes cards and threads, not the hot facts (the session's recent
+`entities` scopes cards, threads and `entity_facts`, not the hot facts (the session's recent
 memory), so other facts can appear; `recall` with `entity` reads one entity
 strictly. `facts[]` here and in `delta` carry `fact_id` (what `forget` takes)
 and `provenance` (the stored source), never rendered into `text`.
+
+#### context_pack sources: `source_id`, `entity_refs` (additive)
+
+`entities` resolve like `entity` names: across the caller's readable sources,
+home first then by id, unless `source_id` pins one (same selector errors;
+`prefer_source_id` reorders only). `entity_refs`
+(`[{"source_id": "wiki", "slug": "people/alice-example"}]`, inside the same cap
+of 8 after `entities`) packs source-qualified entities, each read only in its
+own source and checked like a pin. Every card carries `source_id`; a card
+from outside the home source renders as `slug` (source <id>) in `text`, and
+its newer-mention continuation names the source. Each card's activation
+verdict, newer mentions, records and `page_status` come from its own source,
+never from a same-slug page in another source, and cards are deduplicated by
+`(source_id, slug)`. `pinned_questions` carries a published pin only when its
+source and `scope_entity` match an accepted card's `(source_id, slug)`.
+
+#### context_pack entity_facts (additive)
+
+`entity_facts[]` holds the packed entities' own facts: up to 5 per card, newest
+first, read in the card's own source with the card's visibility (world-only
+unless a trusted-local caller passed `include_private`) and eligibility. Each
+row is `{ source_id, slug, fact_id, fact, kind, entity_slug, valid_from?,
+context, confidence, attributed_to, provenance, trust_tier?, origin? }`, where
+`(source_id, slug)` names the card. `facts[]` is unchanged hot memory, so a
+fact can appear in both arrays. `text` renders entity facts under `## Entity
+facts (about the standing entities)` before hot memory, and a fact in both
+renders once, there. Under `budget_tokens` entity facts pack after cards and
+before hot facts, leave with a dropped card (counted in `dropped_count`), and
+a hot fact already shown as an entity fact costs nothing.
 
 #### context_pack records (additive)
 
@@ -946,12 +1008,17 @@ A name resolves only on the alias or title arm at ≥ 0.8, to a person or compan
 page, never through a common word. An unresolved name returns
 `reason: "counterparty_unresolved"` and no items; an invalid `intent` is
 `invalid_params`. Items are open loops (`L<id>`, trusted-local callers only;
-remote callers get `withheld_arms: ["loops"]`) and the newest dated fact
-(`F<id>`). Visibility follows the `include_private` rule above, with
-private-provenance facts excluded unless widened. The same assembler serves
+remote callers get `withheld_arms: ["loops"]`), the newest dated fact
+(`F<id>`), and the counterparty page's newest dated edit (`kind: "edit"`: the
+lines a revision added, `Ev<page version id>`, or a timeline entry,
+`Et<timeline entry id>`), dropped when it repeats a fact or loop of the same
+brief. Visibility follows the `include_private` rule above, with
+private-provenance facts excluded unless widened; an edit's page (and a
+timeline entry's event page) follows the same page rule, and facts and takes
+fence rows never count as an edit. The same assembler serves
 the off-by-default hook push ([push context](../guides/push-context.md)).
 
-### delta(since?, since_slug?, cursor?, entities?, budget_tokens?, session_id?, include_private?) — read, zero LLM
+### delta(since?, since_slug?, cursor?, entities?, budget_tokens?, session_id?, include_private?, beliefs?) — read, zero LLM
 
 "What changed since T" for heartbeats — pages updated after
 the cursor (oldest first) + facts recorded after the cursor + open-thread
@@ -1022,6 +1089,32 @@ are still returned and `budget_used` (the token estimate of `text`) reports the
 real rendered size, which then exceeds the budget. `since` is always
 normalized ISO (never the raw input string). Replay recipe:
 [ambient recall guide](../guides/ambient-recall.md#replay-after-a-degraded-wake).
+
+**Belief changes (`beliefs: true`, full surface only).** Adds `beliefs`: each
+belief that ended the window different from how it started, read from the
+belief ledger for the same window as the wake (`since` to the wake's horizon).
+`{ source_id, since, until, coverage_from, changes[], truncated, not_recorded? }`;
+each change is `{ kind, slug, change, subject, before, after, before_known,
+upper_bound?, cause, evidence: { event_id, recorded_at, slug, row? }, trust_tier }`.
+An edit and its revert in the window report nothing. `before_known: false`
+means the earlier value is unknown (no body answers at `since`), never that
+it was empty; `upper_bound: true` marks a relationship end the nightly check
+inferred, so it ended on or before that date. `coverage_from` is set when the
+ledger starts after `since` (earlier changes are unknown, not absent), and
+`not_recorded` when the source has no ledger coverage. `entities` narrows the
+list to changes on or about the named slugs. A caller without
+`include_private` (every remote caller) gets the world view: events that were
+world-visible when recorded, on pages visible now, and takes of the holders
+the caller may read (the takes surfaces' allow-list, `world` by default).
+Under `budget_tokens` the belief lines pack into what pages, facts and threads
+leave, and `truncated` reports a cut; `text` gains a
+`## Belief changes since <since>` section. The diff is a read of the window,
+not a cursor arm: it does not set `has_more` or hold a `session_id` cursor,
+so lines a cut dropped are not delivered on the next wake; read them with an
+explicit `since` (or `gbrain beliefs changes`). `min_trust` does not filter
+it; each change carries its `trust_tier`. The
+CLI twin is `gbrain beliefs changes [<entity>...] [--since 7d]`. Design:
+[BELIEF_LEDGER.md section 15](../designs/BELIEF_LEDGER.md#15-w4-as-built-the-weekly-change-diff).
 
 ## Latency classes (per verb)
 

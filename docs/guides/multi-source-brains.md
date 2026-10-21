@@ -157,6 +157,12 @@ gbrain links people/alice-example --all-sources --json      # every source
 gbrain graph people/alice-example --depth 2 --all-sources
 ```
 
+Each call returns at most 500 rows (`--limit N`, up to 5000), merged across
+sources and identity members in link order before the cut. When more match, the
+last row carries `truncated: true` and `next_cursor`; continue with
+`--cursor <next_cursor>` and the same flags, or pass `--all` to page through
+every row.
+
 `get_links` keeps working as an alias of `links`. Passing `--source` together
 with `--source-id` or `--all-sources` is an error. A source that does not exist
 or is archived answers `unknown_source`; a remote agent naming a source outside
@@ -191,7 +197,17 @@ predate unknown-parameter warnings cannot be detected; upgrade the host first.
 
 The most-used subcommands (run `gbrain sources --help` for the full,
 always-current reference — it also covers `status`, `current`,
-`set-cr-mode`, and the `push`/`pull` durability surface):
+`set-cr-mode`, and the `push`/`pull` durability surface).
+
+Changing the contextual retrieval mode, per source with `gbrain sources
+set-cr-mode <id> <mode>` or brain-wide with `gbrain config set
+search.contextual_retrieval <mode>`, does not restamp existing pages: each
+keeps the mode recorded when it was imported, and the new mode applies to
+pages imported from then on. Both commands print this after the write, with
+`gbrain repair contextual-mode [--source <id>] --apply` for pages that have no
+recorded mode (preview it first without `--apply`; see
+[repair](repair.md)).
+
 
 ```
 gbrain sources add <id> --path <p> [--name <n>] [--federated|--no-federated] [--force]
@@ -380,7 +396,7 @@ rewrites it on the next import. No command is needed.
 files, for example `~/vault/notes/people/alice-example.md` and
 `~/vault/notes/notes/people/alice-example.md`, sync refuses instead of
 guessing. Rename or move one of the two files, commit, then run
-`gbrain sync --source vault-notes --no-pull --retry-failed`. The other
+`gbrain sync --source vault-notes --no-pull`. The other
 refusal reasons are listed in [write refusal reasons](write-refusals.md).
 
 ## Citation format for agents
@@ -473,7 +489,11 @@ What hardening guarantees:
   dirty file is one the pull must change; then it changes nothing and its
   notice names the files. `gbrain sources set-pull-strategy <id> <rebase|merge>`
   is still accepted and recorded, but both strategies now integrate by merge,
-  because the shared tree is never rebased.
+  because the shared tree is never rebased. A force-pushed upstream is never
+  merged: `gbrain sync` reports `upstream_rewritten` and, after the user
+  agrees, `gbrain sources reset-upstream <id> --expect-local <sha> --expect-upstream <sha>`
+  moves the checkout to the new upstream and keeps the old history under a
+  backup ref ([upstream rewritten](troubleshooting.md#upstream-rewritten)).
 - **Push is never deferred.** `scripts/brain-commit-push.sh "<msg>" <path>`
   delegates to `gbrain git commit-push`: it takes the checkout's writer lock,
   commits only the named paths, merges a rejected push in memory, and refuses

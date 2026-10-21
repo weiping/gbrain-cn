@@ -67,7 +67,7 @@ import type { ProgressReporter } from '../progress.ts';
 import { chat as gatewayChat, withBudgetTracker, isAvailable } from '../ai/gateway.ts';
 import { createGlobalLlmHaltTracker, haltedClassOf, providerContentBlockReason, type GlobalLlmErrorClass } from '../ai/errors.ts';
 import { importFromContent } from '../import-file.ts';
-import { derivedWriteThrough } from './derived-write-through.ts';
+import { derivedWriteThrough, reportFileHolds } from './derived-write-through.ts';
 import { serializeMarkdown } from '../markdown.ts';
 import { DEFAULT_EXTRACT_MAX_INPUT_CHARS, extractAtomsInput, inputTruncatedLine, recordPartialDisposition, releasePartialDispositions, resolveExtractAtomsInputCap, stampTranscriptTombstone, type ExtractAtomsInput, type ExtractAtomsItem } from './extract-atoms-input.ts';
 import { commitExtractionPlan, readPageWatermark } from '../extraction-watermark.ts';
@@ -82,14 +82,16 @@ import { abortableSleep } from '../retry.ts';
 import { throwIfAborted } from '../abort-check.ts';
 import { createHash } from 'crypto';
 import { slugifySegment } from '../sync.ts';
-import { resolveTierDefault } from '../model-config.ts';
-import { isUndefinedTableError, warnOncePerProcess } from '../utils.ts';
+import { resolveAlias, resolveTierDefault } from '../model-config.ts';
+import { isMissingSchemaObject, warnOncePerProcess } from '../utils.ts';
 import { utcDate } from './cycle-date.ts';
+import { atomSourceDate } from './atom-source-date.ts';
 import { normalizeForGrounding } from './synthesize-verify.ts';
 import type { TranscriptPageIndex } from '../transcripts/discover.ts';
 import { managedAtomSession, readAtomOrigin, resumeManagedAtoms, publishManagedAtoms, MANAGED_ATOM_DISCOVERY_SQL, type AtomOrigin } from '../persistence/atom-maintenance.ts';
 import { effectiveVisibility } from '../search/private-visibility.ts';
 import { OperationError } from '../ops/contract.ts';
+import { isOpPageSlug } from '../ops/context.ts';
 import type { WriteReceipt } from '../persistence/types.ts';
 import { acceptedPendingReceipt } from '../persistence/accepted-pending.ts';
 import { AtomPageStateError, completeAtomReceipts, MAX_DETERMINISTIC_FAILURES, readAtomPageIdentity, writeAtomPageState, type AtomPageInput } from './extract-atoms-page-state.ts';
@@ -635,7 +637,7 @@ export async function tombstonedTranscriptsForHashes(
     );
     return new Set(rows.map(r => transcriptStateKey(r.file_path, r.content_hash)));
   } catch (err) {
-    if (isUndefinedTableError(err)) {
+    if (isMissingSchemaObject(err, 'table', 'extract_atoms_transcript_state')) {
       // Un-migrated brain: the table lands with v146. Once per process, not a
       // full error line on every cycle until the operator migrates.
       warnOncePerProcess('extract_atoms.transcript_state_missing',
@@ -648,33 +650,31 @@ export async function tombstonedTranscriptsForHashes(
   }
 }
 
+export const EXTRACT_ATOMS_MODEL_KEY = 'models.dream.extract_atoms';
+
 /**
- * The exact two-step model resolution `runPhaseExtractAtoms` uses:
- * `models.dream.extract_atoms` DB config wins if set (same plain-`||`
- * truthiness as always — a whitespace-only value IS "configured"), else the
- * key-aware `resolveTierDefault('utility')`. Deliberately NOT
- * `resolveModel()`'s fuller chain (which also honors `models.tier.utility`,
- * `models.default`, and an env var) — extract_atoms has never read those, and
- * unifying the two behaviors is a separate, larger change. Exported so
- * `gbrain models` can report the actual routing instead of a generic chain
- * that can diverge from it in partially-configured installs; `source` comes
- * from the SAME call as `model` so the report's attribution can never
- * disagree with the resolved value. Fail-soft: a throwing config read routes
- * to the tier default (the same end state runPhaseExtractAtoms's config-read
- * try/catch has always produced).
+ * The model resolution `runPhaseExtractAtoms` uses, shared with the
+ * `gbrain models` row so the two cannot diverge (`source` and `label` come
+ * from the SAME call as `model`). Chain (#6675, decision D3 option B):
+ * `models.dream.extract_atoms` > `models.tier.utility` > the key-aware
+ * `resolveTierDefault('utility')`. `models.default` and `GBRAIN_MODEL` are
+ * deliberately skipped: a frontier generic default must not become the model
+ * of the highest-volume dream phase (its cost cap prices the utility tier).
+ * Values are trimmed and alias-resolved like `resolveModelDetailed`'s steps.
+ * Fail-soft: a throwing config read routes to the tier default.
  */
 export async function resolveExtractAtomsModelWithSource(
   engine: BrainEngine,
-): Promise<{ model: string; source: 'config' | 'tier_default' }> {
-  let configuredModel: string | null = null;
+): Promise<{ model: string; source: 'config' | 'tier_config' | 'tier_default'; label?: string }> {
   try {
-    configuredModel = await engine.getConfig('models.dream.extract_atoms');
+    const own = (await engine.getConfig(EXTRACT_ATOMS_MODEL_KEY))?.trim();
+    if (own) return { model: await resolveAlias(engine, own), source: 'config', label: `config: ${EXTRACT_ATOMS_MODEL_KEY}` };
+    const tier = (await engine.getConfig('models.tier.utility'))?.trim();
+    if (tier) return { model: await resolveAlias(engine, tier), source: 'tier_config', label: 'config: models.tier.utility' };
   } catch {
     // Fail-soft — fall through to the tier default.
   }
-  return configuredModel
-    ? { model: configuredModel, source: 'config' }
-    : { model: resolveTierDefault('utility'), source: 'tier_default' };
+  return { model: resolveTierDefault('utility'), source: 'tier_default' };
 }
 
 /** String-returning wrapper for runtime callers (`runPhaseExtractAtoms`). */
@@ -862,7 +862,7 @@ export async function runPhaseExtractAtoms(
 
   // Phase-level no-op: nothing to extract today.
   if (work.length === 0 && transcripts.length === 0 && pages.length === 0) {
-    return {
+    return reportFileHolds({
       phase: 'extract_atoms',
       status: 'skipped',
       duration_ms: 0,
@@ -882,7 +882,7 @@ export async function runPhaseExtractAtoms(
         budget_usd: DEFAULT_BUDGET_USD,
         dry_run: opts.dryRun ?? false,
       },
-    };
+    }, atomFiles?.held, 'atom');
   }
 
   // 4. Per work-item: extract atoms via the configured extract_atoms model
@@ -1036,7 +1036,7 @@ export async function runPhaseExtractAtoms(
         // A strike that never lands means this transcript never tombstones and
         // re-spends budget forever (#4916's class) — say so. A missing table
         // was already warned once by the tombstone check above.
-        if (!isUndefinedTableError(err)) {
+        if (!isMissingSchemaObject(err, 'table', 'extract_atoms_transcript_state')) {
           console.error(`[extract_atoms] transcript failure-count write failed for ${item.filePath}: ${err instanceof Error ? err.message : String(err)}`);
         }
         return null;
@@ -1088,8 +1088,10 @@ export async function runPhaseExtractAtoms(
     const { promptContent, truncated } = input;
     try {
       const origin: AtomOrigin | null = managed ? { ...await readAtomOrigin(engine, managed, item), ...(truncated ? { partialInputChars: maxInputChars } : {}) } : null;
+      const sourcePage = item.kind === 'page' ? await engine.getPage(item.slug, { sourceId }) : null;
+      const contentDate = await atomSourceDate(engine, sourcePage); // #6720: captured with the input, before inference
       const visibility = origin?.visibility ?? effectiveVisibility(item.kind === 'transcript' ? { kind: 'transcript' } // #5525
-        : { kind: 'page', page: await engine.getPage(item.slug, { sourceId }) });
+        : { kind: 'page', page: sourcePage });
       throwIfAborted(opts.signal, 'extract_atoms');
       const resumed = !opts.dryRun && managed && origin ? await resumeManagedAtoms(engine, managed, origin) : 'run';
       if (resumed === 'done') { duplicatesSkipped++; continue; }
@@ -1175,7 +1177,6 @@ export async function runPhaseExtractAtoms(
         // write below). Page-kind items only — transcripts are files, not
         // pages, so there is no from-endpoint to link.
         const provenanceLinks: LinkBatchInput[] = [];
-        const sourcePage = item.kind === 'page' ? await engine.getPage(item.slug, { sourceId }) : null;
         const undatedDate = sourcePage?.created_at ? utcDate(new Date(sourcePage.created_at)) : 'undated';
         for (const atom of atoms) {
           const srcRef = item.kind === 'transcript' ? item.filePath : item.slug;
@@ -1227,7 +1228,7 @@ export async function runPhaseExtractAtoms(
           const md = serializeMarkdown(
             {
               atom_type: atom.atom_type,
-              ...originFrontmatter,
+              ...originFrontmatter, ...(contentDate ? { date: contentDate } : {}),
               // Provisional until the whole item's atoms persist (see above).
               source_hash: `pending:${hash16}`,
               visibility, ...(origin ? { managed_extraction: true } : {}),
@@ -1301,7 +1302,7 @@ export async function runPhaseExtractAtoms(
         // #6503: a cut item keeps its atoms provisional (`pending:<hash>`, the upsert path when it runs
         // again), retires nothing and records its partial disposition instead of a completion stamp.
         const retired = truncated ? [] : await completeUnmanagedItem(engine, sourceId, item, hash16, importedSlugs);
-        await atomFiles?.(importedSlugs, retired);
+        await atomFiles?.write(importedSlugs, retired);
         if (truncated) await recordPartialDisposition(engine, sourceId, item, maxInputChars);
         else if (item.kind === 'page') await stampAtomsScanHash(item);
         await commitAtomsWatermark(item, input, []);
@@ -1407,7 +1408,7 @@ export async function runPhaseExtractAtoms(
     });
   }
 
-  return {
+  return reportFileHolds({
     phase: 'extract_atoms',
     // A phase that skipped every work item and produced nothing did not
     // succeed, even though skips are not failures and leave failures[] empty.
@@ -1454,7 +1455,7 @@ export async function runPhaseExtractAtoms(
       source_id: sourceId,
       dry_run: opts.dryRun ?? false,
     },
-  };
+  }, atomFiles?.held, 'atom');
 }
 
 /**
@@ -1509,10 +1510,12 @@ async function retireStaleAtoms(
  * same normalizer the FS-import path uses) and RE-STRIPS a trailing dash after
  * the 60-char truncation — the cut can land on a hyphen and re-introduce one.
  * Two writers disagreeing on that trailing dash (`…would` vs `…would-`) was the
- * "trailing-dash twin" duplicate bug.
+ * "trailing-dash twin" duplicate bug. #6804: leading dots are dropped too
+ * (`.example domains` → `example-domains`); slugifySegment keeps them and the
+ * page grammar (validatePageSlug) refuses a dot-led segment.
  */
 function atomSlugStem(title: string): string {
-  return slugifySegment(title).slice(0, 60).replace(/-+$/g, '') || 'untitled';
+  return slugifySegment(title).replace(/^[.-]+/, '').slice(0, 60).replace(/-+$/g, '') || 'untitled';
 }
 
 /**
@@ -1577,6 +1580,9 @@ function atomSlug(title: string, srcRef: string, sourcePageSlug?: string, undate
  *      live bound atoms once per run into `pageAtomTitles`; exactly one match
  *      on the JS-lowercased title (SQL LOWER() differs for some non-ASCII
  *      titles) is adopted, while zero or several mint the new-shape slug.
+ *      #6804: an atom an older build minted under a slug the page grammar
+ *      refuses (dot-led) is never adopted; the new slug lands and the
+ *      reconciliation retires the old atom.
  * Every read is scoped to the write's source (unscoped-check/scoped-write).
  */
 async function resolvePageAtomSlug(
@@ -1603,7 +1609,7 @@ async function resolvePageAtomSlug(
     for (const row of rows) titles.set(row.title.toLowerCase(), [...(titles.get(row.title.toLowerCase()) ?? []), row.slug]);
     pageAtomTitles.set(sourcePageSlug, titles);
   }
-  const variants = titles.get(title.toLowerCase()) ?? [];
+  const variants = (titles.get(title.toLowerCase()) ?? []).filter(isOpPageSlug);
   return variants.length === 1 ? variants[0]! : slug;
 }
 

@@ -22,7 +22,7 @@ export const DEFAULT_OUTLINE_LIMIT = 100;
 export const MAX_OUTLINE_LIMIT = 500;
 /** Outline block size for pages without headings (conversation logs). */
 export const OUTLINE_BLOCK_BYTES = 64 * 1024;
-const HEADING_MAX_CHARS = 200;
+export const HEADING_MAX_CHARS = 200;
 const FIRST_LINE_MAX_CHARS = 120;
 
 const NL = 0x0a;
@@ -111,6 +111,15 @@ export function sliceWindow(buf: Buffer, start: number, end: number, forced = fa
     byte_start: start, byte_end: end, line_start: lineStart, line_end: lineEnd,
     ...(forced ? { forced_cut: true as const } : {}),
   };
+}
+
+/** A stretch of a document too large to hold (a segmented page): its bytes from document byte `start`, and the newlines before it. */
+export interface DocumentSlab { bytes: Buffer; start: number; linesBefore: number }
+
+/** A window `cut` from the slab's bytes, in document offsets and line numbers. */
+export function slabWindow(slab: DocumentSlab, cut: (buf: Buffer) => WindowSlice): WindowSlice {
+  const w = cut(slab.bytes);
+  return { ...w, byte_start: w.byte_start + slab.start, byte_end: w.byte_end + slab.start, line_start: w.line_start + slab.linesBefore, line_end: w.line_end + slab.linesBefore };
 }
 
 /** A window from a clean boundary (a cursor position or the document start). */
@@ -209,11 +218,12 @@ export interface PageOutline {
   next_from_index?: number;
 }
 
-const HEADING = /^ {0,3}(#{1,6})[ \t]+(.*?)[ \t]*#*[ \t]*$/;
-const FENCE = /^ {0,3}(```|~~~)/;
-const DATE = /\b((?:19|20)\d{2})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\b/g;
+export const HEADING = /^ {0,3}(#{1,6})[ \t]+(.*?)[ \t]*#*[ \t]*$/;
+export const FENCE = /^ {0,3}(```|~~~)/;
+export const DATE = /\b((?:19|20)\d{2})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\b/g;
 
-function clip(text: string, max: number): string {
+/** `text` cut to `max` UTF-16 units on a code point, with an ellipsis when cut. */
+export function clip(text: string, max: number): string {
   if (text.length <= max) return text;
   let cut = max;
   const c = text.charCodeAt(cut - 1);

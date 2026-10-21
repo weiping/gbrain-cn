@@ -57,6 +57,14 @@ Bun blocks gbrain's postinstall on `bun install -g` (`Blocked 1 postinstall`); a
 
 ## Memory operating protocol
 
+**Retrieval: gbrain first.** For anything in the brain, run `gbrain search` (names,
+codes, phrases) or `gbrain query` (questions), then `gbrain get <slug>` on a hit.
+Don't grep, cat or SQL the brain checkout first. Filters agents miss:
+`--types '["meeting"]'`, `--match keyword` (every matching page), `--since`/`--until`
+on `query`, `--source <id>`, `--limit`, `--json`; `gbrain backlinks <slug>` and
+`gbrain timeline <slug>` for links and dated events. Copyable examples:
+[brain-first](skills/conventions/brain-first.md#retrieval-gbrain-first).
+
 Recall relevant saved context before answering. Save explicit requests to remember with provenance; confirm corrections against the stored record. Automatic capture requires opt-in. Withdrawal (`forget`) removes a fact from active memory; history, source material, and private backups may remain. Never promise physical erasure. Verify changes with actual GBrain calls and distinguish a local test from a new-conversation test in the harness.
 
 Durable preferences and facts belong in shared memory when the user wants them
@@ -198,13 +206,16 @@ writing or reviewing an operation, consult `src/core/operations.ts` for the cont
 - **Keep a managed catch-up moving without a human** (a live checkout where
   other agents commit while `gbrain sync` drains thousands of pages): a page
   that moves under the run is held (`concurrent_write`, `worktree_dirty`), a
-  dropped connection is retried, and a relaunch resumes the frozen manifest.
-  The operator loop is `gbrain sync status --source <id> --json` (cursor,
-  `committed_last_10m`, each hold and the last error with `class` /
-  `safe_actions` / `needs_human`), then, when nothing moved and
+  dropped connection is retried, and a relaunch starts a pass that admits only
+  what is still unsettled. The operator loop is
+  `gbrain sync status --source <id> --json` (`state` and `reason`, the
+  newest pass in `convergence`, `committed_last_10m`, each hold and the last error
+  with `class` / `safe_actions` / `needs_human`), then, when nothing moved and
   `needs_human` is false, `gbrain sync unblock --source <id> --apply` and
   the sync it prints; when `needs_human` is true, relay `next.user_message`
-  with the slug. Decision table:
+  with the slug. A plain status skips its heavy reads: a `*_read` field with
+  `status: not_read` means that field was not read (never "none"); run its
+  `fix` (`--detail`) when you need it. Decision table:
   [`docs/guides/sync-unblock-runbook.md`](./docs/guides/sync-unblock-runbook.md).
 - **Writes that ended without committing** (doctor
   `persistence_terminal_failures`, `terminal write failures` in

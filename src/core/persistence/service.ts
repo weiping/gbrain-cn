@@ -1,3 +1,4 @@
+import { PENDING_IMPORT, pendingImportRefusal } from './pending-import.ts';
 import type { BrainEngine } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
 import { OperationError } from '../ops/contract.ts';
@@ -102,8 +103,9 @@ export async function preparePersistedMutation(e: BrainEngine, row: WriteRequest
   if (row.operation === 'relink_facts') return (await import('../facts/relink-publish.ts')).prepareRelinkMutation(e, row, cfg);
   if (['takes_add','takes_update','takes_supersede','takes_resolve','takes_remove'].includes(row.operation)) return (await import('./takes-prepare.ts')).prepareTakesMutation(e,row,cfg);
   if (['add_tag','remove_tag','add_timeline_entry'].includes(row.operation)) return prepareSemanticPageMutation(e, row, cfg);
+  if (row.operation === 'append_page') return (await import('./page-upload.ts')).withStagedBodyIf(e, row, async () => (await import('./page-append.ts')).prepareAppendMutation(e, row, cfg, signal, clock));
   if (['put_page','capture','delete_page','restore_page','revert_version','edit_page'].includes(row.operation)) return preparePageMutation(e, row, cfg, undefined, signal,
-    { coordinated: await writeSwitchOn(e, 'single_write_group').catch(() => true), clock });
+    { coordinated: await writeSwitchOn(e, 'single_write_group').catch(() => true), clock, boundedChunkWrites: true });
   throw new OperationError('unsupported_mutation_protocol', 'No compatible mutation preparer is registered for this operation.', `Request ${row.request_id} (${row.operation}) was accepted by a gbrain version whose preparer this one lacks, so it has not run. Run gbrain upgrade on every host that serves this brain; the request stays journaled and resumes after the upgrade.`);
 }
 /**
@@ -112,8 +114,6 @@ export async function preparePersistedMutation(e: BrainEngine, row: WriteRequest
  * `autopilot`, `mcp`) get a `WaiterOnlyConsumer` that probes the host's consumer rows on its first tick and settles to
  * full or waiter-only (consumer-election.ts). Either way the returned object has the consumer's whole surface.
  */
-/** #6696 C7: the resident owners whose full consumer runs the storage.keep_db policy (never a short-lived command). */
-const KEEP_DB_POLICY_OWNERS = ['serve', 'jobs', 'autopilot'];
 export function startPersistenceConsumer(engine: BrainEngine, config: GBrainConfig): PersistenceConsumerLike {
   const prior = services.get(engine);
   if (prior) {
@@ -124,7 +124,7 @@ export function startPersistenceConsumer(engine: BrainEngine, config: GBrainConf
     return prior.consumer;
   }
   const full = () => new PersistenceConsumer(engine, config, preparePersistedMutation,
-    { drainNotice: claimOwnerKind() === 'serve', keepDbPolicy: KEEP_DB_POLICY_OWNERS.includes(claimOwnerKind()), onSettled: row => { recordSettlement(engine); rememberSettled(engine, row.id); for (const listener of settledWaiters.get(engine)?.get(row.id) ?? []) listener(row); } });
+    { drainNotice: claimOwnerKind() === 'serve', onSettled: row => { recordSettlement(engine); rememberSettled(engine, row.id); for (const listener of settledWaiters.get(engine)?.get(row.id) ?? []) listener(row); } });
   const kind = claimOwnerKind();
   const service: Service = kind !== 'serve' && RESIDENT_CONSUMER_KINDS.includes(kind) && engine.kind === 'postgres'
     ? { consumer: new WaiterOnlyConsumer(engine, config, full, { kind, hostId: localHostId(), pool: () => enginePoolStats(engine) }), stopping: false }
@@ -219,7 +219,7 @@ export type WriteWait =
  * The waiter never owns a provider, database connection, or kernel lock.
  */
 export async function awaitWrite(engine: BrainEngine, row: WriteRequest, config: GBrainConfig,
-  opts: { waitMs?: number; signal?: AbortSignal } = {}): Promise<WriteWait> {
+  opts: { waitMs?: number; signal?: AbortSignal; whileHeldMs?: number } = {}): Promise<WriteWait> {
   if (isTerminal(row)) return { kind: 'terminal', row };
   const consumer = startPersistenceConsumer(engine, config);
   const service = services.get(engine)!;
@@ -234,14 +234,21 @@ export async function awaitWrite(engine: BrainEngine, row: WriteRequest, config:
   // The admission transaction has committed: publish now, not after the idle backoff.
   consumer.wake(true);
   const waitMs = opts.waitMs ?? 5000;
-  const deadline = performance.now() + waitMs;
+  const started = performance.now();
+  // `whileHeldMs`: past `waitMs`, keep waiting (to that total) while this process's consumer is executing the request or it
+  // is still queued unblocked: a consumer busy past `waitMs` (an effect pass under load) has not claimed it yet.
+  let deadline = started + waitMs;
   const firstPoll = recentlySettled.get(engine)?.has(id) ? 0 : Math.min(WRITE_POLL_START_MS, waitMs / 2);
   let delay = firstPoll, failure: { error: unknown; attempts: number } | undefined;
   try {
     while (!service.stopping && !opts.signal?.aborted) {
       if (handed) { row = handed; handed = undefined; if (isTerminal(row)) return { kind: 'terminal', row }; }
       const remaining = deadline - performance.now();
-      if (remaining <= 0) break;
+      if (remaining <= 0) {
+        if (opts.whileHeldMs && opts.whileHeldMs > waitMs && deadline === started + waitMs
+          && (consumer.holds(id) || row.state === 'queued' && !row.blocked_reason)) { deadline = started + opts.whileHeldMs; continue; }
+        break;
+      }
       await new Promise<void>(resolve => {
         const done = () => { clearTimeout(timer); wake = undefined; opts.signal?.removeEventListener('abort', done); resolve(); };
         const timer = setTimeout(done, Math.min(delay, remaining));
@@ -263,11 +270,31 @@ export async function awaitWrite(engine: BrainEngine, row: WriteRequest, config:
       row = { ...row, ...read.row };
       if (isTerminal(row)) return { kind: 'terminal', row: await getWriteRequestById(engine, id).catch(() => null) ?? row };
     }
+    // A stopped wait settles only what this process can settle at once: one consumer tick (it claims and publishes the
+    // request when nothing holds it back) and the request this consumer is still executing. A write that cannot move
+    // (another owner's lock, a consumer that defers to another process) is left queued under its request id.
+    if (opts.signal?.aborted && !service.stopping && !handed) {
+      const left = () => deadline - performance.now();
+      await Promise.race([consumer.tick().catch(() => undefined), new Promise<void>(resolve => setTimeout(resolve, Math.max(0, left())))]);
+      while (!handed && consumer.holds(id) && left() > 0) {
+        await new Promise<void>(resolve => {
+          const done = () => { clearTimeout(timer); wake = undefined; resolve(); };
+          const timer = setTimeout(done, Math.min(50, left()));
+          wake = done;
+        });
+      }
+    }
   } finally {
     listeners.delete(listener);
     if (!listeners.size && waiters.get(id) === listeners) waiters.delete(id);
   }
   if (handed) row = handed;
+  // A stopped wait then reads the receipt once, so a write that committed meanwhile is banked rather than reported pending.
+  if (!isTerminal(row) && opts.signal?.aborted && !service.stopping) {
+    const latest = await getWriteRequestProgress(engine, id).catch(() => null);
+    if (latest) row = { ...row, ...latest };
+    if (isTerminal(row)) return { kind: 'terminal', row: await getWriteRequestById(engine, id).catch(() => null) ?? row };
+  }
   if (isTerminal(row)) return { kind: 'terminal', row };
   if (failure) {
     const { classifyPgAccessError } = await import('../pg-access-classify.ts');
@@ -335,6 +362,11 @@ export function writeResponse(row: WriteRequest, hints: { retryAfterMs?: number 
       ? pendingWriteHint(receipt, row.operation)
       : delivered?.suggestion ?? content?.suggestion ?? held?.suggestion ?? terminalReceiptHint(row, reason), delivered?.docs);
   if (delivered?.detail ?? held?.reason) error.detail = delivered?.detail ?? held?.reason;
+  // #6693: a write refused while its page's file awaited import says so, with the wait (remember) or the sync to run first.
+  if (isTerminal(row) && reason === 'source_changed' && (row.error_detail as { origin?: unknown } | null | undefined)?.origin === PENDING_IMPORT) {
+    const pending = pendingImportRefusal(row, row.authority?.remote === true);
+    Object.assign(error, { suggestion: pending.suggestion, fix: pending.fix, reason: pending.reason, detail: pending.detail, docs: pending.docs ?? error.docs });
+  }
   // #6317 (B1b): a waiter-only process names the owner that publishes for it, so the caller is told who holds the write instead of polling blind.
   if (!isTerminal(row) && hints.waiterOnlyOwner) {
     const owner = hints.waiterOnlyOwner;

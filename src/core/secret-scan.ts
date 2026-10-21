@@ -421,8 +421,8 @@ const PEM_LINE_MAX = 128;
 const PEM_LINE_MIN = 16;
 const PEM_INDENT_MAX = 16;
 const PEM_RFC1421_LINE_MAX = 256;
-const PEM_BEGIN_RE = /-----BEGIN [A-Z ]*PRIVATE KEY-----/g;
-const PEM_END_RE = /-----END [A-Z ]*PRIVATE KEY-----/g;
+export const PEM_BEGIN_RE = /-----BEGIN [A-Z ]*PRIVATE KEY-----/g;
+export const PEM_END_RE = /-----END [A-Z ]*PRIVATE KEY-----/g;
 
 type PemClaimKind = 'block' | 'forward' | 'backward';
 
@@ -488,7 +488,7 @@ function atCut(t: string, i: number): boolean {
 }
 
 /** FORWARD claim end for a BEGIN fence ending at `headerEnd` (== headerEnd when no body line follows). */
-function pemForwardEnd(t: string, headerEnd: number): number {
+export function pemForwardEnd(t: string, headerEnd: number): number {
   const n = t.length;
   const cap = headerEnd + PEM_BODY_MAX_CHARS;
   let pos = lineEndAfter(t, headerEnd);
@@ -520,7 +520,7 @@ function pemForwardEnd(t: string, headerEnd: number): number {
 }
 
 /** BACKWARD claim start for an END fence at `endStart`, never below `floor`; -1 when no body line precedes it. */
-function pemBackwardStart(t: string, endStart: number, floor: number): number {
+export function pemBackwardStart(t: string, endStart: number, floor: number): number {
   let p = endStart;
   while (endStart - p < PEM_INDENT_MAX && p > floor && isIndentCode(t.charCodeAt(p - 1))) p--;
   let le = lineEndBefore(t, p, floor);
@@ -700,7 +700,22 @@ function assignmentValueIsSecretShaped(value: string): boolean {
   return !(value.startsWith('/') && !LEGACY_ASSIGNMENT_VALUE_RE.test(value));
 }
 
+/**
+ * One compiled set per option combination. scanInternal is synchronous and
+ * resets each pattern's lastIndex before every line, so the 'g' regexes are
+ * safe to share; recompiling them per call cost a search response about a
+ * millisecond per scanned field (GBRA-156).
+ */
+const compiledPatterns = new Map<string, CompiledPattern[]>();
+
 function compilePatterns(opts: ScanOpts): CompiledPattern[] {
+  const key = `${opts.highEntropy === true}|${opts.labeledCredentials === true}`;
+  let compiled = compiledPatterns.get(key);
+  if (!compiled) compiledPatterns.set(key, compiled = buildPatterns(opts));
+  return compiled;
+}
+
+function buildPatterns(opts: ScanOpts): CompiledPattern[] {
   const out: CompiledPattern[] = CORE_PATTERNS.map((p) => ({
     name: p.name,
     // nosemgrep: javascript.lang.security.audit.detect-non-literal-regexp.detect-non-literal-regexp -- p.source is a compile-time literal from CORE_PATTERNS (never caller input); every pattern uses bounded quantifiers, pinned by test/secret-scan-perf.test.ts
@@ -801,6 +816,8 @@ interface RawHit extends LineSpan {
   line: number; // 1-based
   /** Absolute offset of `value` within the scanned text (redactFindings splices on it). */
   abs: number;
+  /** Absolute offset where the match that made this claim starts, its anchor included (<= abs). */
+  from: number;
   lineText: string;
   spans: LineSpans;
   /**
@@ -842,7 +859,7 @@ function scanPemBlocks(text: string, claims: PemClaim[]): RawHit[] {
     }
     const value = text.slice(c.start, c.end);
     const span: LineSpan = { pattern: 'private_key_pem', value, start: 0 };
-    const hit: RawHit = { ...span, line, abs: c.start, lineText: value, spans: { all: [span] } };
+    const hit: RawHit = { ...span, line, abs: c.start, from: c.start, lineText: value, spans: { all: [span] } };
     if (c.kind === 'forward' && c.end > c.headerEnd) hit.legacyValue = text.slice(c.start, c.headerEnd);
     hits.push(hit);
   }
@@ -909,7 +926,7 @@ function scanInternal(text: string, opts: ScanOpts): RawHit[] {
     // line's FIRST hit only (most lines have none), then O(value) to test and
     // to mark. Same answer as scanning every prior span for an intersection.
     let taken: Uint8Array | null = null;
-    const claim = (pattern: string, value: string, start: number): void => {
+    const claim = (pattern: string, value: string, start: number, from: number): void => {
       if (work) work.claims++;
       taken!.fill(1, start, start + value.length);
       // A hit entirely inside a private-key claim (a vendor-shaped run in a
@@ -917,7 +934,7 @@ function scanInternal(text: string, opts: ScanOpts): RawHit[] {
       // characters for the first-wins dedupe but is not reported.
       if (pem.length > 0 && insideClaim(pem, lineStart + start, lineStart + start + value.length)) return;
       spans.all.push({ pattern, value, start });
-      hits.push({ pattern, value, start, abs: lineStart + start, line: i + 1, lineText: line, spans });
+      hits.push({ pattern, value, start, abs: lineStart + start, from: lineStart + from, line: i + 1, lineText: line, spans });
     };
     for (const p of patterns) {
       if (p.continuation && p.continuation !== dangling) continue;
@@ -960,15 +977,15 @@ function scanInternal(text: string, opts: ScanOpts): RawHit[] {
           // the surrounding `db_url_credentials` span was dropped).
           for (let a = start, k = start; k <= end; k++) {
             if (k < end && !taken[k]) continue;
-            if (a < k) claim(p.name, line.slice(a, k), a);
+            if (a < k) claim(p.name, line.slice(a, k), a, m.index);
             a = k + 1;
           }
           continue;
         }
-        claim(p.name, value, start);
+        claim(p.name, value, start, m.index);
       }
     }
-    for (const c of cells) if (!taken || !anyTaken(taken, c.start, c.start + c.value.length)) { taken ??= new Uint8Array(line.length); claim('labeled_credential', c.value, c.start); }
+    for (const c of cells) if (!taken || !anyTaken(taken, c.start, c.start + c.value.length)) { taken ??= new Uint8Array(line.length); claim('labeled_credential', c.value, c.start, c.start); }
   }
   return hits;
 }
@@ -1101,6 +1118,22 @@ export function scanText(text: string, opts: ScanOpts = {}): SecretFinding[] {
     out.push(toFinding(hit, fullHex));
   }
   return out;
+}
+
+/**
+ * `scanText` with each claim's absolute span [start, end) in `text` (UTF-16
+ * offsets of the claimed value) and `from`, where the match that made it
+ * starts: its anchor (`Bearer `, `Authorization: Basic `, an assignment
+ * key) or the boundary character before the value. An allowlisted claim keeps
+ * its span with `finding: null`, so the windowed scan (secret-scan-stream.ts)
+ * can still drop a seam's partial copy of it.
+ */
+export function scanTextSpans(text: string, opts: ScanOpts = {}): Array<{ start: number; end: number; from: number; finding: SecretFinding | null }> {
+  const allowlist = opts.allowlist ?? [];
+  return scanInternal(text, opts).map((hit) => {
+    const fullHex = sha256Hex(hit.value);
+    return { start: hit.abs, end: hit.abs + hit.value.length, from: hit.from, finding: valueAllowlisted(fullHex, allowlist) ? null : toFinding(hit, fullHex) };
+  });
 }
 
 /** Bytes to sniff for NUL when deciding content is binary. */

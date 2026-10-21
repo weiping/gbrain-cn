@@ -4,23 +4,25 @@
  *
  * What these tests protect:
  *   - a flagless delegated run adopts an unfinished cursor's stored options,
- *     exactly as the in-process CLI does: both client builders send
- *     `explicitProcessing: []` instead of dropping the empty list (which made
- *     every processing key explicit on the serve and refused the resume with
- *     `invalid_params`);
- *   - an older CLI omits the list but still sends `true` for each processing
- *     flag its user typed: a newer serve reads those true-valued keys as the
- *     explicit ones (a flagless payload is "no flags"), so `--no-embed` from an
- *     older CLI never resumes a cursor storing `noEmbed=false` into embedding;
+ *     exactly as the in-process CLI does (#6712 PR 1: neither side sends nor
+ *     reads an explicit-processing list any more; a resume inherits the
+ *     cursor's opt-outs);
+ *   - an older CLI's typed `--no-embed` never resumes a cursor storing
+ *     `noEmbed=false` into embedding: the opt-out applies to the requests the
+ *     run freezes (it used to refuse the resume with `invalid_params`);
  *   - a runtime embedding deferral (the cost gate's auto-defer) is not a
  *     processing option: adopting a cursor that stores `noEmbed=false` never
- *     turns embedding back on for the run, in-process or delegated. A provider
- *     spy sees zero embedding calls and no embedding effect is queued.
+ *     turns embedding back on for the run, in-process or delegated, and the
+ *     cursor does not keep the deferral. A provider spy sees zero embedding
+ *     calls and no embedding effect is queued.
  *
- * Regression each guards: dropping `explicitProcessing` on either builder, the
- * serve passing `undefined` through, and the deferral riding only as `noEmbed`.
+ * Regression each guards: a list reappearing on either builder, and the
+ * deferral riding only as `noEmbed`.
  * Existing coverage (`serve-sync-handoff.serial.test.ts`) delegates only onto
  * fresh sources, so a resume never crossed the wire there.
+ *
+ * #6712 PR 4b: a non-company source runs the live pass, which keeps no cursor; the
+ * opt-outs a flagless run inherits live on the pass row's open episode.
  *
  * Serial: the runner is a module singleton and the tests bind local sockets.
  */
@@ -74,13 +76,14 @@ async function fixture(count: number): Promise<{ id: string; root: string }> {
 
 /** An unfinished cursor: one page of `count` committed under the given options, the rest still to freeze. */
 async function partialCursor(id: string, opts: Partial<SyncOpts>): Promise<void> {
-  expect(await performManagedSync(engine, { sourceId: id, noPull: true, explicitProcessing: [], ...opts } as SyncOpts, { maxPages: 1, maxMs: 1000 })).toMatchObject({ status: 'partial' });
+  expect(await performManagedSync(engine, { sourceId: id, noPull: true, ...opts } as SyncOpts, { maxPages: 1, maxMs: 1000 })).toMatchObject({ status: 'partial' });
   await drainEffects();
   embedded.length = 0;
 }
 
-const storedOptions = async (id: string) => (await engine.executeRaw<{ options: unknown }>(
-  "SELECT completed_keys->0->'processingOptions' AS options FROM op_checkpoints WHERE op='managed-sync' AND completed_keys->0->>'sourceId'=$1", [id]))[0]?.options;
+/** The opt-outs of the pass row's open episode (what a flagless pass inherits), or null when no episode is open. */
+const episodeOptions = async (id: string) => (await engine.executeRaw<{ inherited: { noEmbed: boolean; noExtract: boolean; noSchemaPack: boolean } | null }>(
+  "SELECT completed_keys->0->'obligations'->'episode'->'inherited' AS inherited FROM op_checkpoints WHERE op='managed-sync-pass' AND completed_keys->0->>'source_id'=$1", [id]))[0]?.inherited ?? null;
 /** Embedding effects queued for this source's page requests (any state): zero means no provider call can follow. */
 const embeddingEffects = async (id: string) => (await engine.executeRaw<{ n: number }>(
   "SELECT count(*)::int AS n FROM persistence_effects WHERE source_id=$1 AND kind='embedding'", [id]))[0]!.n;
@@ -154,21 +157,22 @@ afterAll(async () => {
   rmSync(home, { recursive: true, force: true });
 });
 
-describe('the client builders send an empty explicit-processing list', () => {
-  test('parseDelegatedSyncArgs: a flagless argv sets none explicitly; a processing flag sets exactly that key', () => {
+describe('the client builders send no explicit-processing list (#6712 PR 1)', () => {
+  test('parseDelegatedSyncArgs: a flagless argv sends no list; a processing flag sends exactly its option', () => {
     const flagless = parseDelegatedSyncArgs(['--source', 'acme-example', '--no-pull']);
-    expect(flagless.ok && flagless.options.explicitProcessing).toEqual([]);
+    // #6712 PR 1: no list crosses the wire; the serve's resume inherits the cursor's opt-outs, as in-process.
+    expect(flagless.ok && 'explicitProcessing' in flagless.options).toBe(false);
     const flagged = parseDelegatedSyncArgs(['--source', 'acme-example', '--no-pull', '--no-extract']);
-    expect(flagged.ok && flagged.options.explicitProcessing).toEqual(['noExtract']);
+    expect(flagged.ok && flagged.options).toEqual({ noPull: true, noExtract: true });
   });
 
   test('a flagless delegated run adopts the unfinished cursor\'s stored options (noEmbed=true) instead of refusing', async () => withEnv(env, async () => {
     const f = await fixture(3);
     await partialCursor(f.id, { noEmbed: true, noExtract: true });
-    expect(await storedOptions(f.id)).toEqual({ noEmbed: true, noExtract: true, noSchemaPack: false });
+    expect(await episodeOptions(f.id)).toMatchObject({ noEmbed: true, noExtract: true, noSchemaPack: false });
     const sock = await serveSocket();
     const delegated = await quiet(() => maybeDelegateManagedSyncToServe(engine, ['--source', f.id, '--no-pull'],
-      { sourceId: f.id, noPull: true, explicitProcessing: [], drain: true } as SyncOpts, deps(sock)).catch((error: unknown) => error));
+      { sourceId: f.id, noPull: true, drain: true } as SyncOpts, deps(sock)).catch((error: unknown) => error));
     expect(delegated).toMatchObject({ kind: 'delegated', result: { status: 'first_sync' } });
     expect(await engine.getPage('notes/n2', { sourceId: f.id })).not.toBeNull();
     // The adopted options are the cursor's: no page request of this source embeds.
@@ -189,18 +193,21 @@ describe('the serve infers a missing list from an older CLI\'s true-valued flags
     expect(done).toMatchObject({ state: 'done', result: { status: 'first_sync' } });
   }), 180_000);
 
+  // #6712 PR 1 (#6552 §1): the refusal is gone. The typed opt-out applies to the requests this run freezes, so it still embeds nothing.
   test('an older CLI\'s --no-embed (noEmbed: true, no list) never resumes a noEmbed=false cursor into embedding', async () => withEnv(env, async () => {
     const f = await fixture(3);
     await partialCursor(f.id, {});
-    expect(await storedOptions(f.id)).toEqual({ noEmbed: false, noExtract: false, noSchemaPack: false });
+    expect(await episodeOptions(f.id)).toBeNull();
     const before = await embeddingEffects(f.id);
     const local = await registerLocalWriter(engine, 'cli');
     const start = await startDelegatedSync(engine, { sourceId: f.id, noPull: true, noEmbed: true, timeoutSeconds: 120 }, randomUUID(),
       { registration: { id: local.id, credential: local.credential, lane: 'cli' } });
     expect(start.ok).toBe(true);
-    // The typed flag is explicit, as in-process: it conflicts with the stored noEmbed=false and the resume is refused.
     const done = await quiet(() => waitTerminal(start.jobId!));
-    expect(done).toMatchObject({ state: 'error', jobErrorEnvelope: { code: 'invalid_params' } });
+    expect(done.jobErrorEnvelope).toBeUndefined();
+    expect(done).toMatchObject({ state: 'done', result: { status: 'first_sync' } });
+    // The --no-embed pass converged, so the opt-out episode it opened is closed.
+    expect(await episodeOptions(f.id)).toBeNull();
     await drainEffects();
     expect(await embeddingEffects(f.id)).toBe(before);
     expect(embedded).toEqual([]);
@@ -211,17 +218,17 @@ describe('a runtime embedding deferral is never lifted by cursor adoption', () =
   test('delegated: the deferral crosses the wire; a cursor storing noEmbed=false embeds nothing in this run', async () => withEnv(env, async () => {
     const f = await fixture(3);
     await partialCursor(f.id, {});
-    expect(await storedOptions(f.id)).toEqual({ noEmbed: false, noExtract: false, noSchemaPack: false });
+    expect(await episodeOptions(f.id)).toBeNull();
     const before = await embeddingEffects(f.id);
     const sock = await serveSocket();
     const delegated = await quiet(() => maybeDelegateManagedSyncToServe(engine, ['--source', f.id, '--no-pull'],
-      { sourceId: f.id, noPull: true, noEmbed: true, embedDeferred: true, explicitProcessing: [], drain: true } as SyncOpts, deps(sock)).catch((error: unknown) => error));
+      { sourceId: f.id, noPull: true, noEmbed: true, embedDeferred: true, drain: true } as SyncOpts, deps(sock)).catch((error: unknown) => error));
     expect(delegated).toMatchObject({ kind: 'delegated', result: { status: 'first_sync' } });
     await drainEffects();
     expect(await embeddingEffects(f.id)).toBe(before);
     expect(embedded).toEqual([]);
-    // The cursor's own options are untouched: the deferral is a property of this run, not of the cursor.
-    expect(await engine.executeRaw("SELECT 1 FROM op_checkpoints WHERE op='managed-sync' AND completed_keys->0->>'sourceId'=$1 AND completed_keys->0->'processingOptions'->>'noEmbed'='false'", [f.id])).toHaveLength(1);
+    // No episode keeps the deferral: it is a property of this run, not of the source.
+    expect(await episodeOptions(f.id)).toBeNull();
   }), 180_000);
 
   test('in-process CLI: the cost gate auto-defers (non-TTY, floor $0); adoption of noEmbed=false still makes zero embedding calls', async () => withEnv(env, async () => {

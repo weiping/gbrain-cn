@@ -31,6 +31,7 @@ import { isConnectorSourceKind } from './connector-identity.ts';
 import { MaintenanceWriteWait } from './maintenance-wait.ts';
 import { auditConflictsCommand, FILE_DRIFT_MESSAGE, liveFileDrift } from './drift-conflicts.ts';
 import { declaredWriteTrust, lowerToDerivedTier, readDerivationDeclaration, recordTaintEdges, type DerivationDeclaration } from '../trust/taint.ts';
+import { sameInstantTies } from '../facts/claim-ties.ts';
 
 export interface MaintenanceAuthority {
   writer: WriteAuthority;
@@ -200,10 +201,11 @@ export function maintenanceDriftRefusal(sourceId: string, slug: string): Operati
 
 /**
  * #6696 (A12): maintenance kinds whose preparer passes `allowMissingFile` (chronicle, stale-atom retirement, ghost-page
- * retirement, which exists to soft-delete pages whose canonical file is gone): a missing canonical file publishes, so it is no ghost.
+ * retirement, which exists to soft-delete pages whose canonical file is gone, and the atoms-restore revert of a retired
+ * atom, whose file the retirement removed): a missing canonical file publishes, so it is no ghost.
  */
 export const PUBLISHES_WITHOUT_FILE: ReadonlySet<string> = new Set(['managed_maintenance_chronicle_event', 'managed_maintenance_chronicle_retire', 'managed_maintenance_retire_stale_atoms',
-  'managed_maintenance_retire_ghost_page']);
+  'managed_maintenance_retire_ghost_page', 'managed_maintenance_restore_reextract_atom']);
 
 /** #6696 (A12): `source_changed` / `canonical_file_missing` before admission: the page's recorded file is gone; never a new request. */
 export function maintenanceGhostRefusal(sourceId: string, slug: string): OperationError {
@@ -463,25 +465,9 @@ async function prepareFactFenceAdoption(unbounded: BrainEngine, row: WriteReques
     if (adopted.length !== facts.length) throw opError('revision_conflict', 'A legacy fact was adopted by another run.',
       `Another run adopted a legacy fact on ${row.slug} in ${row.source_id} while request ${row.request_id} was publishing, so its transaction rolled back. Read the receipt with gbrain write-request -- ${row.request_id} for the final state before planning any new adoption.`,
       { fix: receiptFix(row) });
-    const outcome = await applyPreservingTakeResolutions(tx, row.page_id, prepared);
+    const outcome = await prepared.apply(tx);
     return { ...outcome, facts_adopted: facts.length };
   } };
-}
-
-/**
- * Apply a page publication that republishes the page's takes fence unchanged.
- * Its projection would clear take resolutions recorded only in the database,
- * so they are restored afterwards in the same transaction.
- */
-export async function applyPreservingTakeResolutions(tx: BrainEngine, pageId: number | null, prepared: PreparedMutation): Promise<Record<string, unknown>> {
-  const resolved = await tx.executeRaw<Record<string, unknown>>(`SELECT row_num,resolved_at,resolved_quality,resolved_outcome,
-    resolved_source,resolved_value,resolved_unit,resolved_by FROM takes WHERE page_id=$1 AND resolved_at IS NOT NULL`, [pageId]);
-  const outcome = await prepared.apply(tx);
-  for (const take of resolved) await tx.executeRaw(`UPDATE takes SET resolved_at=$3,resolved_quality=$4,resolved_outcome=$5,
-    resolved_source=$6,resolved_value=$7,resolved_unit=$8,resolved_by=$9 WHERE page_id=$1 AND row_num=$2 AND resolved_at IS NULL`,
-  [pageId, take.row_num, take.resolved_at, take.resolved_quality, take.resolved_outcome, take.resolved_source,
-    take.resolved_value, take.resolved_unit, take.resolved_by]);
-  return outcome;
 }
 
 /**
@@ -516,7 +502,10 @@ async function prepareMaintenanceKind(engine: BrainEngine, row: WriteRequest, co
   enterClaimStep(clock, 'maintenance_dispatch');
   if (row.intent?.kind === 'managed_maintenance_restore_extractor_facts') return (await import('../repair/extractor-facts.ts')).prepareExtractorFactsRestore(engine, row);
   if (row.intent?.kind === 'managed_maintenance_expire_captured_facts') return (await import('../repair/captured-facts.ts')).prepareCapturedFactsExpiry(engine, row);
+  if (row.intent?.kind === 'managed_maintenance_restore_redacted_facts') return (await import('../repair/redacted-facts.ts')).prepareRedactedFactsRestore(engine, row);
+  if (row.intent?.kind === 'managed_maintenance_tighten_fact_visibility') return (await import('../repair/visibility.ts')).prepareFactVisibilityTighten(engine, row);
   if (row.intent?.kind === 'managed_maintenance_conversation_label_retire') return (await import('../repair/conversation-labels.ts')).prepareConversationLabelRetirement(engine, row);
+  if (row.intent?.kind === 'managed_maintenance_conversation_relink') return (await import('../facts/conversation-relink.ts')).prepareConversationRelink(engine, row);
   if (row.intent?.kind === 'managed_maintenance_conversation_facts') return (await import('../facts/conversation-publication.ts')).prepareConversationFactsPublication(engine, row, config);
   if (row.intent?.kind === 'managed_maintenance_fence_facts') return (await import('../cycle/extract-facts.ts')).prepareFenceFactsReconcile(engine, row, config);
   if (row.intent?.kind === 'managed_maintenance_deleted_page_facts_expire') return (await import('../cycle/extract-facts.ts')).prepareDeletedPageFactsExpiry(engine, row);
@@ -547,13 +536,22 @@ async function prepareMaintenanceKind(engine: BrainEngine, row: WriteRequest, co
     return (await import('../chronicle/publish.ts')).prepareChronicleMutation(engine, row, config);
   }
   if (row.intent?.kind === 'managed_maintenance_retire_stale_atoms') return (await import('../repair/stale-atoms.ts')).prepareStaleAtomRetirement(engine, row, config);
+  if (row.intent?.kind === 'managed_maintenance_restore_reextract_atom') return (await import('../repair/atoms-restore.ts')).prepareAtomRestore(engine, row, config);
   if (row.intent?.kind === 'managed_maintenance_retire_ghost_page') return (await import('../repair/ghost-pages.ts')).prepareGhostPageRetirement(engine, row, config);
+  if (row.intent?.kind === 'managed_maintenance_file_drift_remove') return (await import('../repair/file-drift.ts')).prepareDriftFileRemoval(engine, row);
+  if (row.intent?.kind === 'managed_maintenance_merge_legacy_twin') return (await import('../repair/legacy-twins.ts')).prepareLegacyTwinMerge(engine, row, config);
+  if (row.intent?.kind === 'managed_maintenance_resolve_origin_twin') return (await import('../repair/origin-twins.ts')).prepareOriginTwinResolve(engine, row, config);
   if (row.intent?.kind !== 'managed_maintenance_consolidate') throw opError('invalid_params', 'Unsupported maintenance request.',
     `Request ${row.request_id} for ${row.slug} in ${row.source_id} carries a maintenance kind this gbrain version does not publish (likely queued by a newer release); nothing changed. Upgrade gbrain on the brain host, and read the receipt before submitting anything new.`,
     { fix: receiptFix(row) });
   const p = row.intent;
   const facts = p.facts as FactSnapshot[];
   const pages = p.pages as EvidencePage[];
+  if (sameInstantTies(facts.map(f => ({ id: f.id, at: Date.parse(String(f.value.valid_from)), metric: (f.value.claim_metric as string | null) ?? null,
+    unit: (f.value.claim_unit as string | null) ?? null, period: (f.value.claim_period as string | null) ?? null }))).length) {
+    return { observedRevision: p.expected_revision as string, noop: true, apply: async () => ({ status: 'skipped', reason: 'same_instant_typed_claims', noop: true,
+      facts_consolidated: 0, takes_written: 0 }) };
+  }
   const [existing] = await engine.executeRaw<{ id: number; row_num: number; active: boolean; resolved_at: unknown }>(
     "SELECT id,row_num,active,resolved_at FROM takes WHERE page_id=$1 AND claim=$2 AND kind='fact' AND holder='self' ORDER BY id LIMIT 1", [row.page_id, p.claim]);
   if (existing && (!existing.active || existing.resolved_at)) {

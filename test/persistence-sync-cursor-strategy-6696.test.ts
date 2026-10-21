@@ -8,19 +8,20 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import type { SyncOpts } from '../src/commands/sync.ts';
 import { claimWorktree } from '../src/core/persistence/ownership.ts';
-import { managedSyncCursorKey, performManagedSync } from '../src/core/persistence/sync-run.ts';
+import { performManagedSync } from '../src/core/persistence/sync-run.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
 
 // #6696 C1: `sync --all` passes the source's configured strategy while a single-source CLI run, autopilot's cycle and a
 // serve-delegated run pass none, so the same source got two cursor keys (two unfinished cursors that could not resume each
-// other). Strategy normalization picks the configured strategy for a run without --strategy, for fresh cursors only: an
-// unfinished cursor written under the old (un-normalized) key keeps resuming under that key, so the requests it already
-// admitted (their intent.cursorKey) still match their cursor.
+// other). #6712 PR 1 took every option out of the cursor key; #6712 PR 4b replaced a non-company source's cursor with one
+// live pass row per source incarnation (`managed-sync-pass`, `<source>:<incarnation>`). Every caller's pass of the source,
+// whatever strategy it passes, reads and writes that one row and leaves no cursor row behind. The legacy-key handover
+// (an older binary's cursor) is covered by sync-pass-handover-6712.test.ts and sync-pass-cursor-retirement-6712.test.ts.
 //
-// Regression guarded: the normalization done in one caller only (the keys keep diverging), or applied to a live cursor
-// (its queued requests are fenced out by the cursor they no longer match).
+// Regression guarded: an option creeping back into the pass row's key (two rows for one source), or a pass of one caller
+// unable to finish another's.
 
 const home = mkdtempSync(join(tmpdir(), 'gbrain-cursor-strategy-'));
 const engines: BrainEngine[] = [];
@@ -46,43 +47,39 @@ async function fixture(engine: BrainEngine, config: Record<string, unknown>) {
   await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
   return id;
 }
+const lastCommit = async (engine: BrainEngine, id: string) => (await engine.executeRaw<{ c: string | null }>('SELECT last_commit AS c FROM sources WHERE id=$1', [id]))[0]!.c;
+const rootOf = async (engine: BrainEngine, id: string) => (await engine.executeRaw<{ p: string }>('SELECT local_path AS p FROM sources WHERE id=$1', [id]))[0]!.p;
 const isolated = (fn: (engine: BrainEngine) => Promise<void>) => withEnv({ GBRAIN_HOME: home, OPENAI_API_KEY: undefined, ANTHROPIC_API_KEY: undefined }, async () => {
   for (const engine of engines) await fn(engine);
 });
-const cursors = async (engine: BrainEngine, id: string) => engine.executeRaw<{ key: string; done: string | null; strategy: string | null }>(
-  "SELECT fingerprint AS key,completed_keys->0->>'done' AS done,completed_keys->0->'syncOptions'->>'strategy' AS strategy FROM op_checkpoints WHERE op='managed-sync' AND completed_keys->0->>'sourceId'=$1", [id]);
+const stateRows = async (engine: BrainEngine, id: string) => engine.executeRaw<{ op: string; key: string }>(
+  "SELECT op, fingerprint AS key FROM op_checkpoints WHERE op IN ('managed-sync','managed-sync-pass') AND (completed_keys->0->>'sourceId'=$1 OR completed_keys->0->>'source_id'=$1) ORDER BY op, fingerprint", [id]);
 const refused = async (engine: BrainEngine, id: string) => (await engine.executeRaw<{ n: number }>(
   "SELECT count(*)::int AS n FROM persistence_requests WHERE source_id=$1 AND state IN ('failed','conflict','cancelled')", [id]))[0]!.n;
+const incarnation = async (engine: BrainEngine, id: string) => (await engine.executeRaw<{ i: string }>('SELECT incarnation::text AS i FROM sources WHERE id=$1', [id]))[0]!.i;
 // What each caller passes: the single-source CLI, the cycle and a delegated run pass no strategy; `sync --all` passes the configured one.
-const single = (sourceId: string): SyncOpts => ({ sourceId, noPull: true, noEmbed: true, explicitProcessing: [] } as SyncOpts);
+const single = (sourceId: string): SyncOpts => ({ sourceId, noPull: true, noEmbed: true });
 const all = (sourceId: string): SyncOpts => ({ ...single(sourceId), strategy: 'markdown' });
 
-test('a single-source run and a `sync --all` run of a source configured with a strategy select one cursor key', async () => isolated(async engine => {
+test('a single-source run and a `sync --all` run of a source configured with a strategy share one pass row', async () => isolated(async engine => {
   const id = await fixture(engine, { strategy: 'markdown' });
-  expect(await managedSyncCursorKey(engine, single(id))).toBe(await managedSyncCursorKey(engine, all(id)));
   expect(await performManagedSync(engine, single(id), { maxPages: 1, maxMs: 1000 })).toMatchObject({ status: 'partial' });
-  expect((await performManagedSync(engine, all(id))).status).toBe('first_sync');
-  expect(await cursors(engine, id)).toEqual([expect.objectContaining({ strategy: 'markdown' })]);
+  const pass = [{ op: 'managed-sync-pass', key: `${id}:${await incarnation(engine, id)}` }];
+  expect(await stateRows(engine, id)).toEqual(pass);
+  const finished = await performManagedSync(engine, all(id));
+  expect(finished.status).toBe('first_sync');
+  expect(await stateRows(engine, id)).toEqual(pass);
   expect(await refused(engine, id)).toBe(0);
+  for (const name of ['a', 'b', 'c', 'd']) expect(await engine.getPage(name, { sourceId: id })).not.toBeNull();
+  expect(await lastCommit(engine, id)).toBe(git(await rootOf(engine, id), 'rev-parse', 'HEAD'));
 }), 120_000);
 
-test('an unfinished cursor under the old key (no strategy) finishes under that key; the next fresh run is normalized', async () => isolated(async engine => {
-  const id = await fixture(engine, {});
-  // A cursor written while the source had no strategy configured (the key an older binary computed for this source).
-  expect(await performManagedSync(engine, single(id), { maxPages: 1, maxMs: 1000 })).toMatchObject({ status: 'partial' });
-  const [legacy] = await cursors(engine, id);
-  expect(legacy).toMatchObject({ strategy: null });
-  await engine.executeRaw(`UPDATE sources SET config='{"strategy":"markdown"}'::jsonb WHERE id=$1`, [id]);
-  expect(await managedSyncCursorKey(engine, single(id))).toBe(legacy!.key);
-  expect((await performManagedSync(engine, single(id))).status).toBe('first_sync');
-  expect(await cursors(engine, id)).toEqual([{ key: legacy!.key, done: 'true', strategy: null }]);
-  expect(await refused(engine, id)).toBe(0);
-  // Finished: a fresh run takes the normalized key, and `sync --all` agrees with it.
-  expect(await managedSyncCursorKey(engine, single(id))).not.toBe(legacy!.key);
-  expect(await managedSyncCursorKey(engine, single(id))).toBe(await managedSyncCursorKey(engine, all(id)));
-}), 120_000);
-
-test('an explicit --strategy that differs from the configured one keeps its own key', async () => isolated(async engine => {
+test('an explicit --strategy that differs from the configured one runs on the same pass row, and the next plain pass checkpoints HEAD', async () => isolated(async engine => {
   const id = await fixture(engine, { strategy: 'markdown' });
-  expect(await managedSyncCursorKey(engine, { ...single(id), strategy: 'auto' })).not.toBe(await managedSyncCursorKey(engine, single(id)));
+  expect(await performManagedSync(engine, single(id), { maxPages: 1, maxMs: 1000 })).toMatchObject({ status: 'partial' });
+  expect((await performManagedSync(engine, { ...single(id), strategy: 'auto' })).status).not.toBe('blocked_by_failures');
+  expect(await stateRows(engine, id)).toEqual([{ op: 'managed-sync-pass', key: `${id}:${await incarnation(engine, id)}` }]);
+  expect((await performManagedSync(engine, single(id))).status).not.toBe('blocked_by_failures');
+  for (const name of ['a', 'b', 'c', 'd']) expect(await engine.getPage(name, { sourceId: id })).not.toBeNull();
+  expect(await lastCommit(engine, id)).toBe(git(await rootOf(engine, id), 'rev-parse', 'HEAD'));
 }), 120_000);

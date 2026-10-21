@@ -289,13 +289,13 @@ Estimated downstream input cost of the retrieved payload @ 10K queries/mo:
 >
 >   2) balanced — 12K budget, 25 chunks, reranked.
 >
->   3) tokenmax (recommended with a chat key) — no budget, 50 chunks, reranked,
->      `gbrain query` expands by default. The widest retrieval.
+>   3) tokenmax (recommended with a chat key) — no budget, 50 chunks, reranked.
+>      The widest retrieval.
 >
-> Expansion follows the mode for `gbrain query` only: on in `tokenmax`, off in
-> `balanced` and `conservative`; `--expand` (`expand: true` over MCP) forces it
-> and `--no-expand` (`expand: false`) skips it. `gbrain config set search.expansion false`
-> turns the default off for the brain in any mode. `gbrain search` and the memory
+> `gbrain query` does not expand by default in any mode; `--expand`
+> (`expand: true` over MCP) forces it and `--no-expand` (`expand: false`) skips
+> it. `gbrain config set search.expansion true` turns the default on for the
+> brain in any mode. `gbrain search` and the memory
 > verbs never expand. See [search modes](docs/guides/search-modes.md) for the
 > current contract.
 >
@@ -340,6 +340,11 @@ gbrain search "a phrase from an imported page" --json
 Only after enabling the selected embedding provider, run `gbrain embed --stale`.
 Use `gbrain query` for expanded retrieval only when its provider use is intended;
 `--no-expand` opts out of expansion independently of the mode.
+
+Once imported, retrieve through gbrain rather than the files: search, then
+`gbrain get <slug>`. Filters (`--types`, `--match keyword`, `query --since/--until`,
+`--source`, `--json`) are in
+[Retrieval: gbrain first](skills/conventions/brain-first.md#retrieval-gbrain-first).
 
 ## Step 4.5: Wire the Knowledge Graph
 

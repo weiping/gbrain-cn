@@ -220,6 +220,8 @@ export interface MinionQueueOpts {
 
 export interface MinionWorkerOpts {
   queue?: string;
+  /** #7242: called (never awaited, errors swallowed) after each job this worker ran settles; terminal-hook.ts re-reads the row. */
+  onJobSettled?: (job: MinionJob) => void;
   concurrency?: number; // default 1
   lockDuration?: number; // ms, default 30000
   stalledInterval?: number; // ms, default 30000
@@ -264,6 +266,10 @@ export interface MinionWorkerOpts {
   childCliInvocation?: { cmd: string; argsPrefix: string[] } | null;
   /** tini path for wrapping job children ('' = absent, direct spawn). */
   childTiniPath?: string;
+  /** #7242: job names that count against the long-job lane. Default: lanes.ts DEFAULT_LONG_JOB_NAMES. */
+  longJobNames?: readonly string[];
+  /** #7242: slots kept free of long jobs when concurrency >= 2 (at least one slot still takes long jobs). Default 1; 0 disables. */
+  shortJobReservedSlots?: number;
 }
 
 // --- Job Context (passed to handlers) ---
@@ -589,6 +595,14 @@ export interface SubagentHandlerData {
    * that predate the field ignore it and keep the strict behavior.
    */
   allow_clean_zero_writes?: boolean;
+  /**
+   * #6297 — byte budget on this job's `get_page` results (the dream patterns
+   * child, `dream.patterns.child_read_budget_kb`). Past it a read returns a
+   * short summary instead of the page, so the replayed transcript stays
+   * bounded. Counted from the job's own tool-execution ledger, so a crash
+   * replay keeps the budget. Trusted field (PROTECTED_JOB_NAMES); unset = no budget.
+   */
+  read_budget_bytes?: number;
   /**
    * #4216 — synthesis execution mode. 'oneshot' = single structured
    * completion + programmatic validated writes, falling back to the agentic

@@ -12,6 +12,7 @@ import { RESIDENT_POOL_FLOOR } from '../core/pg-access-classify.ts';
 import { redirectStdoutLoggingToStderr } from '../core/console-prefix.ts';
 import { startFactsDrainScheduler, type FactsDrainScheduler, type FactsDrainSchedulerOpts } from '../core/facts/drain-scheduler.ts';
 import { startMovementWatch, type MovementWatch } from '../core/persistence/sync-movement.ts';
+import { startServeHeadWatcher } from '../core/serve-head-watcher.ts';
 import { onForwardProgress } from '../core/forward-progress.ts';
 import { graduationHandoffRequested, writeServeGraduationEnvelope } from '../core/persistence/graduation-serve-guard.ts';
 import {
@@ -237,7 +238,7 @@ export async function runServe(
   // 'verbs' exposes exactly the seven protocol verbs (the quickstart surface);
   // 'starter' the ~20-op daily-driver set; 'full' keeps every operation.
   const { parseSurfaceFlag, resolveSurfaceWithSource, resolveStdioSurface, parseAccessFlag, SURFACE_SOURCE_LABEL } = await import('../mcp/surface.ts');
-  const { loadConfig } = await import('../core/config.ts');
+  const { loadConfig, MERGED_CONFIG_BY_ENGINE } = await import('../core/config.ts');
   const surfaceFlag = parseSurfaceFlag(args);
   const resolved = isHttp ? resolveSurfaceWithSource(surfaceFlag, loadConfig()) : resolveStdioSurface(surfaceFlag, loadConfig());
   const surface = resolved.surface;
@@ -277,6 +278,8 @@ export async function runServe(
   // binding is deliberate or unambiguous — sole-source brains are a pure
   // no-op. Stdio-only: the OAuth HTTP path scopes writes per token instead.
   const sourceGuard = args.includes('--source-guard');
+  // Opt-in warm CLI socket (core/cli-socket/server.ts): off, the serve loads nothing and reads nothing for it.
+  const cliSocketOn = args.includes('--cli-socket') || MERGED_CONFIG_BY_ENGINE.get(engine)?.serve_cli_socket === true;
   if (sourceGuard && isHttp) {
     // Loud posture warning (the --log-full-params precedent): the guard is a
     // stdio-lane mechanism; HTTP writes are scoped per token instead. An
@@ -367,11 +370,13 @@ export async function runServe(
     const { armCorpusDrain } = await import('../core/sweep.ts');
     const corpusDrain = (opts.armCorpusDrain ?? armCorpusDrain)(engine, { sourceId: process.env.GBRAIN_SOURCE || undefined });
 
+    const cliSocket = cliSocketOn ? await (await import('../core/cli-socket/server.ts')).startCliSocket(engine, httpLog) : null;
     try {
       await runHttp(engine, { port, tokenTtl, enableDcr, enableDcrInsecure, publicUrl, logFullParams, bind, suppressBootstrapToken, printAdminToken, surface, adoptServer: opts.adoptServer });
     } finally {
       stallWatchdog?.dispose();
       corpusDrain?.cancel();
+      cliSocket?.close();
     }
 
     await finishHttpServe(engine, opts);
@@ -452,6 +457,8 @@ export async function runServe(
     // earlier flips stdin into flowing mode and can consume a fast client's
     // initialize frame before the SDK sees it.
     activateStdioIdleActivityTracking();
+    // Opt-in warm CLI socket; bound after the stdout redirect so a request's captured console output keeps its stream.
+    if (cliSocketOn) void import('../core/cli-socket/server.ts').then(m => m.startCliSocket(engine, opts.log ?? ((msg: string) => console.error(msg))));
   } finally {
     if (bootDeadline) clearTimeout(bootDeadline);
     stopProgressWatch();
@@ -593,13 +600,16 @@ function installFactsDrain(engine: BrainEngine, opts: ServeOptions, deps: StdioL
 /**
  * #6317 (B4): the facts drain plus the movement watch (one `[gbrain notice]`
  * when a managed source's sync data stops moving; reader in
- * persistence/sync-movement.ts), stopped together at shutdown.
+ * persistence/sync-movement.ts), stopped together at shutdown. #6858 ask 6:
+ * the on-commit HEAD watcher (`sync.on_commit`, core/serve-head-watcher.ts)
+ * stops with them, before shutdownDelegatedSync aborts the sync it started.
  */
 function installResidentTickers(engine: BrainEngine, opts: ServeOptions, deps: StdioLifecycleDeps, shuttingDown: () => boolean): { stop(): Promise<void> } {
   const factsDrain = installFactsDrain(engine, opts, deps, shuttingDown);
   // The watch keeps its own unref'd timer: the injected lifecycle timers are the parent watchdog's and the idle sweep's, which tests count.
   const movementWatch: MovementWatch = startMovementWatch(engine, { log: deps.log });
-  return { stop: async () => { movementWatch.stop(); await factsDrain?.stop(); } };
+  const headWatcher = startServeHeadWatcher(engine, { log: deps.log });
+  return { stop: async () => { const settled = headWatcher.stop(); movementWatch.stop(); await settled; await factsDrain?.stop(); } };
 }
 
 function installStdioLifecycle(

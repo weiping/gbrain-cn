@@ -29,8 +29,9 @@ import { classifyLlmCallFailure } from '../think/index.ts';
 import { PINNED_QUESTION_MARKER, normalizeQuestion, sentenceId } from './identity.ts';
 import { entityAnchoredPages, prefixAnchoredPages } from '../search/entity-anchor.ts';
 import { quarantinedProvenanceFilterFragment, quarantineFilterFragment } from '../quarantine.ts';
-import { FACT_HASH_SQL, TAKE_HASH_SQL, TIMELINE_HASH_SQL, evaluateAnswer, type EvidenceKind } from './freshness.ts';
+import { FACT_HASH_SQL, OWNER_BODY_HASH_SQL, TAKE_HASH_SQL, TIMELINE_HASH_SQL, evaluateAnswer, type EvidenceKind } from './freshness.ts';
 import { ownerClaims, readQuestionPage } from './pages.ts';
+import { neutralizeForPrompt } from '../think/sanitize.ts';
 import { acquireLease, getPin, pinId, releaseLease, type AnswerSentence, type PinRow } from './store.ts';
 
 export type BlockedReason = 'no_model_key' | 'budget_exhausted' | 'no_worker' | 'refresh_failed' | 'awaiting_consent';
@@ -171,7 +172,8 @@ export async function retrieveEvidence(engine: BrainEngine, pin: PinRow): Promis
   const candidates = slugs.size === 0 ? [] : await engine.executeRaw<CandidatePage>(
     `SELECT id, slug, source_id, generation, knowledge_revision::text AS revision, type, compiled_truth, updated_at,
        (frontmatter ? '${PINNED_QUESTION_MARKER}') AS marker
-     FROM pages WHERE source_id = $1 AND slug = ANY($2::text[]) AND deleted_at IS NULL AND ${quarantineFilterFragment('pages')}`, [pin.source_id, [...slugs]]);
+     FROM pages WHERE source_id = $1 AND slug = ANY($2::text[]) AND deleted_at IS NULL AND body_storage = 'inline'
+       AND ${quarantineFilterFragment('pages')}`, [pin.source_id, [...slugs]]);
   const laundered = launderingIndex(await engine.executeRaw<PublishedAnswer>(
     `SELECT q.answer, q.last_refresh_at AS published_at,
        COALESCE(array_agg(e.page_id) FILTER (WHERE e.page_id IS NOT NULL), ARRAY[]::integer[]) AS cited
@@ -206,7 +208,7 @@ export async function retrieveEvidence(engine: BrainEngine, pin: PinRow): Promis
        ORDER BY f.valid_from DESC, f.id DESC LIMIT ${MAX_FACTS}`, [pin.source_id, entitySlugs]);
     for (const f of facts) {
       push({ kind: 'fact', source_id: pin.source_id, page_id: null, page_slug: f.entity_slug, page_generation: null, page_revision: null,
-        item_id: Number(f.id), content_hash: f.hash, text: `[fact about ${f.entity_slug ?? 'unknown'}, from ${String(f.valid_from).slice(0, 10)}] ${f.fact}` });
+        item_id: Number(f.id), content_hash: f.hash, text: `[fact about ${f.entity_slug ?? 'unknown'}, from ${String(f.valid_from).slice(0, 10)}] ${neutralizeForPrompt(f.fact).text}` });
     }
   }
   if (pageIds.length > 0) {
@@ -321,7 +323,7 @@ async function revalidate(tx: BrainEngine, rows: EvidenceRow[]): Promise<string 
   const pageIds = [...new Set(pageRows.map(r => r.page_id!))];
   if (pageIds.length) {
     const current = new Map((await tx.executeRaw<{ id: number; generation: string | number; revision: string | null; deleted: boolean; body: string }>(
-      `SELECT id, generation, knowledge_revision::text AS revision, deleted_at IS NOT NULL AS deleted, md5(compiled_truth) AS body
+      `SELECT id, generation, knowledge_revision::text AS revision, deleted_at IS NOT NULL AS deleted, ${OWNER_BODY_HASH_SQL('pages')} AS body
        FROM pages WHERE id = ANY($1::integer[]) FOR SHARE`, [pageIds])).map(r => [r.id, r]));
     for (const r of pageRows) {
       const c = current.get(r.page_id!);

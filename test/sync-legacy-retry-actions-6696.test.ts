@@ -1,21 +1,19 @@
 /**
- * #6696 C3: `--retry-failed` on a managed source names failures recorded under another cursor key. A failure whose run
- * predates recorded sync options used to get "gbrain sync ... with the same options as the failed run (this receipt no
- * longer records them)": a command nobody can run. Now each such row is classified, and the action printed for it
- * settles it when run:
+ * #6696 C3, revised by #6712 PR 1: `--retry-failed` on a managed source settles failures an older gbrain recorded under
+ * other cursor keys. The per-row action classifier (`managed-retry-actions.ts`) is gone: a source has one cursor key, and
+ * the current key folds older-key cursors in (the newest unfinished one finishes in place under its key, the rest are
+ * superseded with their failure rows). A failure no cursor holds at all is named with the orphan repair that retires it.
  *
- *   - resumable: an option set reproduces the row's cursor key exactly (the run's own options with and without the
- *     source's configured strategy and --full, or the options another cursor of the source recorded); the command is
- *     labelled a replay when an unfinished run holds the key, a fresh discovery when none does;
- *   - safely orphaned: the existing orphan repair names the row (no cursor, an unadoptable principal, superseded);
- *   - unresolved: nothing selects it now; the action finishes a current run, after which the orphan repair retires it.
+ * Fixture: one source configured with strategy `markdown`, two unfinished cursors an older gbrain left under its own keys
+ * (a `--full` run, and a newer run with an `--exclude`), both recorded before cursors kept their options, and one failure
+ * row with no cursor, for a file sync does not index (so no successful run settles it on its own).
  *
- * Fixture: one source configured with strategy `markdown`, two unfinished legacy cursors (a `--full` run, and a run with
- * an `--exclude` no current option reproduces) and one failure row with no cursor at all, for a file sync does not index
- * (so no successful run settles it on its own).
+ * Regression that fails it: the "no longer records them" text, a legacy failure that survives the retry, or a cursor-less
+ * row with no printed way out.
  *
- * Regression that fails it: the "no longer records them" text, an unlabelled command, or an action that leaves the
- * original failure recorded.
+ * #6712 PR 4b: a non-company source keeps no cursor, so its first live pass retires every older-key cursor of the
+ * incarnation with its failure row (`retireLegacyCursors`); the first test seeds the two unfinished cursors an older gbrain
+ * left instead of running one, and none of them remains after the retry.
  */
 import { afterAll, beforeAll, expect, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
@@ -32,6 +30,8 @@ import { claimWorktree } from '../src/core/persistence/ownership.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { performManagedSync } from '../src/core/persistence/sync-run.ts';
 import { readManagedSyncFailures, recordManagedSyncFailure } from '../src/core/persistence/sync-failures.ts';
+import { resolveManagedSyncContext } from '../src/core/persistence/sync-discovery.ts';
+import { managedSyncAuthority } from '../src/core/persistence/sync-authority.ts';
 import { managedSyncOrphansRepair } from '../src/core/repair/managed-sync-orphans.ts';
 import { runRepair } from '../src/core/repair/core.ts';
 import { repairSpec } from '../src/core/repair/registry.ts';
@@ -75,9 +75,6 @@ afterAll(async () => {
 
 const cursorKeys = async (engine: BrainEngine, id: string) => (await engine.executeRaw<{ key: string; syncOptions: Record<string, unknown> | null }>(
   "SELECT fingerprint AS key,completed_keys->0->'syncOptions' AS \"syncOptions\" FROM op_checkpoints WHERE op='managed-sync' AND completed_keys->0->>'sourceId'=$1", [id]));
-/** A run recorded before cursors kept their options: strip them from the header. */
-const stripOptions = (engine: BrainEngine, key: string) => engine.executeRaw(
-  "UPDATE op_checkpoints SET completed_keys=jsonb_set(completed_keys,'{0}',(completed_keys->0)-'syncOptions') WHERE op='managed-sync' AND fingerprint=$1", [key]);
 const failureKeys = async (engine: BrainEngine, id: string) => (await engine.executeRaw<{ key: string }>(
   "SELECT fingerprint AS key FROM op_checkpoints WHERE op='managed-sync-failure' AND completed_keys->0->>'source_id'=$1 ORDER BY fingerprint", [id])).map(row => row.key);
 
@@ -107,7 +104,7 @@ async function fixture(engine: BrainEngine) {
   await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
   const [{ incarnation }] = await engine.executeRaw<{ incarnation: string }>('SELECT incarnation::text AS incarnation FROM sources WHERE id=$1', [id]);
   const run = (opts: Partial<SyncOpts>, budget = { maxPages: 1, maxMs: 1000 }) =>
-    performManagedSync(engine, { sourceId: id, noPull: true, explicitProcessing: [], ...opts } as SyncOpts, budget);
+    performManagedSync(engine, { sourceId: id, noPull: true, ...opts } as SyncOpts, budget);
   /** A failure recorded before failures kept their run's options. */
   const failure = (cursor_key: string, path: string) => recordManagedSyncFailure(engine, { source_id: id, source_incarnation: incarnation, path, code: 'source_changed',
     message: 'file and database disagree', request_id: null, run_id: `run-${cursor_key.slice(0, 8)}`, target: head, cursor_key, phase: 'receipt', state: 'failed',
@@ -120,52 +117,56 @@ const actionLine = (out: string, label: RegExp) => {
   return found!.slice(found!.lastIndexOf(': ') + 2).trim();
 };
 
-test('legacy failures under other keys are classified resumable / safely orphaned / unresolved, and each printed action settles its row', async () => withEnv(env, async () => { for (const engine of engines) {
+/** An unfinished cursor (and manifest) an older gbrain left under `key`, recorded before cursors kept their options. */
+async function legacyCursor(engine: BrainEngine, id: string, key: string, ageMinutes: number, extra: Record<string, unknown> = {}) {
+  const [source] = await engine.executeRaw<{ incarnation: string; root: string }>('SELECT incarnation::text AS incarnation, local_path AS root FROM sources WHERE id=$1', [id]);
+  const context = await resolveManagedSyncContext(engine, { sourceId: id, noPull: true } as SyncOpts);
+  const authority = await managedSyncAuthority(engine, id, source!.incarnation, source!.root);
+  const runId = `run-${key}`, at = new Date(Date.now() - ageMinutes * 60_000).toISOString();
+  const entries = [0, 1, 2, 3].map(i => ({ path: `notes/n${i}.md`, sourcePath: `notes/n${i}.md`, action: 'import', working: false, slug: `notes/n${i}`, pageId: null, revision: null }));
+  const binding = { ...context.binding, owner_epoch: String((context.binding as { owner_epoch?: unknown }).owner_epoch), topology_generation: String(context.binding.topology_generation) };
+  const cursor = { binding, root: context.root, gitRoot: context.gitRoot, sourceId: id, incarnation: source!.incarnation, from: null, target: git(source!.root, 'rev-parse', 'HEAD'),
+    slugMode: 'git-root', discoveredAt: at, runId, index: 1, total: entries.length, authority, processingOptions: { noEmbed: false, noExtract: false, noSchemaPack: false },
+    counts: { added: 1, modified: 0, deleted: 0, chunks: 0 }, ...extra };
+  await engine.executeRaw('INSERT INTO op_checkpoints(op,fingerprint,completed_keys,updated_at) VALUES($1,$2,$3::text::jsonb,$4::timestamptz)', ['managed-sync', key, JSON.stringify([cursor]), at]);
+  await engine.executeRaw('INSERT INTO op_checkpoints(op,fingerprint,completed_keys,updated_at) VALUES($1,$2,$3::text::jsonb,$4::timestamptz)', ['managed-sync-manifest', runId, JSON.stringify(entries), at]);
+}
+const orphanCommand = (id: string) => `gbrain repair managed-sync-orphans --source ${id}`;
+
+test('legacy failures under older keys: one --retry-failed folds their cursors in and settles them; the printed repair settles the cursor-less row', async () => withEnv(env, async () => { for (const engine of engines) {
   const { id, run, failure } = await fixture(engine);
-  // Two unfinished runs recorded before cursors kept their options: a --full run and a run with an --exclude.
-  expect(await run({ full: true })).toMatchObject({ status: 'partial' });
-  const fullKey = (await cursorKeys(engine, id)).find(row => row.syncOptions?.full === true)!.key;
-  expect(await run({ exclude: ['archive/**'] })).toMatchObject({ status: 'partial' });
-  const excludeKey = (await cursorKeys(engine, id)).find(row => (row.syncOptions?.exclude as string[] | undefined)?.length)!.key;
-  await stripOptions(engine, fullKey); await stripOptions(engine, excludeKey);
+  const fullKey = `${id}-full`, excludeKey = `${id}-exclude`;
+  await legacyCursor(engine, id, fullKey, 60);
+  await legacyCursor(engine, id, excludeKey, 10);
   const noCursorKey = `legacy-${randomUUID()}`;
   await failure(fullKey, 'notes/n1.md'); await failure(excludeKey, 'notes/n2.md'); await failure(noCursorKey, 'assets/data.bin');
   expect((await readManagedSyncFailures(engine, [id])).filter(row => row.syncOptions)).toEqual([]);
 
   const out = await capture(() => runSyncInner(engine, ['--source', id, '--no-pull', '--retry-failed']));
   expect(out).not.toContain('this receipt no longer records them');
-  const line = (label: RegExp) => actionLine(out, label);
-  const replay = line(/^\s+1 resumable \(replay/);
-  expect(replay).toBe(`gbrain sync --source ${id} --no-pull --retry-failed --full --strategy markdown`);
-  const orphaned = line(/^\s+1 safely orphaned/);
-  expect(orphaned).toBe(`gbrain repair managed-sync-orphans --source ${id}`);
-  const unresolved = line(/^\s+1 unresolved/);
-  expect(unresolved).toBe(`gbrain sync --source ${id} --no-pull`);
-  expect(await failureKeys(engine, id)).toEqual([excludeKey, fullKey, noCursorKey].sort());
+  expect(out).toContain('Retrying 3 previously-failed file(s)...');
+  expect(out).toContain(`1 of them belong to no sync run any more`);
+  expect(out).toContain(orphanCommand(id));
+  // The first pass retired both older-key cursors with their failures; the cursor-less row is left to the printed repair.
+  expect((await cursorKeys(engine, id)).map(row => row.key)).toEqual([]);
+  expect(await failureKeys(engine, id)).toEqual([noCursorKey]);
 
-  // Each printed action, run as printed, settles its rows: the replay its own; the unresolved run's completion makes
-  // the option-less cursor superseded, so the orphan repair then retires it along with the cursor-less row.
-  await runAction(engine, replay);
-  expect(await failureKeys(engine, id)).toEqual([excludeKey, noCursorKey].sort());
-  await runAction(engine, unresolved);
-  await runAction(engine, orphaned);
+  await runAction(engine, orphanCommand(id));
   expect(await failureKeys(engine, id)).toEqual([]);
   expect(await readManagedSyncFailures(engine, [id])).toEqual([]);
 } }), 240_000);
 
-test('a cursor-less legacy failure whose key the options reproduce gets a fresh discovery (not a replay) that clears it', async () => withEnv(env, async () => { for (const engine of engines) {
+test('a cursor-less legacy failure for a file no run imports is named with the orphan repair, which clears it', async () => withEnv(env, async () => { for (const engine of engines) {
   const { id, run, failure } = await fixture(engine);
   // A --full run that finished and was retired: its failure row outlived its cursor and never recorded the options.
+  const fullKey = `${id}-full`;
   expect(await run({ full: true }, { maxPages: 1000, maxMs: 60_000 })).toMatchObject({ status: 'first_sync' });
-  const fullKey = (await cursorKeys(engine, id)).find(row => row.syncOptions?.full === true)!.key;
   await engine.executeRaw("DELETE FROM op_checkpoints WHERE op='managed-sync' AND fingerprint=$1", [fullKey]);
   await failure(fullKey, 'assets/data.bin');
   const out = await capture(() => runSyncInner(engine, ['--source', id, '--no-pull', '--retry-failed']));
   expect(out).not.toContain('this receipt no longer records them');
-  expect(out).not.toMatch(/resumable \(replay/);
-  const fresh = actionLine(out, /^\s+1 resumable \(fresh discovery, not a replay/);
-  expect(fresh).toBe(`gbrain sync --source ${id} --no-pull --retry-failed --full --strategy markdown`);
+  expect(out).toContain(orphanCommand(id));
   expect(await failureKeys(engine, id)).toEqual([fullKey]);
-  await runAction(engine, fresh);
+  await runAction(engine, orphanCommand(id));
   expect(await failureKeys(engine, id)).toEqual([]);
 } }), 240_000);

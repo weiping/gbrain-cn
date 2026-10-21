@@ -1107,10 +1107,21 @@ const COLUMN_EXEMPTIONS = new Set<string>([
   // v178/v198/v217: migration-created on PGLite, no index references the
   // column, and every reader treats a missing value as 0 attempts.
   'persistence_requests.preparation_attempts',
+  // Large-pages hardening (migration v261) — transient retry budget. Same posture as
+  // v178/v198/v217/v220: migration-created on PGLite, no index references the columns,
+  // and every reader treats a missing value as 0 interruptions and no backoff.
+  'persistence_requests.transient_interruptions',
+  'persistence_requests.next_attempt_at',
   // Cat 40 Hard F6 (migration v238) — the client's original request_id. Same
   // posture as v178/v198: persistence_requests is migration-created on PGLite,
   // no index references the column, and every reader treats NULL as "sent a UUID or nothing".
   'persistence_requests.client_request_id',
+  // Wave B fix lane B (migration v254) — segment-reader marks next to the v178
+  // stamps. Same posture as v178: persistence_requests is migration-created on
+  // PGLite, no index references the columns, and every reader treats NULL as a
+  // writer that does not read segmented pages.
+  'persistence_requests.admitter_segment_reader',
+  'persistence_requests.consumer_segment_reader',
   // #5455 (migration v183) — managed mode epoch. persistence_brain is
   // migration-created on PGLite; no index in either blob references it, and
   // pre-migration readers go through to_jsonb(persistence_brain)->'mode_epoch'.
@@ -1125,6 +1136,40 @@ const COLUMN_EXEMPTIONS = new Set<string>([
   // doctor reader probes for the column on older brains.
   'pages.links_attendance_blocked_revision',
   'pages.links_attendance_blocked_at',
+  // GBRA-130 A-1 (migration v258) — the link-extraction failure record. Same
+  // posture as the v180 attendance marker: absent from both schema blobs, so
+  // fresh and upgraded brains share its ordinal; column-only and nullable, no
+  // index or function in either blob references it, and the doctor reader
+  // probes for the column on older brains.
+  'pages.links_extract_failure',
+  // Wave B segmented page storage (migration v248). Deliberately absent from
+  // both schema blobs so fresh and upgraded brains share their ordinals; no
+  // index in either blob references them (content_chunks_occurrence_idx is
+  // migration-built), and the blob functions that read them
+  // (bump_page_generation_fn, gbrain_advance_page_revision,
+  // update_page_search_vector) reach them only when compiled_truth/timeline is
+  // NULL, which no brain before v248 can hold; the writer guard reads
+  // body_generation by key.
+  'pages.body_storage',
+  'pages.body_bytes',
+  'pages.truth_bytes',
+  'pages.body_lines',
+  'pages.body_generation',
+  'pages.segment_count',
+  'pages.segmenter_version',
+  'pages.body_flags',
+  'pages.truth_lead',
+  'pages.timeline_lead',
+  'content_chunks.occurrence_id',
+  'content_chunks.local_ordinal',
+  'content_chunks.raw_byte_start',
+  'content_chunks.raw_byte_end',
+  'content_chunks.body_generation',
+  'content_chunks.retired_generation',
+  'page_versions.body_storage',
+  'page_versions.body_generation',
+  'page_versions.body_bytes',
+  'page_versions.content_hash',
 ]);
 
 test('every ALTER TABLE ADD COLUMN in MIGRATIONS is covered by applyForwardReferenceBootstrap (column-only class)', async () => {
