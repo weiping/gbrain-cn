@@ -34,11 +34,11 @@ const OP_AREAS: Record<string, string> = {
   get_page: 'pages', put_page: 'pages', delete_page: 'pages', list_pages: 'pages',
   restore_page: 'pages', purge_deleted_pages: 'pages',
   get_versions: 'pages', revert_version: 'pages',
-  resolve_slugs: 'pages', get_chunks: 'pages',
+  resolve_slugs: 'pages', whois: 'pages', get_chunks: 'pages',
   put_raw_data: 'pages', get_raw_data: 'pages',
   fetch: 'pages', // #4039 deep-research read adapter (search/fetch pair)
   // search
-  search: 'search', query: 'search', search_by_image: 'search', assemble_evidence: 'search',
+  search: 'search', search_exact: 'search', query: 'search', search_by_image: 'search', assemble_evidence: 'search',
   // tags
   add_tag: 'tags', remove_tag: 'tags', get_tags: 'tags',
   // links + graph

@@ -16,6 +16,7 @@ import type { PageType, EffectiveDateSource } from './types.ts';
 import { ensureWellFormed } from './text-safe.ts';
 import { embed } from './embedding.ts'; // gbrain-cn: CJK wikilink vector fallback (resolveSlug step 5)
 import { stripCodeBlocks } from './markdown-code.ts';
+import { maskLinksFence } from './links-fence.ts';
 import { targetTakesVerb } from './link-target-roles.ts';
 import { inSuppressedRange, rolePriorSuppressedRanges } from './machine-sections.ts';
 import { statedRelationTypes } from './line-grammar.ts';
@@ -839,6 +840,8 @@ export interface BodyLinkCandidate { pass: number; index: number; candidate: Lin
  */
 export async function extractBodyLinks(slug: string, content: string, pageType: PageType, resolver: SlugResolver,
   opts: ExtractPageLinksOptions = {}): Promise<{ links: BodyLinkCandidate[]; attendanceComplete: boolean }> {
+  // The links fence is projected as its own edges (links-fence-projection.ts); its cells are not body references.
+  content = maskLinksFence(content);
   const links: BodyLinkCandidate[] = [];
   const shift = opts.window?.offset ?? 0;
   const inWindow = (idx: number) => !opts.window || (idx >= opts.window.start && idx < opts.window.end);
