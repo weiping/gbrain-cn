@@ -316,9 +316,11 @@ revision and disclose skipped cells.
 on PGLite and, with an explicit safe `DATABASE_URL`, isolated PostgreSQL databases.
 It covers stale preconditions, current/original grants, private facts, retained
 backups, ordinary mutations after repair, and competing publications.
-`test/reconcile-owner-journey.serial.test.ts` drives real CLI requests through
-HTTP and stdio PGLite owners before and after activation, restarts the owner, and
-independently reads the newly remembered private fact and provenance.
+`test/reconcile-owner-journey.serial.test.ts` (stdio) and
+`test/reconcile-owner-journey-http.serial.test.ts` (HTTP) drive real CLI requests
+through PGLite owners before and after activation, restart the owner, and
+independently read the newly remembered private fact and provenance
+(`test/helpers/reconcile-owner-journey.ts`).
 
 `test/reconcile-crash-*.slow.test.ts` and `test/e2e/reconcile-crash*.test.ts` kill real
 processes at all eight publication boundaries with activation off/on. PostgreSQL
@@ -561,7 +563,7 @@ The chaos modes, each named in failures and selectable with
 
 | Mode | What happens | Expected end state | On master |
 | --- | --- | --- | --- |
-| (a) client kills, (b) serve kills | A kill loop of `GBRAIN_TEST_CONVERGENCE_KILLS` change rounds, each ending in one `kill -9` at a point of the curated list (`publication:before_commit`, `publication:after_commit`, `consumer:preparing`, `lane:applied`, `sync:before_group_admission`, `sync:mid_checkpoint`), cycling a `--no-delegate` client, a serve running a delegated catch-up, and a serve with its delegating client | strict convergence | runs |
+| (a) client kills, (b) serve kills | A kill loop of `GBRAIN_TEST_CONVERGENCE_KILLS` change rounds, each ending in one `kill -9` at a point of the curated list (`publication:before_commit`, `publication:after_commit`, `consumer:preparing`, `lane:applied`, `sync:before_group_admission`, `sync:mid_checkpoint`, `sync:held_settled`, `sync:passed_over`, `sync:batch_entries`, `sync:tail_started`), cycling a `--no-delegate` client, a serve running a delegated catch-up, and a serve with its delegating client | strict convergence | runs |
 | (c) concurrent writers | During the kill loop: `gbrain put` rewrites of 5% of the notes, `remember` facts on an entity page, `gbrain extract timeline --source db` (a managed maintenance job) | strict convergence; every acknowledged write in the ledger | runs |
 | (c-db) DB-only competitor | With `sync.write_through=false`, a DB-only `put` lands while the run is stalled on that page's frozen entry, and another on a page whose file did not change | the raced page is held `concurrent_write` (needs a person), its file keeps the committed bytes and its page the DB write; both pages are left out of disk == DB | runs |
 | (d) out-of-band Git | While a run is stalled mid-manifest: `git mv` and `git rm` of 1% of the files, committed, and deletion of 1% uncommitted | moves and removals converge strictly; each uncommitted deletion is listed by `gbrain pages ghosts` with the `gbrain repair ghost-pages` exit and left out of disk == DB | runs |

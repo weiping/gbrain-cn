@@ -8,9 +8,9 @@
  * onto the build already installed (doctor's `runtime_build_skew` fix);
  * `--dry-run` prints the plan and changes nothing.
  */
-import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { existsSync, readFileSync, readlinkSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { delimiter, dirname, join } from 'node:path';
+import { delimiter, dirname, isAbsolute, join } from 'node:path';
 import { spawnSync } from '../core/spawn.ts';
 import { isThinClient, loadConfig, toEngineConfig } from '../core/config.ts';
 import { opError } from '../core/ops/contract.ts';
@@ -24,9 +24,13 @@ import { readSupervisorBuild, readSupervisorPid } from '../core/minions/supervis
 import { parseEtimeToMs, readWorkers } from '../core/minions/worker-registry.ts';
 import { installedVersion, runtimeInstallRoot } from '../core/runtime-build.ts';
 import { VERSION } from '../version.ts';
+import { compareWriterVersions } from '../core/persistence/writer-versions.ts';
+import { resolveQuietHoursWindow, resolveSelfUpgradeMode } from '../core/self-upgrade.ts';
+import { evaluateQuietHours } from '../core/minions/quiet-hours.ts';
+import { logSelfUpgrade } from '../core/audit/self-upgrade-audit.ts';
 import {
   classifyGbrainCommand, collectHostProcesses, copyFix, gbrainEntry, mismatchedBuilds, PENDING_BUILD, planRestart, runRestartSteps, verifyRestart,
-  type HostProcess, type ProcessSources, type ProcessTableRow, type RestartPlan, type ServiceHandle, type WarmSocketState,
+  type HostProcess, type ProcessSources, type ProcessTableRow, type RestartExecutor, type RestartPlan, type ServiceHandle, type WarmSocketState,
 } from '../core/upgrade-restart.ts';
 
 const DOCS = 'docs/guides/upgrades-auto-update.md#restart';
@@ -47,6 +51,21 @@ function processHome(pid: number): string | null | undefined {
   }
 }
 
+/** A process's working directory, which a relative entry point resolves against; null when it cannot be read (only Linux exposes it). */
+function processCwd(pid: number): string | null {
+  try { return readlinkSync(`/proc/${pid}/cwd`); } catch { return null; }
+}
+
+/** The package name at a directory; undefined when it holds no readable package.json. */
+function packageNameAt(root: string): string | null | undefined {
+  try {
+    const name = (JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as { name?: unknown }).name;
+    return typeof name === 'string' ? name : null;
+  } catch {
+    return undefined;
+  }
+}
+
 /** This user's processes from `ps` (Linux and macOS), or the given pids; null when ps cannot run. */
 function readProcessTable(uid: number | undefined, pids?: number[]): ProcessTableRow[] | null {
   const select = pids ? ['-p', pids.join(',')] : uid === undefined ? ['-x'] : ['-U', String(uid)];
@@ -58,16 +77,16 @@ function readProcessTable(uid: number | undefined, pids?: number[]): ProcessTabl
     if (!m) return [];
     const elapsed = parseEtimeToMs(m[3]!);
     const pid = Number(m[1]);
-    return [{ pid, ppid: Number(m[2]), command: m[4]!, started_ms: elapsed === null ? null : now - elapsed, gbrain_home: processHome(pid) }];
+    return [{ pid, ppid: Number(m[2]), command: m[4]!, started_ms: elapsed === null ? null : now - elapsed, gbrain_home: processHome(pid), cwd: processCwd(pid) }];
   });
 }
 
 /** The gbrain install a command line starts from: the package directory above its entry point and the version it holds now (null for a compiled binary). */
-function installOf(command: string): { root: string | null; version: string | null } {
-  const entry = gbrainEntry(command)?.entry;
+function installOf(command: string, cwd?: string | null): { root: string | null; version: string | null } {
+  const entry = gbrainEntry(command, { cwd, packageName: packageNameAt })?.entry;
   if (!entry) return { root: null, version: null };
   try {
-    const found = entry.includes('/') ? entry : (process.env.PATH ?? '').split(delimiter).map(dir => join(dir, entry)).find(path => existsSync(path));
+    const found = entry.includes('/') ? (isAbsolute(entry) ? entry : undefined) : (process.env.PATH ?? '').split(delimiter).map(dir => join(dir, entry)).find(path => existsSync(path));
     if (!found) return { root: null, version: null };
     let dir = dirname(realpathSync(found));
     for (let i = 0; i < 4; i++, dir = dirname(dir)) {
@@ -81,9 +100,9 @@ function installOf(command: string): { root: string | null; version: string | nu
 /** The pid a service manager runs for a unit or label now; null when it is not running or cannot be read. */
 function servicePid(platform: string, unit: string, launchdLabel: string): number | null {
   const r = platform === 'darwin' ? spawnSync('launchctl', ['list', launchdLabel], { encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] })
-    : spawnSync('systemctl', ['--user', 'show', '-p', 'MainPID', '--value', unit], { encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] });
+    : spawnSync('systemctl', ['--user', 'show', '-p', 'MainPID', unit], { encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] });
   if (r.status !== 0 || typeof r.stdout !== 'string') return null;
-  const pid = Number(platform === 'darwin' ? /"PID"\s*=\s*(\d+)/.exec(r.stdout)?.[1] : r.stdout.trim());
+  const pid = Number((platform === 'darwin' ? /"PID"\s*=\s*(\d+)/ : /^MainPID=(\d+)/m).exec(r.stdout)?.[1]);
   return Number.isInteger(pid) && pid > 1 ? pid : null;
 }
 
@@ -132,17 +151,31 @@ async function hostSources(): Promise<{ sources: ProcessSources; notes: string[]
     workers: () => { try { return readWorkers(() => null).map(w => ({ pid: w.pid, version: w.version ?? null })); } catch { return []; } },
     processTable: () => readProcessTable(uid),
     install: installOf,
+    packageName: packageNameAt,
     home: brainHome(),
     exclude: [process.pid, process.ppid],
   };
   return { sources, notes, close, pidFile: DEFAULT_PID_FILE };
 }
 
+/** The real executor for restart steps; `pidFile` is the default supervisor PID file. */
+function hostExecutor(pidFile: string): RestartExecutor {
+  return {
+    run: (argv, env) => {
+      const r = spawnSync(argv[0]!, argv.slice(1), { encoding: 'utf8', timeout: 600_000, stdio: ['ignore', 'pipe', 'pipe'], env: env ? { ...process.env, ...env } : process.env });
+      return { status: r.error ? null : r.status, output: `${r.stdout ?? ''}${r.stderr ?? ''}${r.error ? r.error.message : ''}` };
+    },
+    terminate: terminateIfUnchanged,
+    supervisorPid: file => { const status = readSupervisorPid(file ?? pidFile); return status.running ? status.pid : null; },
+    sleep: ms => new Promise(r => setTimeout(r, ms)),
+  };
+}
+
 /** SIGTERM pid only while it is still the MCP server the plan saw: same role, same start time (ps reports it to the second). */
 function terminateIfUnchanged(pid: number, startedMs: number | null): 'stopped' | 'gone' | 'changed' {
   const row = readProcessTable(undefined, [pid])?.find(r => r.pid === pid);
   if (!row) return 'gone';
-  if (classifyGbrainCommand(row.command) !== 'mcp' || startedMs === null || row.started_ms === null || Math.abs(row.started_ms - startedMs) > 2_000) return 'changed';
+  if (classifyGbrainCommand(row.command, { cwd: row.cwd, packageName: packageNameAt }) !== 'mcp' || startedMs === null || row.started_ms === null || Math.abs(row.started_ms - startedMs) > 2_000) return 'changed';
   try { process.kill(pid, 'SIGTERM'); return 'stopped'; } catch { return 'gone'; }
 }
 
@@ -177,8 +210,9 @@ export function restartRefusal(plan: RestartPlan, rerunArgv: readonly string[], 
 export interface HostRestartOptions { stopMcp: boolean; json: boolean; rerunArgv: string[] }
 
 /**
- * `gbrain upgrade --restart-only [--dry-run]`. `--dry-run` belongs to `--restart-only`: anywhere else it is refused,
- * never ignored while the upgrade installs for real (#2185). True when this handled the invocation.
+ * `gbrain upgrade --restart-only [--dry-run]`. True when this handled the invocation. A `--dry-run` without
+ * `--restart-only` is the channel preview (commands/upgrade-channel.ts runUpgradeDryRun), which installs nothing, so it
+ * is still never ignored while the upgrade installs for real (#2185).
  */
 export async function handleRestartOnly(args: readonly string[], opts: HostRestartOptions): Promise<boolean> {
   const dryRun = args.includes('--dry-run');
@@ -186,9 +220,7 @@ export async function handleRestartOnly(args: readonly string[], opts: HostResta
     await runHostRestart({ ...opts, rerunArgv: ['gbrain', 'upgrade', '--restart-only', ...(opts.stopMcp ? ['--stop-mcp'] : [])], dryRun });
     return true;
   }
-  if (!dryRun) return false;
-  setCliExitVerdict(writeCliError(opError('invalid_params', '--dry-run previews only a restart; nothing was installed.', 'Run gbrain upgrade --restart-only --dry-run to preview the restart.'), 'upgrade', { json: opts.json }));
-  return true;
+  return false;
 }
 
 /** The package directory this process loaded its code from (realpath), the install the upgrade replaces. */
@@ -252,15 +284,7 @@ export async function runHostRestart(opts: HostRestartOptions & { dryRun: boolea
     if (refusal) { setCliExitVerdict(writeCliError(refusal, 'upgrade', { json: opts.json })); return; }
     if (!opts.json) printPlan(plan, warmBefore, notes);
     const startedMs = Date.now();
-    const results = await runRestartSteps(plan, {
-      run: (argv, env) => {
-        const r = spawnSync(argv[0]!, argv.slice(1), { encoding: 'utf8', timeout: 600_000, stdio: ['ignore', 'pipe', 'pipe'], env: env ? { ...process.env, ...env } : process.env });
-        return { status: r.error ? null : r.status, output: `${r.stdout ?? ''}${r.stderr ?? ''}${r.error ? r.error.message : ''}` };
-      },
-      terminate: terminateIfUnchanged,
-      supervisorPid: file => { const status = readSupervisorPid(file ?? pidFile); return status.running ? status.pid : null; },
-      sleep: ms => new Promise(r => setTimeout(r, ms)),
-    });
+    const results = await runRestartSteps(plan, hostExecutor(pidFile));
     if (!opts.json) for (const r of results) console.log(`  ${r.ok ? 'ok' : 'FAILED'}: ${r.detail}`);
     const verified = await verifyRestart(plan, startedMs, warmBefore, {
       collect: () => collectHostProcesses(sources), probeWarmSocket: () => probeCliSocket(),
@@ -285,6 +309,85 @@ export async function runHostRestart(opts: HostRestartOptions & { dryRun: boolea
     if (stopped.length) console.log(`Reconnect gbrain in the harness of each stopped MCP server (${stopped.map(s => `pid ${s.pid}`).join(', ')}): Claude Code /mcp, then reconnect; other harnesses: start a new session.`);
   } finally {
     await close();
+  }
+}
+
+export type ServeRestartOutcome = { outcome: 'no_service' | 'current' } | { outcome: 'manual' | 'restarted' | 'unverified'; detail: string };
+
+/**
+ * #7475: the serve-only restart plan when the serve service can move every older serve onto `expected` by itself;
+ * otherwise the outcome. A serve counts as older only on evidence: a recorded build below `expected`, or no recorded
+ * build and a start before the install on disk was written (`installedMs`). A newer or unknown serve is left alone.
+ */
+export function planServeRestart(processes: readonly HostProcess[], serveService: ServiceHandle, expected: string, ownRoot: string | null, installedMs: number | null = null): RestartPlan | ServeRestartOutcome {
+  const older = processes.filter(p => p.role === 'serve' && (p.version !== null
+    ? (compareWriterVersions(p.version, expected) ?? 0) < 0
+    : installedMs !== null && p.started_ms !== null && p.started_ms < installedMs));
+  const plan = planRestart(older, { expected, serveService, autopilotService: null, stopMcp: false, ownInstallRoot: ownRoot });
+  if (!plan.stale.length) return { outcome: 'current' };
+  if (plan.manual.length || plan.steps.some(step => step.kind !== 'service')) {
+    return { outcome: 'manual', detail: `run \`gbrain upgrade --restart-only\`: ${[...describeSteps(plan), ...plan.manual.map(m => m.instruction)].join(' ')}` };
+  }
+  return plan;
+}
+
+/**
+ * #7475: the autopilot self-upgrade swaps and relaunches only itself. Once it runs the new build, it calls this to
+ * restart the serve the installed serve service runs when that serve is on an older build, and to verify it came
+ * back on this one. Serve only: a stale serve the service does not run (started by hand, or from another install)
+ * is reported as `manual` and left to doctor's `runtime_build_skew` and `gbrain upgrade --restart-only`.
+ */
+export async function restartStaleServeService(): Promise<ServeRestartOutcome> {
+  const services = hostServices();
+  if (!services.serve) return { outcome: 'no_service' };
+  const { sources, close, pidFile } = await hostSources();
+  try {
+    const collectServe = async () => (await collectHostProcesses(sources)).filter(p => p.role === 'serve');
+    const root = ownInstallRoot();
+    const onDisk = installedVersion(root);
+    if (onDisk !== VERSION) return { outcome: 'manual', detail: `the install on disk holds ${onDisk ? `v${onDisk}` : 'an unknown build'}, not this autopilot's v${VERSION}; run \`gbrain upgrade --restart-only\`` };
+    let installedMs: number | null = null;
+    try { installedMs = statSync(join(root!, 'package.json')).mtimeMs; } catch { /* no install time: a serve with no recorded build stays as it is */ }
+    const plan = planServeRestart(await collectServe(), services.serve, VERSION, root, installedMs);
+    if (!('steps' in plan)) return plan;
+    const { probeCliSocket } = await import('../core/cli-socket/probe.ts');
+    const warmBefore = await probeCliSocket();
+    const startedMs = Date.now();
+    const results = await runRestartSteps(plan, hostExecutor(pidFile));
+    const verified = await verifyRestart(plan, startedMs, warmBefore, {
+      collect: collectServe, probeWarmSocket: () => probeCliSocket(),
+      sleep: ms => new Promise(r => setTimeout(r, ms)), now: () => Date.now(),
+    }, { timeoutMs: VERIFY_TIMEOUT_MS, pollMs: VERIFY_POLL_MS });
+    const problems = [...results.filter(r => !r.ok).map(r => r.detail), ...verified.problems];
+    return { outcome: verified.ok ? 'restarted' : 'unverified', detail: `${describeSteps(plan).join(' ')}${problems.length ? `; ${problems.join(' ')}` : ''}` };
+  } finally {
+    await close();
+  }
+}
+
+export type ServeRestartDeps = { state: { tried: boolean }; restart: () => Promise<ServeRestartOutcome> };
+const SERVE_RESTART_DEPS: ServeRestartDeps = { state: { tried: false }, restart: restartStaleServeService };
+
+/**
+ * #7475: the autopilot daemon calls this each tick. In auto mode, under the self-upgrade swap's own quiet-hours and
+ * idle gates, the autopilot (relaunched on the new build after its swap) restarts the stale serve the serve service
+ * runs, and audits the outcome as `restart_serve`. One attempt per autopilot process; the relaunch after the next
+ * swap tries again. Never throws.
+ */
+export async function restartServeAfterSelfUpgrade(isIdle: () => Promise<boolean>, deps: ServeRestartDeps = SERVE_RESTART_DEPS): Promise<void> {
+  if (deps.state.tried) return;
+  try {
+    const cfg = loadConfig();
+    if (!cfg || resolveSelfUpgradeMode(cfg) !== 'auto') return;
+    if (evaluateQuietHours(resolveQuietHoursWindow(cfg.self_upgrade?.quiet_hours), new Date()) === 'allow') return;
+    if (!await isIdle()) return;
+    deps.state.tried = true;
+    const result = await deps.restart();
+    if (!('detail' in result)) return;
+    logSelfUpgrade({ channel: 'autopilot', action: 'restart_serve', current: VERSION, outcome: result.outcome === 'restarted' ? 'applied' : 'skipped', reason: result.outcome });
+    console.log(`[autopilot] serve ${result.outcome === 'restarted' ? `restarted onto v${VERSION}` : `still on another build (${result.outcome})`}: ${result.detail}`);
+  } catch {
+    /* the serve restart must never break the autopilot tick */
   }
 }
 

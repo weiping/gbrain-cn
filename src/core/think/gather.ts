@@ -23,12 +23,14 @@ import { INTERNAL_BREADTH_SEARCH_OPTS } from '../search/internal-breadth.ts';
 import { resolveHardExcludes } from '../search/source-boost.ts';
 import { boundedProjectedPrefix } from '../page-window/document.ts';
 import { overlaidBoundedRows, pageLeadSource } from '../page-window/bounded-lead.ts';
-import type { Page, SearchResult } from '../types.ts';
+import { affectsRecall, type HybridSearchMeta, type Page, type SearchResult } from '../types.ts';
+import { GATHER_DEGRADED_PREFIX } from '../degraded-stamp.ts';
 import { DEFAULT_PAGES_BUDGET, PAGES_BLOCK_EXCERPT_FLOOR_CHARS, type PagesBudget } from './pages-budget.ts';
 import { filterPagesToWindow, type TemporalWindow } from './temporal-window.ts';
 import { pageContentDate } from './temporal-context.ts';
 import { sanitizeQueryForPrompt } from '../search/expansion.ts';
 import { evidenceTitle } from '../search/evidence-date.ts';
+import { fenceTranscriptText, neutralizeToolCalls, quoteLabel } from '../search/transcript-quote.ts';
 import { ensureWellFormed } from '../text-safe.ts';
 import { CJK_SLUG_CHARS } from '../cjk.ts';
 import type { IntentAsk } from '../search/decide-retrieval.ts';
@@ -162,6 +164,9 @@ export async function runGather(
   });
 
   let windowDiagnostic: ThinkGatherResult['diagnostics']['window'];
+  // GBRA-200: a degraded page search (keyword-only fallback, a cut arm) is reported, never silent.
+  const searchDegraded = new Set<string>();
+  const onMeta = (m: HybridSearchMeta) => { for (const d of m.degraded ?? []) if (affectsRecall(d)) searchDegraded.add(d.stage); };
 
   // Stream 1: hybrid page search (existing primitive).
   // Both legs opt out of the reader-facing trims (autocut #4561, adaptive
@@ -175,6 +180,7 @@ export async function runGather(
       ...INTERNAL_BREADTH_SEARCH_OPTS,
       ...pageScope,
       decide,
+      onMeta,
     }),
     engine.listPages({
       ...(window.startMs !== null ? { effective_after: new Date(window.startMs).toISOString() } : {}),
@@ -201,6 +207,7 @@ export async function runGather(
     ...INTERNAL_BREADTH_SEARCH_OPTS,
     ...pageScope,
     decide,
+    onMeta,
   })).catch((e) => {
     warnings.push('GATHER_HYBRID_FAILED');
     process.stderr.write(`[think.gather] hybrid stream failed: ${(e as Error).message}\n`);
@@ -302,6 +309,7 @@ export async function runGather(
     (h: TakeHit) => `${h.page_slug}#${h.row_num}`,
   ).slice(0, takesLimit);
 
+  for (const stage of searchDegraded) warnings.push(`${GATHER_DEGRADED_PREFIX}${stage}`);
   return {
     pages: pages.slice(0, gatherLimit),
     takes: fusedTakes,
@@ -664,7 +672,11 @@ export function renderPagesBlockDetailed(
     const slug = String(page.slug ?? '');
     const title = String(page.title ?? '');
     const slugIdentity = slug.split('/').pop()?.replace(/[-_]/g, ' ') ?? '';
-    const content = String(page.chunk_text ?? page.compiled_truth ?? page.snippet ?? '');
+    const raw = String(page.chunk_text ?? page.compiled_truth ?? page.snippet ?? '');
+    // #8042: a chat page's text is quoted (tool calls summarized before the excerpt, the rendered text fenced).
+    const quote = quoteLabel({ ...p, chunk_text: raw });
+    const content = quote === null ? raw : neutralizeToolCalls(raw);
+    const quoted = (text: string) => (quote === null ? text : fenceTranscriptText(text, quote));
     const flag = (p.injection_suspected ? `${INJECTION_SUSPECTED_LINE}\n` : '')
       + (p.trust_tier && needsDataEnvelope(p.trust_tier) ? `${EXTERNAL_DATA_RULE}\n` : '') + graphEvidenceLine(p);
     const trustAttr = p.trust_tier ? ` ${trustAttributes({ trust_tier: p.trust_tier, origin: p.origin ?? 'legacy' })}` : '';
@@ -675,7 +687,7 @@ export function renderPagesBlockDetailed(
     if (typeof opts.verbatim === 'function' ? opts.verbatim(p) : opts.verbatim) {
       const cap = opts.verbatimLen ?? excerptLen;
       if (content.length > cap || (p as { delivered?: { truncated?: boolean } }).delivered?.truncated === true) truncated = true;
-      return `<page slug="${slug}" rank="${idx + 1}"${titleAttr}${dateAttr}${trustAttr}>\n${flag}${content.slice(0, cap)}\n</page>`;
+      return `<page slug="${slug}" rank="${idx + 1}"${titleAttr}${dateAttr}${trustAttr}>\n${flag}${quoted(content.slice(0, cap))}\n</page>`;
     }
     const excerpt = selectRelevantExcerptDetailed(
       content,
@@ -688,7 +700,7 @@ export function renderPagesBlockDetailed(
       (excerpt.truncatedStart ? `${EXCERPT_CUT_START_MARKER}\n` : '') +
       excerpt.text +
       (excerpt.truncatedEnd ? `\n${EXCERPT_CUT_END_MARKER}` : '');
-    return `<page slug="${slug}" rank="${idx + 1}"${titleAttr}${dateAttr}${trustAttr}>\n${flag}${body}\n</page>`;
+    return `<page slug="${slug}" rank="${idx + 1}"${titleAttr}${dateAttr}${trustAttr}>\n${flag}${quoted(body)}\n</page>`;
   }).join('\n\n');
   return { text, truncated };
 }

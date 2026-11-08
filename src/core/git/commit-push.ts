@@ -33,6 +33,7 @@ import { gitChildEnv, literalPathspecs } from '../git-env.ts';
 import { GIT_ENV, GIT_ENV_AUTH, GIT_SSRF_SUBCOMMAND_FLAGS, durableSsrfFlags } from '../git-transport.ts';
 import { assertManagedFilesystemWrite, hasFilesystemPublication, managedFilesystemRootFor, type ManagedFilesystemRoot } from '../persistence/filesystem-guard.ts';
 import { acquireNativeLock, acquireNativeLockSync, type NativeLockSyncHandle } from '../persistence/native-lock.ts';
+import { recordCommit, recordIntent } from './commit-ledger.ts';
 import { OperationError, opError } from '../ops/contract.ts';
 import { shellQuote } from '../agent-output.ts';
 
@@ -100,7 +101,11 @@ export interface CommitPushOptions {
   lockWaitMs?: number;
   /** `--resolve`: blob choice per conflicted path for the in-memory merge. */
   resolutions?: Map<string, Resolution>;
-  /** `--expect-remote`: the remote commit the resolutions were chosen against (required with resolutions). */
+  /**
+   * `--expect-remote`: the remote commit the resolutions were chosen against (required with resolutions). Without
+   * resolutions it binds the publish (#7686): HEAD is merged with that commit, pushed with a lease on it, and a remote that
+   * moved anywhere else refuses, so a rewrite made after the caller checked the remote is never merged back.
+   */
   expectRemote?: string;
   /** How long a foreground publish waits for another publish to finish. */
   publishWaitMs?: number;
@@ -114,6 +119,8 @@ export interface CommitPushOptions {
   pending?: boolean;
   /** Commit and publish files outside the configured source root(s): the user's explicit choice, or gbrain's own scaffolding at the checkout root. */
   allowOutsideSourceRoot?: boolean;
+  /** `--base <path>=<blob>`: the blob (or `absent`) each named path had at HEAD when the writer read it; a moved one refuses `commit_base_moved`. */
+  bases?: Map<string, string>;
 }
 
 export type Resolution = { kind: 'ours' } | { kind: 'theirs' } | { kind: 'file'; path: string };
@@ -413,7 +420,19 @@ function restoreIndex(root: string, rel: string[], before: string[]): void {
   if (records.length) withIndexRetry(root, ['update-index', '-z', '--index-info'], 'index restore', undefined, records.map(l => `${l}\0`).join(''));
 }
 
-interface CommitScope { roots: string[]; lockPath: string; markHeld: boolean }
+interface CommitScope { roots: string[]; lockPath: string; markHeld: boolean; bases?: ReadonlyMap<string, string> }
+
+/** `--base` keyed by the repository-relative path it names; each must also be a committed path. */
+function scopeBases(root: string, opts: CommitPushOptions, rel: string[]): Map<string, string> | undefined {
+  if (!opts.bases?.size) return undefined;
+  const scoped = new Map<string, string>();
+  for (const [path, blob] of opts.bases) {
+    const [key] = scopePaths(root, [path], opts.cwd ?? process.cwd());
+    if (!key || !rel.includes(key)) throw opError('commit_paths_invalid', `--base names ${path}, which is not one of the paths to commit.`, 'Name every --base path after -- as well.');
+    scoped.set(key, blob);
+  }
+  return scoped;
+}
 
 /**
  * Stage and commit exactly `rel` (the caller holds the commit lock). Refused
@@ -424,6 +443,12 @@ interface CommitScope { roots: string[]; lockPath: string; markHeld: boolean }
 function commitPaths(root: string, rel: string[], message: string, scope: CommitScope): string | null {
   const outside = rel.filter(p => !insideSourceRoots(p, scope.roots));
   if (outside.length) throw outsideRootError(root, scope.roots, outside, 'Refusing to commit');
+  for (const [path, base] of scope.bases ?? []) {
+    const head = git(root, ['rev-parse', '--verify', '-q', `HEAD:${path}`]).stdout.trim() || 'absent';
+    if (head !== base) throw opError('commit_base_moved', `${path} changed at HEAD since the writer read it (base ${base}, HEAD ${head}).`,
+      `Nothing was staged or committed. Read ${path} at HEAD again (git -C ${root} show HEAD:${path}), redo the change on it, and rerun with --base ${path}=${head}.`,
+      { detail: JSON.stringify({ path, base, head }), docs: 'docs/guides/shared-checkout-git.md#base-check' });
+  }
   const swept = stagedPaths(root).filter(p => !rel.includes(p) && rel.some(spec => covers(spec, p)));
   if (swept.length) {
     const list = `${swept.slice(0, 10).join(', ')}${swept.length > 10 ? ', ...' : ''}`;
@@ -448,12 +473,15 @@ function commitPaths(root: string, rel: string[], message: string, scope: Commit
     const env = { [COMMIT_VIA_ENV]: scope.lockPath, ...(scope.markHeld ? { [COMMIT_LOCK_ENV]: scope.lockPath } : {}) };
     // #7759: literal per path, never git's global --literal-pathspecs: Git exports that to the commit's hooks, where a
     // guard's glob pathspec ('*.json') then matches nothing and lets the commit through.
+    recordIntent(root, { writer: 'commit_push', head_before: git(root, ['rev-parse', '--verify', '--quiet', 'HEAD']).stdout.trim() || null, message });
     const commit = withIndexRetry(root, ['commit', '--only', '-m', message, '--', ...literalPathspecs(paths)], 'git commit', env);
     if (commit.code !== 0) {
       throw opError('git_unavailable', `git commit failed in ${root}; the paths were unstaged again and keep their bytes.`,
         `${commit.stderr.trim().slice(0, 300)} A missing git identity (user.name, user.email) or a refusing pre-commit hook are common causes.`);
     }
-    return gitOk(root, ['rev-parse', 'HEAD'], 'rev-parse HEAD');
+    const sha = gitOk(root, ['rev-parse', 'HEAD'], 'rev-parse HEAD');
+    recordCommit(root, { sha, writer: 'commit_push' });
+    return sha;
   } catch (e) {
     try { restoreIndex(root, rel, before); } catch { /* the index lock outlasted the retries; the error below still stands */ }
     throw e;
@@ -500,8 +528,12 @@ export function pendingWriteThroughStillDirty(repo: string): PendingWriteThrough
   return pending.filter(e => dirty.has(e.path));
 }
 
-/** Appends without the lock (O_APPEND), so a writer that could not get it still records its file. */
-function notePending(root: string, paths: string[]): void {
+/**
+ * Appends without the lock (O_APPEND), so a writer that could not get it still records its file. `root` is the checkout
+ * root and `paths` are relative to it (`scopePaths`). The derived write-through also records each file right after writing
+ * it (#8073), so a crash before its commit leaves the file for the next locked commit to sweep.
+ */
+export function notePending(root: string, paths: string[]): void {
   try { appendFileSync(absGitPath(root, PENDING_NAME), paths.map(p => `${new Date().toISOString()}\t${JSON.stringify(p)}\n`).join('')); } catch { /* best-effort */ }
 }
 
@@ -701,6 +733,7 @@ function integrate(root: string, local: string, remote: string): Integration {
     for (const p of step.conflicts) conflicts.add(p);
     for (const p of step.structural) structural.add(p);
     acc = gitOk(root, ['commit-tree', '--no-gpg-sign', step.tree!, '-p', acc, '-m', 'gbrain: replay'], 'commit-tree');
+    recordCommit(root, { sha: acc, writer: 'replay', ref: null });
   }
   return { tree: treeOf(root, acc), conflicts: [...conflicts], structural: [...structural], skipped };
 }
@@ -806,7 +839,9 @@ function buildMerge(ctx: Ctx, ours: string, theirs: string, tree: string, skippe
   const remote = `${ctx.remote}/${ctx.mergeRef.replace(/^refs\/heads\//, '')}`;
   const note = skipped.length
     ? ['-m', `Left out ${skipped.length} local commit(s) whose patch ${remote} already has: ${skipped.slice(0, 20).map(s => s.slice(0, 12)).join(' ')}${skipped.length > 20 ? ' ...' : ''}`] : [];
-  return gitOk(ctx.root, ['commit-tree', tree, '-p', ours, '-p', theirs, '-m', `gbrain: merge ${remote} into ${ctx.branch}`, ...note, ...extra.flatMap(m => ['-m', m])], 'commit-tree');
+  const sha = gitOk(ctx.root, ['commit-tree', tree, '-p', ours, '-p', theirs, '-m', `gbrain: merge ${remote} into ${ctx.branch}`, ...note, ...extra.flatMap(m => ['-m', m])], 'commit-tree');
+  recordCommit(ctx.root, { sha, writer: 'merge', ref: null });
+  return sha;
 }
 
 function fetchTracking(ctx: Ctx): string | null {
@@ -887,6 +922,7 @@ export function readQuarantine(repo: string): QuarantineEntry[] {
  * a merge built over it earlier) is returned so a lagging checkout catches up.
  */
 function publish(ctx: Ctx, start: string, resolutions: Map<string, Resolution> | undefined, expectRemote: string | undefined, cwd: string): Published {
+  const bound = expectRemote && !resolutions?.size ? gitOk(ctx.root, ['rev-parse', '--verify', `${expectRemote}^{commit}`], 'rev-parse --expect-remote') : undefined;
   let candidate = start;
   let integrated = 0;
   let lastError = '';
@@ -900,15 +936,22 @@ function publish(ctx: Ctx, start: string, resolutions: Map<string, Resolution> |
   };
   for (let attempt = 0; attempt < MAX_PUSH_ATTEMPTS; attempt++) {
     if (attempt) Atomics.wait(sleeper, 0, 0, Math.min(2000, 50 * 2 ** attempt) + Math.floor(Math.random() * 100));
-    const push = remoteGit(ctx.root, 'push', [...(ctx.keepCheckout ? ['--no-verify'] : []), '--', ctx.remote, `${candidate}:${ctx.mergeRef}`]);
-    if (push.code === 0) return { sha: candidate, integrated, confirmed: 'push', ...notes() };
-    lastError = push.stderr.trim();
-    if (remoteContains(ctx, candidate)) return onRemote();
-    const remoteTip = fetchTracking(ctx);
-    if (!remoteTip) break;
-    if (isAncestor(ctx.root, remoteTip, candidate)) {
-      if (++stalled > 1) break;
-      continue;
+    let remoteTip = bound && !isAncestor(ctx.root, bound, candidate) ? bound : null;
+    if (!remoteTip) {
+      const push = remoteGit(ctx.root, 'push', [...(ctx.keepCheckout ? ['--no-verify'] : []), ...(bound ? [`--force-with-lease=${ctx.mergeRef}:${bound}`] : []), '--', ctx.remote, `${candidate}:${ctx.mergeRef}`]);
+      if (push.code === 0) return { sha: candidate, integrated, confirmed: 'push', ...notes() };
+      lastError = push.stderr.trim();
+      if (remoteContains(ctx, candidate)) return onRemote();
+      remoteTip = fetchTracking(ctx);
+      if (!remoteTip) break;
+      if (bound && remoteTip !== bound) {
+        throw opError('push_unconfirmed', `The remote moved to ${remoteTip.slice(0, 12)} after --expect-remote ${bound.slice(0, 12)} was checked, so nothing was pushed: publishing now could merge back commits a rewrite removed.`,
+          'Check the remote history first (gbrain sources refresh checks it for a force-push), then rerun.', { detail: candidate, retryable: true });
+      }
+      if (isAncestor(ctx.root, remoteTip, candidate)) {
+        if (++stalled > 1) break;
+        continue;
+      }
     }
     const raw = integrate(ctx.root, candidate, remoteTip);
     const kept = supersededPaths(ctx.root, candidate, remoteTip, raw, resolutions);
@@ -1086,7 +1129,7 @@ function commitPathsOnly(root: string, opts: CommitPushOptions, where: string, r
   let committed: string | null;
   try {
     assertNoOperationInProgress(root);
-    committed = commitPaths(root, rel, opts.message.trim(), { roots, lockPath: lock.lockPath, markHeld: true });
+    committed = commitPaths(root, rel, opts.message.trim(), { roots, lockPath: lock.lockPath, markHeld: true, bases: scopeBases(root, opts, rel) });
   } finally {
     lock.release();
   }
@@ -1119,7 +1162,7 @@ export function commitAndPush(opts: CommitPushOptions): CommitPushResult {
     const lock = acquireCommitLock(root, opts.lockWaitMs);
     try {
       assertNoOperationInProgress(root);
-      committed = rel.length ? commitPaths(root, rel, opts.message!.trim(), { roots: opts.allowOutsideSourceRoot ? [''] : roots, lockPath: lock.lockPath, markHeld: true }) : null;
+      committed = rel.length ? commitPaths(root, rel, opts.message!.trim(), { roots: opts.allowOutsideSourceRoot ? [''] : roots, lockPath: lock.lockPath, markHeld: true, bases: scopeBases(root, opts, rel) }) : null;
       settlePending(root);
     } finally {
       lock.release();
@@ -1144,14 +1187,14 @@ export function commitAndPush(opts: CommitPushOptions): CommitPushResult {
       { detail: committed ?? '', retryable: true });
   }
 
-  const cycle = (onlyWhenClean: boolean, start: string | null, resolutions?: Map<string, Resolution>) => {
+  const cycle = (onlyWhenClean: boolean, start: string | null, resolutions?: Map<string, Resolution>, expectRemote?: string) => {
     const requested = existsSync(requestPath);
     rmSync(requestPath, { force: true });
     try {
       const head = gitOk(root, ['rev-parse', 'HEAD'], 'rev-parse HEAD');
       const target = start && !isAncestor(root, start, head) ? start : head;
       if (!opts.allowOutsideSourceRoot) assertLocalCommitsInsideRoots(ctx, target, roots);
-      const published = publish(ctx, target, resolutions, opts.expectRemote, cwd);
+      const published = publish(ctx, target, resolutions, expectRemote, cwd);
       if (!elsewhere) rmSync(absGitPath(root, CONFLICT_STATE_NAME), { force: true });
       const moved = published.sha === head || elsewhere || opts.keepCheckout ? { checkout: 'unchanged' as const } : advanceWithLock(root, published.sha, head, onlyWhenClean, opts.lockWaitMs);
       return { published, moved };
@@ -1164,7 +1207,7 @@ export function commitAndPush(opts: CommitPushOptions): CommitPushResult {
 
   let first: ReturnType<typeof cycle>;
   try {
-    first = cycle(unattended, committed, opts.resolutions);
+    first = cycle(unattended, committed, opts.resolutions, opts.expectRemote);
   } finally {
     pub.release();
   }

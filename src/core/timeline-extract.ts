@@ -13,7 +13,7 @@
 
 import { parse as parseYaml } from './yaml-lite.ts';
 import { parseInlineCitationTimelineEntries, findTimelineSourceDelimiter, parseTimelineEntries } from './link-extraction.ts';
-import { isDatedTimelineLine, supersededInlineCitationEntries } from './timeline-citations.ts';
+import { isDatedTimelineLine, isValidDate, supersededInlineCitationEntries } from './timeline-citations.ts';
 import { createHash } from 'node:crypto';
 import type { BrainEngine } from './engine.ts';
 import { firstMaterializedMarkerIndex } from './timeline-marker.ts';
@@ -47,6 +47,7 @@ export function extractTimelineFromContent(content: string, slug: string): Extra
   const bulletPattern = /^-\s+\*\*(\d{4}-\d{2}-\d{2})\*\*\s*\|\s*(.+)$/gm;
   let match;
   while ((match = bulletPattern.exec(content)) !== null) {
+    if (!isValidDate(match[1])) continue;
     const rest = match[2].trim();
     // #4277: dated auto-generated backlink receipts
     // (`- **date** | Referenced in [X](y.md)`) are graph-maintenance noise —
@@ -67,6 +68,7 @@ export function extractTimelineFromContent(content: string, slug: string): Extra
   // Format 2: Header — ### YYYY-MM-DD — Title
   const headerPattern = /^###\s+(\d{4}-\d{2}-\d{2})\s*[—–-]\s*(.+)$/gm;
   while ((match = headerPattern.exec(content)) !== null) {
+    if (!isValidDate(match[1])) continue;
     const afterIdx = match.index + match[0].length;
     const nextHeader = content.indexOf('\n### ', afterIdx);
     const nextSection = content.indexOf('\n## ', afterIdx);

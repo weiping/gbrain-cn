@@ -354,6 +354,42 @@
         "name": "derived_visibility"
       },
       {
+        "category": "brain",
+        "name": "access_readers_malformed"
+      },
+      {
+        "category": "brain",
+        "name": "access_unknown_readers"
+      },
+      {
+        "category": "brain",
+        "name": "access_recent_narrowings"
+      },
+      {
+        "category": "brain",
+        "name": "access_page_readers_backfill"
+      },
+      {
+        "category": "brain",
+        "name": "access_policy_pending"
+      },
+      {
+        "category": "brain",
+        "name": "access_policy_widening_held"
+      },
+      {
+        "category": "brain",
+        "name": "access_policy_invalid"
+      },
+      {
+        "category": "brain",
+        "name": "access_policy_store_mismatch"
+      },
+      {
+        "category": "brain",
+        "name": "access_may_act_for_wildcard"
+      },
+      {
         "category": "ops",
         "name": "rls"
       },
@@ -451,6 +487,10 @@
       },
       {
         "category": "brain",
+        "name": "segmented_tiling"
+      },
+      {
+        "category": "brain",
         "name": "timeline_history"
       },
       {
@@ -496,6 +536,10 @@
       {
         "category": "ops",
         "name": "frontmatter_hook"
+      },
+      {
+        "category": "ops",
+        "name": "url_source_origin"
       },
       {
         "category": "brain",
@@ -571,6 +615,10 @@
       },
       {
         "category": "brain",
+        "name": "unwithdrawn_facts"
+      },
+      {
+        "category": "brain",
         "name": "conversation_label_facts"
       },
       {
@@ -580,6 +628,10 @@
       {
         "category": "brain",
         "name": "captured_facts_active"
+      },
+      {
+        "category": "brain",
+        "name": "agent_session_facts"
       },
       {
         "category": "brain",
@@ -842,6 +894,10 @@
         "name": "quarantined_changes"
       },
       {
+        "category": "brain",
+        "name": "foreign_writers"
+      },
+      {
         "category": "ops",
         "name": "decide_health"
       },
@@ -868,6 +924,10 @@
       {
         "category": "brain",
         "name": "facts_drain"
+      },
+      {
+        "category": "ops",
+        "name": "wakeshift"
       },
       {
         "category": "brain",
@@ -994,6 +1054,10 @@
         "name": "sync_overwritten_db_edits"
       },
       {
+        "category": "brain",
+        "name": "sync_rows_behind_checkpoint"
+      },
+      {
         "category": "meta",
         "name": "sync_config_keys"
       },
@@ -1015,7 +1079,19 @@
       },
       {
         "category": "brain",
+        "name": "local_edit_adoptions"
+      },
+      {
+        "category": "brain",
         "name": "outside_content_fences"
+      },
+      {
+        "category": "ops",
+        "name": "owner_host_stale"
+      },
+      {
+        "category": "brain",
+        "name": "embedding_plane_disagreement"
       },
       {
         "category": "brain",
