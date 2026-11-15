@@ -46,6 +46,11 @@ export const CONFIG_API_KEY_ENV = [
   // config-plane gap started biting daemon/launchd/MCP contexts the same
   // way voyage's #2662 did).
   ['litellm_api_key', 'LITELLM_API_KEY'],
+  // Magpie's local gateway. The gateway itself does not require a Bearer
+  // token, but the fold exists so a hardened magpie build (or a remote
+  // magpie gateway) can be authenticated from the config plane the same
+  // way litellm is.
+  ['magpie_api_key', 'MAGPIE_API_KEY'],
   ['together_api_key', 'TOGETHER_API_KEY'],
   ['google_api_key', 'GOOGLE_GENERATIVE_AI_API_KEY'],
   // #4031: the Azure key was the only member of the group below left unfolded,

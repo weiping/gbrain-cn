@@ -112,6 +112,13 @@ export interface GBrainConfig {
    */
   litellm_api_key?: string;
   /**
+   * Magpie local-gateway API key. File-plane slot folded into the gateway
+   * env as MAGPIE_API_KEY (optional in the magpie recipe — the local
+   * gateway does not verify the Bearer token, so most setups leave it
+   * unset). Same fold pattern as litellm_api_key above.
+   */
+  magpie_api_key?: string;
+  /**
    * Together AI API key. File-plane slot folded into the gateway env as
    * TOGETHER_API_KEY (required by the together recipe). Same fold pattern
    * (and same DB-plane caveat) as voyage_api_key above.
@@ -1261,6 +1268,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'dashscope_api_key',
   'deepseek_api_key',
   'litellm_api_key',
+  'magpie_api_key',
   'together_api_key',
   'google_api_key',
   'azure_openai_api_key',

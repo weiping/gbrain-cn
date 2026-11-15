@@ -518,20 +518,22 @@ export async function defaultExtractor(
   // Bound each call so one stalled provider socket can't pin the phase for the
   // full gateway default (GBRAIN_AI_CHAT_TIMEOUT_MS, 300s) x pageLimit. The
   // caller already catches per-page errors, logs a warning, and continues.
-  // gbrain-cn: default to glm-4-flash for take extraction — short-form JSON
-  // (3-5 claims/page); flash handles it in 4-5s vs glm-4.7's 30-50s, and 5x
-  // more requests fit the per-minute Zhipu rate-limit window. Override via
-  // modelHint. The bound scales with maxTokens so an escalated or configured
-  // larger cap gets time to generate what it allows. An operator bound
-  // (callBoundMs) takes its place for every call: claude-cli never reports a
-  // truncation, so on that route the retry and its longer scaled bound never
-  // happen.
+  // gbrain-cn: the extractor follows the gateway's configured chat model
+  // (getChatModel()) instead of a hardcoded provider id — the same
+  // convention calibration-profile and grade_takes adopted in v0.42.62. The
+  // old 'zhipu:glm-4-flash' pin was a speed/rate-limit shortcut that also
+  // bypassed the brain's own chat_model; every non-embedding model call now
+  // goes through the configured provider (magpie). The bound scales with
+  // maxTokens so an escalated or configured larger cap gets time to generate
+  // what it allows. An operator bound (callBoundMs) takes its place for every
+  // call: claude-cli never reports a truncation, so on that route the retry
+  // and its longer scaled bound never happen.
   const call = (maxTokens: number) => {
     const boundMs = input.callBoundMs ?? extractorCallTimeoutMs(maxTokens);
     const ownBound = AbortSignal.timeout(boundMs);
     return gatewayChat({
       messages: [{ role: 'user', content: prompt }],
-      model: input.modelHint ?? 'zhipu:glm-4-flash',
+      model: input.modelHint ?? getChatModel(),
       maxTokens,
       abortSignal: ownBound,
     }).catch((err: unknown) => {
