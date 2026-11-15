@@ -30,7 +30,7 @@ import { slugConflictHoldMessage } from '../import-file.ts';
 import { isImageFilePath, isMultimodalEnabled, resolveSlugForPath } from '../sync.ts';
 import { loadActivePackForEngine } from '../schema-pack/engine-resolution.ts';
 import { VERSION } from '../../version.ts';
-import { sha256 } from './digest.ts';
+import { digest, sha256 } from './digest.ts';
 import { readPageBodyPolicy, type PageBodyPolicy } from '../page-body/limits.ts';
 import { materializedSnapshot } from './segmented-apply.ts';
 import { readPagePurgeTombstones } from './page-purge.ts';
@@ -121,6 +121,18 @@ export function pinnedFilterDriver(cursor: Pick<SyncDiscovery, 'root' | 'gitRoot
 export function driftBaselineContent(gitRoot: string, entry: Pick<SyncEntry, 'drift' | 'driftBaseline'>): string | null {
   if ((entry.drift !== 'both' && entry.drift !== 'unknown') || !entry.driftBaseline) return null;
   try { return readBlobContents(gitRoot, [{ oid: entry.driftBaseline, size: SYNC_READ_BOUND }]).get(entry.driftBaseline) ?? null; } catch { return null; }
+}
+
+/**
+ * GST-2568: whether the stored frontmatter differs from a file's only by keys gbrain itself wrote to the database: a copy of
+ * the reserved `type` key (older imports) and the grandfather's `validate: false` (#6429), each absent from the file. A
+ * page with any other difference (a protected key, a label) is not treated as unchanged since that file.
+ */
+export function onlyDerivedKeysAdded(content: string, stored: Record<string, unknown> | null | undefined): boolean {
+  const file = parseMarkdown(content, 'derived-keys.md').frontmatter;
+  const page = stored ?? {};
+  return [...new Set([...Object.keys(file), ...Object.keys(page)])].every(key => digest(file[key] ?? null) === digest(page[key] ?? null)
+    || !Object.hasOwn(file, key) && (key === 'type' || key === 'validate' && page[key] === false));
 }
 
 /** #7199: whether the page still holds what the entry's baseline or one of its earlier committed versions (`driftHistory`) imports, tried in order. */
@@ -335,6 +347,8 @@ export interface FrozenImportScreen {
   retryCommand: string;
   /** #6188 dry run: told the fixes when Tier 1 admits the file by rewriting a fence. */
   onNormalized?: (fixes: FenceFix[]) => void;
+  /** GBRA-133: the freeze's timer turn, taken after the filter driver's Git read so the screen that follows starts a stretch of its own. */
+  turn?: () => Promise<void>;
 }
 
 /**
@@ -402,6 +416,7 @@ export async function screenFrozenImport(engine: BrainEngine, input: FrozenImpor
   const filtered = filterOwnedRefusal(entry.path, content, entry.working || !gitRoot || !target || !entries ? null
     : pinnedFilterDriver({ ...input.cursor, gitRoot, target, entries }, entry.path), input.cursor.sourceId, true);
   if (filtered) return heldEntry(entry, slug, pageId, filtered, content, blob);
+  await input.turn?.();
   // GBRA-133 S-39: text holding NUL cannot be stored or carried in the write intent; only this file is held. A slug conflict
   // still names the hold (#6749): its message carries the path alone, and the slug-conflicts lane reports NULL_BYTES as still_invalid.
   const nul = nullBytesRefusal(entry.path, content);

@@ -80,6 +80,13 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     run: async (engine, scope) => { const { derivedVisibilityCheck } = await import('./checks/derived-visibility.ts'); return perSource(scope, id => derivedVisibilityCheck(engine, id)); },
   },
   {
+    id: 'privacy_label_ignored', resolution: 'operator', registration: 'wave',
+    count: d => Number(d.pages ?? 0),
+    impact: 'Some pages carry an access or confidentiality value gbrain does not read as private, so the label does not hide them from remote callers or keep them out of git',
+    instruction: 'List the pages with `gbrain list --where <key>=<value> --json` on the brain host and add `visibility: private` to each page that should stay private; gbrain rewrites no label itself.',
+    run: async (engine, scope) => (await import('./checks/privacy-label-ignored.ts')).privacyLabelIgnoredCheck(engine, scope.sourceIds),
+  },
+  {
     id: 'safe_index_pending', resolution: 'repair', registration: 'wave',
     count: d => Number(d.pages_pending ?? 0),
     impact: 'Some pages are below the safe-chunk index version and are withheld from remote search',
@@ -251,6 +258,20 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     impact: 'A dream synthesis key keeps dying and was paid for on each attempt',
     instruction: 'Fix the cause, then reset the breaker with the command doctor prints.',
     run: async engine => (await import('./checks/dream-breaker.ts')).dreamPaidLoopCheck(engine),
+  },
+  {
+    id: 'dream_write_deferred', resolution: 'operator', registration: 'wave',
+    count: d => (d.items ?? []).filter((item: { replays: number; bound: number }) => item.replays >= item.bound).length,
+    impact: 'A dream phase write is still pending after its replay bound, so the phase submits nothing more for that source',
+    instruction: 'Read the receipt with the `gbrain write-request` command doctor prints; if the writer is stuck, `gbrain sources writer status --source <id> --json` names why.',
+    run: async (engine, scope) => (await import('./checks/dream-write-deferred.ts')).dreamWriteDeferredCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'embedding_restamp_stalled', resolution: 'operator', registration: 'wave',
+    count: d => (d.last ? 1 : 0),
+    impact: 'The free embedding signature restamp keeps failing, so current vectors still read as another model\'s space',
+    instruction: 'Fix the error doctor prints, then run `gbrain dream --phase embed` once.',
+    run: async engine => (await import('./checks/embedding-restamp.ts')).embeddingRestampStalledCheck(engine),
   },
   {
     id: 'writer_version', resolution: 'operator', registration: 'wave',

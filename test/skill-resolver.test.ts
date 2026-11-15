@@ -23,10 +23,10 @@ import {
   buildSkillIndex, catalogStatus, removeSkillIndex, resolveSkills, sessionStatus, ResolverError, BLOCK_TOKEN_CAP, type TurnInput,
 } from '../src/core/skills/resolver/index.ts';
 import { lexTerms } from '../src/core/skills/resolver/tokenize.ts';
-import { isAcknowledgement, mentionsSkill } from '../src/core/skills/resolver/rank.ts';
+import { isAcknowledgement, maxIdf, mentionsSkill } from '../src/core/skills/resolver/rank.ts';
 import { estimateTokens } from '../src/core/skills/resolver/block.ts';
 import { acquireLease, holdsLease, releaseLease, tryAcquireLease } from '../src/core/skills/resolver/lock.ts';
-import { commitSession, commitSessionAsync, gcSessions, loadSession, sessionKey } from '../src/core/skills/resolver/session.ts';
+import { commitSession, commitSessionAsync, gcSessions, gcSessionsAsync, loadSession, sessionGcSettled, sessionKey } from '../src/core/skills/resolver/session.ts';
 import { catalogFile } from '../src/core/skills/resolver/paths.ts';
 import { appendDailyLog, appendDailyLogSync, DAILY_LOG_DAY_CAP_BYTES, dailyLogFile, LANE_LOG, readRecentDailyLog, RESOLVER_LOG } from '../src/core/skills/resolver/daily-log.ts';
 import { EXCLUDE_MAX, STAT_CHECK_SLICE } from '../src/core/skills/resolver/resolve.ts';
@@ -115,6 +115,69 @@ describe('turn rules', () => {
     expect([strict.output.suggestions, strict.output.block, strict.output.no_skill]).toEqual([[], '', false]);
     const named = await resolveSkills({ message: 'use the desc-3 skill', min_match_strength: 'named' }, { home });
     expect(named.output.suggestions.map(s => s.id)).toEqual(['x:desc-3']);
+  });
+
+  test('top_gate empties the block when the best skill scores below it over its catalog maxIdf; off by default and at 0, a named skill bypasses it, nothing gated is committed', async () => {
+    const home = tmp();
+    await jsonCatalog(home, 'c', BASIC);
+    const open = await resolveSkills({ message: 'team status', session_id: 'g' }, { home });
+    expect(open.output.suggestions[0]!.id).toBe('gbrain:reports');
+    const top = open.output.suggestions[0]!.score / maxIdf(BASIC.length);
+    const below = await resolveSkills({ message: 'team status', top_gate: top + 0.01, session_id: 'g2' }, { home });
+    expect([below.output.block, below.output.suggestions, below.output.block_reason, below.output.no_skill]).toEqual(['', [], 'weak_top_match', false]);
+    expect(below.pending!.delta.suggested).toEqual([]);
+    expect((await resolveSkills({ message: 'team status', top_gate: top - 0.01 }, { home })).output.suggestions[0]!.id).toBe('gbrain:reports');
+    expect((await resolveSkills({ message: 'team status', top_gate: 0 }, { home })).output.suggestions).toEqual((await resolveSkills({ message: 'team status' }, { home })).output.suggestions);
+    const named = await resolveSkills({ message: 'use the deploy skill', top_gate: 100 }, { home });
+    expect(named.output.suggestions[0]).toMatchObject({ id: 'gbrain:deploy', match_strength: 'named' });
+  });
+
+  test('top_gate reads the best skill the block would show: an excluded top skill does not open it, and an empty window stays filtered', async () => {
+    const home = tmp();
+    await jsonCatalog(home, 'c', BASIC);
+    const open = await resolveSkills({ message: 'weekly meeting notes' }, { home });
+    const [top, second] = open.output.suggestions;
+    expect(second!.score).toBeLessThan(top!.score);
+    const gate = (top!.score + second!.score) / 2 / maxIdf(BASIC.length);
+    expect((await resolveSkills({ message: 'weekly meeting notes', top_gate: gate }, { home })).output.suggestions[0]!.id).toBe(top!.id);
+    const excluded = await resolveSkills({ message: 'weekly meeting notes', exclude: [top!.id], top_gate: gate }, { home });
+    expect([excluded.output.suggestions, excluded.output.block_reason]).toEqual([[], 'weak_top_match']);
+    const none = await resolveSkills({ message: 'weekly meeting notes', exclude: open.output.suggestions.map(s => s.id), top_gate: 0.0001 }, { home });
+    expect(none.output.block_reason).toBe('filtered');
+  });
+
+  test('top_gate reads the skills left after session dedupe: a deduped strong skill does not open it for a weak one', async () => {
+    const home = tmp();
+    await jsonCatalog(home, 'c', [
+      { id: 'x:release-widget', name: 'release-widget', description: 'Release the widget staging service' },
+      { id: 'x:deploy-notes', name: 'deploy-notes', description: 'Write deploy notes for the team' },
+    ]);
+    const msg = 'deploy release widget staging service';
+    const open = await resolveSkills({ message: msg }, { home });
+    expect(open.output.suggestions.map(s => s.id)).toEqual(['x:release-widget', 'x:deploy-notes']);
+    const [strong, weak] = open.output.suggestions.map(s => s.score / maxIdf(2));
+    const gate = (strong! + weak!) / 2;
+    expect(weak!).toBeLessThan(gate);
+    const first = await resolveSkills({ message: 'release widget staging service', session_id: 'dd', top_gate: gate }, { home });
+    expect(first.output.suggestions.map(s => s.id)).toEqual(['x:release-widget']);
+    expect(await first.commit()).toBe(true);
+    const again = await resolveSkills({ message: msg, session_id: 'dd', top_gate: gate }, { home });
+    expect([again.output.suggestions, again.output.block, again.output.block_reason, again.output.deduped]).toEqual([[], '', 'weak_top_match', ['x:release-widget']]);
+    expect(again.pending!.delta.suggested).toEqual([]);
+    const named = await resolveSkills({ message: 'use the deploy-notes skill', session_id: 'dd', top_gate: 100 }, { home });
+    expect(named.output.suggestions.map(s => s.id)).toEqual(['x:deploy-notes']);
+  });
+
+  test('top_gate reads the same at any catalog size: the score is divided by the maxIdf of its own catalog', async () => {
+    const home = tmp();
+    const pad = (n: number) => Array.from({ length: n }, (_, i) => ({ id: `p:${word(i, 3)}`, name: word(i, 3), description: Array.from({ length: 8 }, (_, s) => word(i, 5 + s)).join(' ') }));
+    await jsonCatalog(home, 'small', BASIC);
+    await jsonCatalog(home, 'large', [...BASIC, ...pad(400)]);
+    const small = await resolveSkills({ message: 'team status' }, { home, catalogs: ['small'] });
+    const large = await resolveSkills({ message: 'team status' }, { home, catalogs: ['large'] });
+    const ratio = (r: typeof small, n: number) => r.output.suggestions[0]!.score / maxIdf(n);
+    expect(large.output.suggestions[0]!.score).toBeGreaterThan(small.output.suggestions[0]!.score * 2);
+    expect(Math.abs(ratio(large, BASIC.length + 400) - ratio(small, BASIC.length))).toBeLessThan(0.15 * ratio(small, BASIC.length));
   });
 
   test('previous_user_message is ranked only when the current message matches nothing', async () => {
@@ -217,6 +280,7 @@ describe('turn rules', () => {
     expect(r.output.suggestions.length).toBe(2);
     expect(r.output.suggestions.map(s => s.id)).not.toContain('gbrain:meeting-notes');
     for (const bad of [{}, { message: 1 }, { message: 'x', top_k: 9 }, { message: 'x', top_k: 0 }, { message: 'x', extra: 1 }, { message: 'x', exclude: new Array(EXCLUDE_MAX + 1).fill('a') }, { message: 'x', min_match_strength: 'weak' },
+      { message: 'x', top_gate: -1 }, { message: 'x', top_gate: 101 }, { message: 'x', top_gate: '1' }, { message: 'x', top_gate: Number.NaN },
       { message: 'x', session_id: 'has space' }, { message: 'x', session_id: 'é' }, { message: 'x', session_id: 'a'.repeat(257) }, { message: 'x', harness: 'vim' }, { message: 'x', expected_catalog_hash: 'abc' }]) {
       expect(await codeOf(resolveSkills(bad as TurnInput, { home }))).toBe('skill_resolve_invalid_input');
     }
@@ -300,6 +364,35 @@ describe('sessions', () => {
     expect(reset.output.block).not.toBe('');
     await reset.commit();
     expect(loadSession(home, key).turn).toBe(1);
+  });
+
+  test('a spent budget stays spent on an acknowledgement or a no-match turn (HARN-52)', async () => {
+    const home = tmp();
+    await jsonCatalog(home, 'c', BASIC);
+    await commitSession(home, sessionKey('on', 'claude-code', 'a'), { tokens: 2000, suggested: [], resuggested: [], reset: false });
+    for (const message of ['ok thanks', 'zzqxv']) {
+      const r = await resolveSkills({ message, session_id: 'a', harness: 'claude-code' }, { home });
+      expect([r.output.no_skill, r.output.budget_exhausted, r.output.block_reason]).toEqual([true, true, message === 'zzqxv' ? 'no_match' : 'ack']);
+    }
+    expect((await resolveSkills({ message: 'ok thanks', session_id: 'fresh', harness: 'claude-code' }, { home })).output.budget_exhausted).toBe(false);
+  });
+
+  test('block_reason says why a block is empty: deduped, paced, budget_exhausted, filtered, shadow', async () => {
+    const home = tmp();
+    await jsonCatalog(home, 'c', BASIC);
+    const first = await resolveSkills({ message: 'deploy', session_id: 'd' }, { home, sessionTokenBudget: 50_000 });
+    expect(first.output.block_reason).toBeNull();
+    await first.commit();
+    const again = await resolveSkills({ message: 'deploy', session_id: 'd' }, { home, sessionTokenBudget: 50_000 });
+    expect([again.output.block, again.output.block_reason]).toEqual(['', 'deduped']);
+    await commitSession(home, sessionKey('on', undefined, 'p'), { tokens: 1000, suggested: [], resuggested: [], reset: false });
+    const paced = await resolveSkills({ message: 'team status', session_id: 'p' }, { home });
+    expect([paced.output.block, paced.output.block_reason]).toEqual(['', 'paced']);
+    await commitSession(home, sessionKey('on', undefined, 'p'), { tokens: 1000, suggested: [], resuggested: [], reset: false });
+    expect((await resolveSkills({ message: 'team status', session_id: 'p' }, { home })).output.block_reason).toBe('budget_exhausted');
+    expect((await resolveSkills({ message: 'deploy', exclude: ['gbrain:deploy'], min_match_strength: 'name' }, { home })).output.block_reason).toBe('filtered');
+    const shadow = await resolveSkills({ message: 'deploy', shadow: true }, { home });
+    expect([shadow.output.block_reason, shadow.shadowOutput?.block_reason]).toEqual(['shadow', null]);
   });
 
   test('a skill the turn names still gets its line after the budget is spent; its tokens count', async () => {
@@ -417,6 +510,35 @@ describe('sessions', () => {
     utimesSync(join(dir, file), old, old);
     expect(gcSessions(home)).toBe(1);
     expect(existsSync(join(dir, file))).toBe(false);
+  });
+
+  test('a bounded async GC pass examines at most its file budget and stamps; one past its deadline deletes nothing and leaves no stamp', async () => {
+    const home = tmp();
+    const dir = join(home, 'skill-index', 'sessions');
+    mkdirSync(dir, { recursive: true });
+    const old = (Date.now() - 8 * 24 * 3600 * 1000) / 1000;
+    for (let i = 0; i < 10; i++) { const p = join(dir, `${String(i).repeat(64)}.json`); writeFileSync(p, '{}'); utimesSync(p, old, old); }
+    const stamp = join(home, 'skill-index', 'logs', 'session-gc.stamp');
+    expect(await gcSessionsAsync(home, Date.now(), { files: 3, until: performance.now() - 1 })).toBe(0);
+    expect(existsSync(stamp)).toBe(false);
+    expect(await gcSessionsAsync(home, Date.now(), { files: 3, until: performance.now() + 60_000 })).toBe(3);
+    expect(readdirSync(dir)).toHaveLength(7);
+    expect(existsSync(stamp)).toBe(true);
+  });
+
+  test('async GC never deletes an idle session file while a commit holds its lease; the commit keeps the earlier state', async () => {
+    const home = tmp();
+    const key = sessionKey('on', undefined, 'gc-race');
+    expect(await commitSessionAsync(home, key, { tokens: 100, suggested: ['a'], resuggested: [], reset: false })).toBe(true);
+    await sessionGcSettled();
+    const file = join(home, 'skill-index', 'sessions', `${key}.json`);
+    const old = (Date.now() - 8 * 24 * 3600 * 1000) / 1000;
+    utimesSync(file, old, old);
+    let removed = -1;
+    const ok = await commitSessionAsync(home, key, { tokens: 7, suggested: ['b'], resuggested: [], reset: false }, { at: async (stage) => { if (stage === 'held') removed = await gcSessionsAsync(home); } });
+    expect(ok).toBe(true);
+    expect(removed).toBe(0);
+    expect(loadSession(home, key)).toMatchObject({ turn: 2, spent: 107 });
   });
 });
 
@@ -541,15 +663,39 @@ describe('catalog sources and bounds', () => {
     }
   });
 
-  test('bounds: 10,000 skills build, 10,001 refuse; over 8 MB refuses; the body is capped at 4 KB', async () => {
+  test('bounds: 10,000 skills build, 10,001 refuse; over 64 MB refuses; the body is capped at 4 KB', async () => {
     const home = tmp();
     const many = Array.from({ length: 10_000 }, (_, i) => ({ id: `s${i}`, name: `skill-${i}`, description: `${word(i, 9)} task` }));
     const rec = await buildSkillIndex({ catalog: 'big', fromJson: JSON.stringify(many), fromJsonStdin: true }, { home });
     expect(rec.catalog.skill_count).toBe(10_000);
     expect(await codeOf(buildSkillIndex({ catalog: 'big2', fromJson: JSON.stringify([...many, { id: 'one-more', name: 'x' }]), fromJsonStdin: true }, { home }))).toBe('skill_source_invalid');
-    expect(await codeOf(buildSkillIndex({ catalog: 'huge', fromJson: JSON.stringify([{ id: 'a', name: 'a', description: 'x'.repeat(9 * 1024 * 1024) }]), fromJsonStdin: true }, { home }))).toBe('skill_source_invalid');
+    expect(await codeOf(buildSkillIndex({ catalog: 'huge', fromJson: JSON.stringify([{ id: 'a', name: 'a', description: 'x'.repeat(65 * 1024 * 1024) }]), fromJsonStdin: true }, { home }))).toBe('skill_source_invalid');
     await jsonCatalog(home, 'body', [{ id: 'b', name: 'b', description: 'd', body: `${'filler '.repeat(700)} zebrafinch` }]);
     expect((await resolveSkills({ message: 'zebrafinch' }, { home, catalogs: ['body'] })).output.no_skill_reason).toBe('no_match');
+  });
+
+  test('a JSON catalog over 8 MB of full bodies builds: bodies are trimmed to 4 KB, the snapshot is kept trimmed and stays fresh', async () => {
+    const home = tmp();
+    const full = Array.from({ length: 300 }, (_, i) => ({ id: `s${i}`, name: `skill-${i}`, description: `${word(i, 9)} task`, body: `${i === 7 ? 'zebrafinch ' : ''}${'filler text '.repeat(3000)}` }));
+    const text = JSON.stringify(full);
+    expect(Buffer.byteLength(text)).toBeGreaterThan(8 * 1024 * 1024);
+    const rec = await buildSkillIndex({ catalog: 'full', fromJson: text, fromJsonStdin: true }, { home });
+    expect(rec.catalog.skill_count).toBe(300);
+    const snap = readFileSync(join(home, 'skill-index', 'full', 'source.json'), 'utf8');
+    expect(Buffer.byteLength(snap)).toBeLessThan(2 * 1024 * 1024);
+    expect((JSON.parse(snap) as { body: string }[])[0]!.body.length).toBeLessThanOrEqual(4096);
+    expect((await catalogStatus('full', { home })).fresh).toBe(true);
+    expect((await resolveSkills({ message: 'zebrafinch' }, { home, catalogs: ['full'] })).output.suggestions[0]?.id).toBe('s7');
+  });
+
+  test('a JSON catalog over 8 MB stays fresh when a 4 KB cut ends on whitespace or a body opens with two frontmatter blocks', async () => {
+    const home = tmp();
+    const full = Array.from({ length: 900 }, (_, i) => ({ id: `s${i}`, name: `skill-${i}`, description: `${word(i, 9)} task`,
+      body: i === 1 ? `---\nkind: a\n---\n---\nkind: b\n---\n${'abc '.repeat(2500)}` : 'abc '.repeat(2500) }));
+    const text = JSON.stringify(full);
+    expect(Buffer.byteLength(text)).toBeGreaterThan(8 * 1024 * 1024);
+    await buildSkillIndex({ catalog: 'ws', fromJson: text, fromJsonStdin: true }, { home });
+    expect(await catalogStatus('ws', { home })).toMatchObject({ fresh: true, stale_reason: null });
   });
 
   test('a SKILL.md over 64 KB is skipped as unreadable, not read whole', async () => {

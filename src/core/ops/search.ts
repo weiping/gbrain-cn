@@ -223,11 +223,12 @@ async function evidenceOutput(ctx: OperationContext, p: Record<string, unknown>,
 }
 
 /** Keyword rows (every one a direct FTS hit): the markers hybridSearch would stamp, then bookkeeping. */
-async function stampKeywordRows(ctx: OperationContext, results: SearchResult[], scope: SourceScope & { excludePrivate: boolean }, queryText: string, startedAt: number, timings: SearchTimings): Promise<void> {
+async function stampKeywordRows(ctx: OperationContext, results: SearchResult[], scope: SourceScope & { excludePrivate: boolean }, queryText: string, startedAt: number, timings: SearchTimings, keywordMode: boolean): Promise<void> {
   // #3783: mark before stamping so evidence still reads keyword_exact.
   markKeywordHits(results);
   stampDeepResearchIds(results);
-  stampEvidenceSafe(results);
+  // GBRA-449: with match "keyword" each row satisfies the caller's own keyword statement (this path never OR-relaxes), whatever its score.
+  stampEvidenceSafe(results, { keywordMode });
   // #1699 / #160: the content_flag channel and the unverified-stub marker still surface off the hybrid path.
   await timings.stage('post_fusion', () => stampContentFlags(ctx.engine, results, scope));
   await timings.stage('post_fusion', () => stampUnverifiedExtractions(ctx.engine, results, scope));
@@ -419,7 +420,7 @@ async function buildRetrievalResponseMeta(
   const readinessScope = { ...scope, excludePrivate, types: opts.types, excludeSlugPrefixes };
   // #6721: these reads depend on nothing but the inputs above, so they run at once: on a pooled Postgres
   // the wall time is the slowest read's round trips, not their sum. The answer-feedback write still runs last.
-  const [safeIndexPending, [readiness, pendingCount], entityFacts, matchedFacts, held, sourceFreshness, embeddingHeld, filterNotice] = await Promise.all([
+  const [safeIndexPending, [readiness, pendingCount], entityFacts, matched, held, sourceFreshness, embeddingHeld, filterNotice] = await Promise.all([
     timed('safe_index', ctx.remote !== false && hasUnsealedPagesInScope(ctx, scope, excludePrivate, { types: opts.types, excludeSlugPrefixes })),
     timed('readiness', probeProjectionReadiness(ctx.engine, readinessScope).then(async r =>
       [r, r.status === 'projection_pending' ? await countPendingProjections(ctx.engine, readinessScope, relevance) : null] as const)),
@@ -441,18 +442,39 @@ async function buildRetrievalResponseMeta(
   // A fact the facts arm already returned as a row is not repeated beside the blocks.
   const factRowIds = new Set((results as SearchResult[]).flatMap(r => r.fact_row ? [r.fact_row.id] : []));
   // #7043: a matched fact may copy an entity fact; the merged list collapses again before the response.
-  // An entity fact keeps the corrected_by its matched copy carries, and a label follows its corrector into the collapse.
-  const correctedBy = new Map(matchedFacts.flatMap(m => m.corrected_by ? [[m.id, m.corrected_by] as const] : []));
-  const merged = await collapseFactReads(ctx.engine, [...entityFacts.map(e => ({ ...e, corrected_by: correctedBy.get(e.id) })),
-    ...matchedFacts.filter(m => !entityFacts.some(e => e.id === m.id))].filter(f => !factRowIds.has(f.id)));
+  const merged = await collapseFactReads(ctx.engine, [...entityFacts,
+    ...matched.facts.filter(m => !entityFacts.some(e => e.id === m.id)).map(({ corrected_by: _, ...m }) => m)].filter(f => !factRowIds.has(f.id)));
   const shownAs = new Map([...factRowIds].map(id => [id, id]));
   for (const f of merged) for (const id of f.collapsed_ids ?? [f.id]) shownAs.set(id, f.id);
+  // #7938: the matcher's correction decisions cover facts its cap cut, which the entity facts can bring back. A
+  // corrected fact shows only labelled beside a returned corrector; dropping one can strand a fact it corrected,
+  // so the drop repeats until every remaining label names a returned fact.
+  const correctors = (f: { id: number; collapsed_ids?: number[] }) => (f.collapsed_ids ?? [f.id]).flatMap(id => matched.correctedBy.get(id) ?? []);
+  let visible = merged;
+  for (;;) {
+    const kept = visible.filter(f => { const by = correctors(f); return !by.length || by.some(id => shownAs.has(id) && shownAs.get(id) !== f.id); });
+    if (kept.length === visible.length) break;
+    const keptIds = new Set(kept.map(f => f.id));
+    for (const [id, rep] of shownAs) if (!factRowIds.has(rep) && !keptIds.has(rep)) shownAs.delete(id);
+    visible = kept;
+  }
   // #8042: a lookup failure withholds saved_facts (degraded stage below) rather than return third-party text unquoted.
-  const quotedFacts = await quoteFacts(ctx.engine, merged, ctx.remote !== false).catch(() => null);
-  const savedFacts = (quotedFacts ?? []).map(({ corrected_by, ...f }) => {
-    const by = corrected_by === undefined ? undefined : shownAs.get(corrected_by);
-    return stripCollapseColumns(by === undefined || by === f.id ? f : { ...f, corrected_by: by });
+  const quotedFacts = await quoteFacts(ctx.engine, visible, ctx.remote !== false).catch(() => null);
+  const labelled = (quotedFacts ?? []).map(f => {
+    const by = correctors(f).map(id => shownAs.get(id)).find(id => id !== undefined && id !== f.id);
+    return stripCollapseColumns(by === undefined ? f : { ...f, corrected_by: by });
   });
+  // A corrected fact follows its corrector, as the matcher orders them: the reply's "corrected by a newer saved fact
+  // above" stays true, and its budget, which cuts from the end, never keeps a corrected fact without its corrector.
+  const savedFacts: typeof labelled = [];
+  const placed = new Set(factRowIds);
+  const correctorOf = (f: object) => (f as { corrected_by?: number }).corrected_by;
+  for (let rest = labelled; rest.length;) {
+    const ready = rest.filter(f => correctorOf(f) === undefined || placed.has(correctorOf(f)!));
+    const batch = ready.length ? ready : rest;
+    for (const f of batch) { savedFacts.push(f); placed.add(f.id); }
+    rest = rest.filter(f => !batch.includes(f));
+  }
   const heldTotal = [...heldBySource.values()].reduce((sum, n) => sum + n, 0);
   const embedding = embeddingHeld?.total ? embeddingHeld : null;
   const coverage: RetrievalCoverage | undefined = pending || heldTotal || embedding ? {
@@ -470,7 +492,7 @@ async function buildRetrievalResponseMeta(
   if (heldNotice) ctx.emitNotice?.(heldNotice);
   const degraded = [...(m?.degraded ?? [])];
   if (safeIndexPending) degraded.push({ stage: 'safe_index_pending' });
-  if (quotedFacts === null && merged.length) degraded.push({ stage: 'saved_facts_withheld' });
+  if (quotedFacts === null && visible.length) degraded.push({ stage: 'saved_facts_withheld' });
   if (readiness.status === 'by_design') degraded.push({ stage: 'projection_by_design' });
   else if (readiness.status !== 'ready') {
     degraded.push({ stage: readiness.status === 'projection_pending' ? 'projection_pending' : 'projection_status_unknown' });
@@ -752,11 +774,14 @@ const search: Operation = {
       const keywordOpts = { ...readOpts, source_boosts: sourceBoosts, keywordPhrase, ...(types ? { types } : {}) };
       // F2 `match: "keyword"`: page-grain enumeration, no diversity pruning, every page keeps a row.
       // A query that is one entity's name lists records filed under any of its names (the agent no longer walks each alias).
-      const names = paging.match === 'keyword' && !paging.cursor ? await setup(() => wholeQueryEntityNames(ctx.engine, queryText, { ...scope, excludePrivate })) : null;
-      const pageParams = names ? { ...p, query: names.map(aliasPhrase).join(' OR ') } : p;
-      const page = paging.match === 'keyword' ? await timings.stage('lexical', () => readKeywordPage(ctx.engine, pageParams, keywordOpts, paging, Math.min(limit, searchLimitCap()))) : null;
+      // A cursor page's query is already the first page's OR of names; the cursor carries the names for matched_alias.
+      const names = paging.match !== 'keyword' ? null
+        : paging.cursor ? paging.cursor.names ?? null
+        : await setup(() => wholeQueryEntityNames(ctx.engine, queryText, { ...scope, excludePrivate }));
+      const pageParams = names && !paging.cursor ? { ...p, query: names.map(aliasPhrase).join(' OR ') } : p;
+      const page = paging.match === 'keyword' ? await timings.stage('lexical', () => readKeywordPage(ctx.engine, pageParams, keywordOpts, paging, Math.min(limit, searchLimitCap()), names)) : null;
       if (page && names) {
-        page.meta.match_names = names;
+        if (!paging.cursor) page.meta.match_names = names;
         for (const row of page.rows) {
           const text = (row.chunk_text ?? '').toLowerCase();
           const hit = names.slice(1).find(n => text.includes(n.toLowerCase()));
@@ -769,7 +794,7 @@ const search: Operation = {
       let keywordBound: DegradedStageEntry | undefined;
       const results = await keepFrontmatterMatches(ctx.engine, (page ? page.rows : dedupResults(await timings.stage('lexical', () => ctx.engine.searchKeyword(queryText, { limit, offset, ...keywordOpts,
         onKeywordIncomplete: reason => { keywordBound = { stage: 'keyword_candidates_incomplete', reason }; } })).finally(lexicalDone.resolve))).map(r => ({ ...r })), where);
-      await stampKeywordRows(ctx, results, { ...scope, excludePrivate }, queryText, startedAt, timings);
+      await stampKeywordRows(ctx, results, { ...scope, excludePrivate }, queryText, startedAt, timings, paging.match === 'keyword' && !names);
       // #3800: cap AFTER capture/meta so eval + cache see the real payload.
       return evidenceOutput(ctx, p, results, plan, { ...scope, excludePrivate }, null, snippetCap, timings,
         async rows => withCountMeta(withCountMeta(await buildRetrievalResponseMeta(ctx, scope, queryText, rows, null, { conceptHint: true, types, typeFilterNotice: typeFilter.notice, filterHintFor: { op: 'search', p }, timings }),

@@ -58,7 +58,7 @@ export interface SyncResult {
    * QUOTA — retry after fixing the provider) from genuine file poison
    * (--skip-failed territory).
    */
-  failureCodes?: Array<{ code: string; count: number }>;
+  failureCodes?: Array<{ code: string; count: number }>; /** GST-2492 PR 2: advice for a cause in the source's mode, not the files (`strict_requires_managed`). */ failureAdvice?: string;
   /**
    * Files skipped because their FILENAME contains bracket/control characters
    * (SyncableReason 'malformed-path'). Informational — these never gate
@@ -76,6 +76,8 @@ export interface SyncResult {
   tail?: Omit<import('../core/persistence/sync-tail.ts').SyncTailReport, 'links'>;
   /** GBRA-217: the pass's change-reason notices (a failed or capped trailer scan, a secret in a pushed trailer) and its count of skipped malformed trailers. */
   reason_notices?: import('../core/agent-output.ts').Notice[];
+  /** GST-2462: the run's one `privacy_label_ignored` notice, counting by value the pages it wrote whose privacy label gbrain ignores. */
+  privacy_label_notice?: import('../core/agent-output.ts').Notice;
   reason_trailers_malformed?: number;
   /** #5459 (P4.5): live pages a `--full` tree walk kept because their file is in the working tree and their import provenance is the working tree or unknown. */
   working_tree_kept?: number;
@@ -146,7 +148,7 @@ export interface SyncResult {
    */
   held?: import('../core/persistence/sync-holds.ts').GitHoldItem[];
   held_count?: number; held_needs_human?: number;
-  holds_outstanding?: number;
+  holds_outstanding?: number; holds_released?: number;
   holds_escalated?: boolean;
   holds_truncated?: boolean;
   /** A sliced run (`writer_yield`) has not screened every entry yet. */

@@ -20,6 +20,7 @@
  */
 
 import { resolverHealthEntry, retrievalReflexEntry, skillConformanceEntry } from './checks/skill-group.ts';
+import { skillHealthEntry } from './checks/skill-health.ts';
 import {
   bootstrapChecksEntry,
   memorableRelayEntry,
@@ -27,6 +28,7 @@ import {
   minionsMigrationEntry,
 } from './checks/local-runtime.ts';
 import { supervisorEntry } from './checks/supervisor-health.ts';
+import { skillpackUpdateEntry } from './checks/skillpack-update.ts';
 import {
   stubGuardEntry,
   extractionBacklogsEntry,
@@ -44,6 +46,7 @@ import { ipcSocketPathEntry } from './checks/local-ipc.ts';
 import { functionSearchPathEntry } from './checks/function-search-path.ts';
 import { postgresTlsEntry } from './checks/postgres-tls.ts';
 import { databaseEncodingEntry } from './checks/database-encoding.ts';
+import { schemaFunctionBodiesEntry } from './checks/schema-function-bodies.ts';
 import {
   pgvectorEntry,
   rlsEntry,
@@ -90,11 +93,13 @@ import { queueHealthEntry, indexAuditEntry, imageAssetsEntry } from './checks/qu
 import { imageEmbeddingCoverageEntry } from './checks/image-embedding-coverage.ts';
 import { globalMaintenanceTimeoutsEntry } from './checks/global-maintenance-timeouts.ts';
 import { globalMaintenanceStalledEntry } from './checks/global-maintenance-stalled.ts';
+import { unattendedMaintenanceEntry } from './checks/unattended-maintenance.ts';
 import { embedBackfillStalledEntry } from './checks/embed-backfill-stalled.ts';
 import { contentDriftSweepEntry } from './checks/content-drift-sweep.ts';
 import { connectorAccountMismatchEntry } from './checks/connector-account-mismatch.ts';
 import { legacyJobAuthorityEntry } from './checks/legacy-job-authority.ts';
 import { legacyTokenGrantsEntry } from './checks/legacy-token-grants.ts';
+import { unscopedMultiUserTokenEntry } from './checks/unscoped-multi-user-token.ts';
 import { grantNewOpsEntry } from './checks/grant-new-ops.ts';
 import { linksExtractionLagEntry, syncFreshnessEntry, searchModeEntry } from './checks/sync-search.ts';
 import { persistenceConsumersEntry, serveBuildDriftEntry } from './checks/persistence-consumers.ts';
@@ -110,8 +115,10 @@ import { transcriptSecretExposureEntry } from './checks/transcript-secrets.ts';
 import { autoChronicleEntry } from './checks/auto-chronicle.ts';
 import { factsDrainEntry } from './checks/facts-drain.ts';
 import { wakeshiftEntry } from './checks/wakeshift.ts';
+import { wakeshiftOpenclawEntry } from './checks/wakeshift-openclaw.ts';
 import { factTakeVectorsEntry } from './checks/vector-coverage.ts';
 import { decideHealthEntry } from './checks/decide.ts';
+import { memoryProposalsEntry } from './checks/memory-proposals.ts';
 import { supersessionCalibrationEntry } from './checks/supersession-calibration.ts';
 import { factAdmissionFloorsEntry } from './checks/fact-admission-floors.ts';
 import { unlinkedFactsEntry } from './checks/unlinked-facts.ts';
@@ -132,21 +139,34 @@ import { chatFallbackChainEntry } from './checks/chat-fallback.ts';
 import { providerConsentEntry } from './checks/provider-consent.ts';
 import { behaviorChangesEntry } from './checks/behavior-changes.ts';
 import { fenceIntegrityEntry } from './checks/fence-integrity.ts';
+import { mcpRequestLogRetentionEntry } from './checks/mcp-request-log.ts';
+import { storageManifestEntry } from './checks/storage-manifest.ts';
 import { outsideContentFencesEntry } from './checks/outside-content-fences.ts';
 import { dbAheadOfGitEntry } from './checks/db-ahead-of-git.ts';
 import { gitIndexLagEntry } from './checks/git-index-lag.ts';
+import { strictFactsOutsideGitEntry } from './checks/strict-facts-outside-git.ts';
 import { localEditAdoptionsEntry } from './checks/local-edit-adoptions.ts';
+import { sessionLaneBudgetEntry } from './checks/session-lane.ts';
 import { syncConfigKeysEntry } from './checks/sync-config-keys.ts';
 import { ghostPagesEntry } from './checks/ghost-pages.ts';
 import { memberAccessEntry } from './checks/member-access.ts';
 import { folderAccessEntry } from './checks/folder-access.ts';
+import { unlabeledPeopleFoldersEntry } from './checks/unlabeled-people-folders.ts';
+import { openSharedPagesEntry } from './checks/open-shared-pages.ts';
+import { unscopedSharedReadsEntry } from './checks/unscoped-shared-reads.ts';
+import { sharedStdioBindingEntry } from './checks/shared-stdio-binding.ts';
 import { sharedAgentAccessEntry } from './checks/shared-agent-access.ts';
+import { ownerReadsRestrictedEntry } from './checks/owner-reads-restricted.ts';
+import { accessLineageEntry } from './checks/access-lineage.ts';
+import { accessLabelledOnlyEntry } from './checks/access-labelled-only.ts';
+import { attestReadAccessEntry } from './checks/attest-read-access.ts';
+import { guestSourceEntry } from './checks/guest-source.ts';
 import { originTwinsEntry } from './checks/origin-twins.ts';
 import { slugPathMismatchEntry } from './checks/slug-path-mismatch.ts';
 import { renameIdentityDowngradesEntry } from './checks/rename-identity-downgrades.ts';
 import { unindexedFilesEntry } from './checks/unindexed-files.ts';
 import { syncLandingGapsEntry } from './checks/landing-gaps.ts';
-import { purgeParkedPagesEntry } from './checks/purge-parks.ts';
+import { derivedOriginParkedEntry, purgeParkedPagesEntry } from './checks/purge-parks.ts';
 import { derivationPurgeSweepsEntry } from './checks/derivation-purge-sweeps.ts';
 import { missingRecordedFilesEntry } from './checks/missing-recorded-files.ts';
 import { uncommittedSyncDeletionsEntry } from './checks/uncommitted-sync-deletions.ts';
@@ -184,6 +204,8 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   resolverHealthEntry,
   retrievalReflexEntry,
   skillConformanceEntry,
+  skillHealthEntry,
+  skillpackUpdateEntry,
   bootstrapChecksEntry,
   memorableRelayEntry,
   connectorsEntry,
@@ -224,12 +246,22 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   derivedVisibilityEntry,
   memberAccessEntry,
   folderAccessEntry,
+  unlabeledPeopleFoldersEntry,
+  openSharedPagesEntry,
+  unscopedSharedReadsEntry,
+  sharedStdioBindingEntry,
   sharedAgentAccessEntry,
+  ownerReadsRestrictedEntry,
+  accessLineageEntry,
+  accessLabelledOnlyEntry,
+  attestReadAccessEntry,
+  guestSourceEntry,
   rlsEntry,
   postgresTlsEntry,
   functionSearchPathEntry,
   databaseEncodingEntry,
   schemaVersionEntry,
+  schemaFunctionBodiesEntry,
   rlsEventTriggerEntry,
   embeddingsEntry,
   embeddingProviderEntry,
@@ -264,12 +296,14 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   queueHealthEntry,
   globalMaintenanceTimeoutsEntry,
   globalMaintenanceStalledEntry,
+  unattendedMaintenanceEntry,
   embedBackfillStalledEntry,
   contentDriftSweepEntry,
   connectorAccountMismatchEntry,
   legacyJobAuthorityEntry,
   legacyTokenGrantsEntry,
   grantNewOpsEntry,
+  unscopedMultiUserTokenEntry,
   indexAuditEntry,
   imageAssetsEntry,
   imageEmbeddingCoverageEntry,
@@ -280,11 +314,13 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   gitWriterEntry,
   foreignWritersEntry,
   decideHealthEntry,
+  memoryProposalsEntry,
   unlinkedFactsEntry,
   edgeValidityEntry,
   autoChronicleEntry,
   factsDrainEntry,
   wakeshiftEntry,
+  wakeshiftOpenclawEntry,
   factTakeVectorsEntry,
   plannerStatsEntry,
   retrievalFeedbackEntry,
@@ -298,6 +334,8 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   trustReleaseUnpreviewedEntry,
   coreMemoryEntry,
   persistenceConsumersEntry,
+  // GBRA-133: this role's session connections across every process, against the pooler's limit (read-only).
+  sessionLaneBudgetEntry,
   runtimeBuildSkewEntry,
   cliSocketRefusalsEntry,
   atomHeldFailedEntry,
@@ -308,6 +346,7 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   slugPathMismatchEntry,
   renameIdentityDowngradesEntry,
   purgeParkedPagesEntry,
+  derivedOriginParkedEntry,
   derivationPurgeSweepsEntry,
   missingRecordedFilesEntry,
   uncommittedSyncDeletionsEntry,
@@ -323,6 +362,7 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   dbAheadOfGitEntry,
   // Git-canonical G3: how far each strict source's index trails the commit at HEAD.
   gitIndexLagEntry,
+  strictFactsOutsideGitEntry,
   // GST-1601: the one-sided local edits adopted in the last 24 h per source (informational, always ok).
   localEditAdoptionsEntry,
   // GBRA-221: live fence rows on imported pages whose body is outside-authored text (review only).
@@ -330,6 +370,10 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   // GBRA-248 W0: writes waiting on a long-quiet owner host, and a file plane that disables embeddings over a database with vectors.
   ownerHostStaleEntry,
   embeddingPlaneDisagreementEntry,
+  // #6770: MCP request-log size and the opt-in retention prune (read-only; the enable fix asks the user).
+  mcpRequestLogRetentionEntry,
+  // GST-1943: the storage shelf: cards failing the card schema, interim records not adopted, a hosted shelf directory gone.
+  storageManifestEntry,
   fenceIntegrityEntry,
   searchModeEntry,
 ];
@@ -390,7 +434,7 @@ function onlyResult(checks: Check[], only: ReadonlySet<string>, stopped: boolean
   const kept = checks.filter((c) => only.has(c.name) || (stopped && missing.length > 0 && c.name === 'connection'));
   for (const name of missing) {
     kept.push(stopped
-      ? { name, status: 'warn', message: 'Not run: the database checks stopped early (see the connection check).', fix_unavailable_reason: 'check_errored' }
+      ? { name, status: 'warn', message: 'Not run: the database checks stopped early (see the connection check).', details: { health: 'unknown' }, fix_unavailable_reason: 'check_errored' }
       : infoCheck(name, 'No finding: this check does not apply to this brain right now.', 'not_applicable'));
   }
   return kept;

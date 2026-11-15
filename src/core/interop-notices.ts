@@ -296,6 +296,30 @@ export function keylessThinkNotice(): Notice {
   };
 }
 
+/** GBRA-437: a remote think's `model` was not used; the host's think model answered instead. */
+export function modelOverrideIgnoredNotice(reason: 'not_allowed' | 'unusable'): Notice {
+  return {
+    code: 'model_override_ignored',
+    kind: 'info',
+    dedupe_key: reason,
+    why: reason === 'not_allowed'
+      ? 'This brain runs think on its own configured model for remote callers, so the requested model was not used; think ran on the host think model instead (modelUsed names it). Omit model, or ask the brain owner to allow it on the brain host.'
+      : 'The requested model is allowed for remote callers on this brain but cannot run there right now, so it was not used; think ran on the host think model instead (modelUsed names it).',
+    ...(reason === 'not_allowed' ? {
+      fix: {
+        argv: ['gbrain', 'config', 'set', 'think.remote_models', '<models>'],
+        consent: ['paid'],
+        actor: 'host_admin',
+        why: 'think.remote_models is a comma-separated list of models remote callers may pick for think; every think answer is a paid call on the host\'s key.',
+        user_message: 'This brain answers remote think calls with its own configured model. The owner can allow another model on the brain host with gbrain config set think.remote_models <models>.',
+        inputs: [{ name: 'models', how: 'The current think.remote_models value plus the requested model, comma-separated.' }],
+        verify: { argv: ['gbrain', 'config', 'get', 'think.remote_models'] },
+        requires_exclusive: false,
+      },
+    } : {}),
+  };
+}
+
 /** think with save/take over MCP: persistence is local-CLI only, so `saved_slug` is null. */
 export function thinkNotSavedNotice(): Notice {
   return {
@@ -323,6 +347,31 @@ export function privateFactNotice(factId?: string | number): Notice {
     code: 'private_fact_not_pushed',
     kind: 'info',
     why: `This fact is private: only local CLI recall reads it. Session hooks push world-visible facts only, so it will not reach a new agent session, and MCP agents cannot recall it. If the user wants their agents to know it without looking it up, ask them before saving it again with visibility world${forget}.`,
+  };
+}
+
+/**
+ * GST-2446: remember saved a fact for an entity that has no page, on a source whose pages are in Git. Once per entity
+ * per session. GST-2492: a fact held in Git (on memory/unattributed) needs nothing, so the notice only says where it is
+ * and when it moves; a fact in the database alone needs the user's word, so the step asks before creating the page.
+ */
+export function entityPageMissingNotice(sourceId: string, entitySlug: string, held?: { slug: string; committed: boolean }): Notice {
+  const base = { code: 'entity_page_missing', kind: 'info' as const, dedupe_key: `${sourceId}\0${entitySlug}` };
+  if (held) return { ...base,
+    why: `${held.committed ? 'Saved and committed to Git' : 'Saved in the database only, as its folder keeps its pages out of Git'}; held on ${held.slug} until ${entitySlug} has a page. Say that when you report the save. Nothing needs to run: once the page exists, the next maintenance cycle (gbrain dream) moves the fact into the page's Facts table${held.committed ? ', in its file' : ''}.` };
+  const userMessage = `The fact is saved in the database only: ${entitySlug} has no page, so it is in no file in Git. Should I create a page for ${entitySlug}?`;
+  return { ...base,
+    why: `Entity ${entitySlug} has no page in source ${sourceId}, so a fact saved for it is stored in the database only: recall returns it, but it is on no page and in no file in Git. Say that when you report the save, and ask the user whether to create the page; once it exists, the next maintenance cycle (gbrain dream) can move the facts saved for ${entitySlug} into the page's Facts table, in its file.`,
+    user_message: userMessage,
+    fix: {
+      ask_user: true,
+      argv: ['gbrain', 'put', entitySlug],
+      mcp: { tool: 'put_page', arguments: { slug: entitySlug, content: '<content>' } },
+      inputs: [{ name: 'content', how: `The page as Markdown: frontmatter with type and title, then what is known about ${entitySlug}. On the CLI, pass it on stdin.` }],
+      consent: [], actor: 'agent', requires_exclusive: false,
+      why: `Creates the page ${entitySlug}, so its facts have a file. Run it only after the user agrees.`,
+      verify: { argv: ['gbrain', 'get', entitySlug], mcp: { tool: 'get_page', arguments: { slug: entitySlug } } },
+    },
   };
 }
 
