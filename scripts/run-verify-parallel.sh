@@ -113,6 +113,8 @@ CHECKS=(
   "check:resolver"
   "check:privacy"
   "check:test-names"
+  # A test that opens a changelog.d fragment by name breaks on the release commit.
+  "check:test-fragment-reads"
   "check:test-isolation"
   # D7: a test that gates execution on a GBRAIN_* opt-in the operator-env
   # preload strips is a silent skip; TS AST scan, ~2s.
@@ -239,6 +241,9 @@ CHECKS=(
   # A since: 'TBD' BEHAVIOR_CHANGES row never ships: refused on a stamped tree
   # (VERSION has a CHANGELOG header and differs from origin/master's) and on master.
   "check:behavior-since"
+  # Stable's promise (docs/STABILITY.md): a documented command, flag, MCP tool, config key or exit code the base has
+  # leaves only through a matured deprecations.d record; new behavior-changes.d rows carry kind:.
+  "check:public-surface"
   # CHANGELOG.md keeps every release heading origin/master has (a cut file is refused).
   "check:changelog-headings"
   "check:structural-manifest"
@@ -299,7 +304,7 @@ if [ -n "${GBRAIN_VERIFY_LOG_DIR:-}" ]; then
   LOG_DIR="$GBRAIN_VERIFY_LOG_DIR"
   mkdir -p "$LOG_DIR" || { echo "ERROR: cannot create $LOG_DIR" >&2; exit 2; }
 else
-  LOG_DIR="$(mktemp -d /tmp/gbrain-verify-XXXXXX)"
+  LOG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/gbrain-verify-XXXXXX")"
   KEEP_LOGS=0
   trap '[ "$KEEP_LOGS" = "1" ] || rm -rf "$LOG_DIR"' EXIT
 fi

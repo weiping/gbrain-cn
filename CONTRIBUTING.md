@@ -440,7 +440,7 @@ to a sibling module. Every row also adds a behavior test of its own; the
 | CLI-only command | The implementation in `src/commands/<name>.ts`; the dispatch module `src/cli/commands/<name>.ts`; a help line in `printHelp` (`src/cli.ts`, so raise its `module-size-limits.tsv` ceiling by one) | A record in `CLI_COMMANDS` (`src/cli/command-table.ts`): `phase: 'pre-connect'` when the command never touches the database, `'post-connect'` when its `run(engine, args, ctx)` needs an engine; `thinClient: 'none'` unless remote brains must refuse it (`'refuse'`, or `'route-then-refuse'` for subcommand routing); `selfHelp: true` when the command has flags or subcommands (its `run` then prints its own `--help`); optional `skipStartupHooks`; `load: () => import('<literal>')` | `bun run build:flag-registry`; the CLI goldens, deliberately: `GBRAIN_TEST_UPDATE_GOLDENS=1 bun test test/cli-goldens.test.ts test/cli-dispatch-phase.test.ts test/cli-dispatch-thin-client.test.ts` | `test/<name>.test.ts` spawning `bun src/cli.ts <name>` and asserting output and exit code, plus `bun test test/cli-command-table.test.ts test/cli-flag-validation.test.ts` |
 | HTTP route (`gbrain serve --http`) | The route inside `mount<Area>(app, ctx)` in `src/commands/serve-http-<area>.ts` (`/admin/api/*` goes in `serve-http-admin-api.ts`, `/mcp` in `serve-http-mcp.ts`, OAuth in `serve-http-oauth.ts`); a new area is a new module plus one mount call in `buildServeHttpApp` (`src/commands/serve-http.ts`). An `/admin` route takes `ctx.requireAdmin` before its handler | None for a route in an existing area; a new area adds its mount call in `buildServeHttpApp` (order matters) | The route goldens, deliberately: `GBRAIN_TEST_UPDATE_GOLDENS=1 bun test test/serve-http-route-golden.test.ts test/serve-http-route-runtime-golden.test.ts` | A behavior test (`test/serve-http-<area>-<route>.test.ts`: mount the area on a bare `express()` app with a stub ctx; `mountAdminApi` reads `requireAdmin`, `sseClients` and `mcpResourceUrl` at mount time) plus `bun test test/serve-http-admin-route-guard.test.ts`, which finds the new route by itself |
 | Sync phase | A module under `src/commands/sync/` taking `(run, Pick<SyncPlan, ...>, ...)` and returning `SyncResult \| undefined`; state it shares across awaits becomes a field on `SyncRun` (`src/commands/sync/sync-run.ts`). A value for the final summary flows `SyncRun` field -> `finalizeIncrementalSync` (`sync/finalize.ts`) -> `SyncResult` (`src/commands/sync.ts`, raise its ceiling) -> `printSyncResult` (`sync/report.ts`) when it should print | The phase call order in `performSyncInner` (`src/commands/sync/incremental.ts`) | Nothing | A case in `test/sync-run-ordering.serial.test.ts` (it has the git-repo + PGLite harness: `commitPages`, `performSync`), plus `bun test test/sync.test.ts test/sync-run-ordering.serial.test.ts` |
-| Release version and migration numbers | `changelog.d/<branch-slug>.md` (your entry, no version heading; /ship writes it) and one `behavior-changes.d/<id>.md` per new upgrade-notice row; number a new migration master's latest + 1 | None: the release PR writes every version stamp; never edit VERSION, the manifests or a released CHANGELOG section | On a migration-number collision, `bun run migrations:renumber`; a PR stamped the old way converts with `bun run release:unstamp` | `bun run verify` (check:regen-all builds the behavior-change table); `bun test test/scripts/release-restamp.test.ts test/scripts/build-behavior-changes.test.ts` when you change those scripts ([docs](docs/RELEASING.md#releases-per-batch)) |
+| Release version and migration numbers | `changelog.d/<branch-slug>.md` (your entry, no version heading; /ship writes it) and one `behavior-changes.d/<id>.md` per new upgrade-notice row (with its `kind:`); a removal or rename of something stable keeps first adds a [`deprecations.d/<id>.md`](deprecations.d/README.md) record; number a new migration master's latest + 1 | None: the release PR writes every version stamp; never edit VERSION, the manifests or a released CHANGELOG section | On a migration-number collision, `bun run migrations:renumber`; a PR stamped the old way converts with `bun run release:unstamp` | `bun run verify` (check:regen-all builds the behavior-change table); `bun test test/scripts/release-restamp.test.ts test/scripts/build-behavior-changes.test.ts` when you change those scripts ([docs](docs/RELEASING.md#releases-per-batch)) |
 | Stress-test a touched test (flake hunt) | Nothing: `bun run test:stress [files…] [--iterations N] [--base <ref>] [--postgres]` (defaults: files changed versus `origin/master`, 10 iterations, a fresh database per iteration) | None | Nothing | The same command; a failing iteration prints its reproduce line |
 | A bundled skill (`skills/<name>/SKILL.md`), or a command, flag or operation a skill names | The skill text, in the same PR as the code it describes; follow [Changing a skill](#changing-a-skill) | `skills/skill-budgets.tsv` only for a skill over 16 KB (a ceiling goes up only in a reviewer-visible edit); `scripts/skill-drift-baseline.txt` only shrinks | `bun run scripts/generate-skills-manifest.ts` (the skills lock) | `bash scripts/skills-commit-gate.sh` (it runs `bun run check:skill-health` and prints the `Skill-size:` lines for your commit message) |
 
@@ -805,23 +805,65 @@ gstack reads both from master, so a branch's edits take effect after it merges.
   2 MB ceiling. Those files stay covered by the privacy, gitleaks and doc
   checks, and every code, test and config line is still reviewed.
 
-### How a contributor PR lands
+### How an outside pull request is handled
 
-Contributor PRs are never merged into master as-is. A maintainer folds the
-change into a fix-wave PR, revises it there (tests, agent-facing errors,
-conventions) and lands it with credit: the commit says `Contributed by @handle`
-and carries a `Co-Authored-By:` trailer. Your PR stays open until then. When
-the fix wave merges, a workflow closes your PR with a comment that links the wave.
+Thanks for sending one. Here is what happens to it, so nothing comes as a
+surprise:
 
-The **Fix-wave gate** check enforces this. It fails every PR into master whose
-head branch is not in `garrytan/gbrain` itself, and posts one comment saying
-so when the PR opens. A red gate on a contributor PR is expected and is not a
-judgment of the work. Maintainers' own branches (`capy/*`, `garrytan/*`) pass.
+- **Documentation people read** (README, guides, docs pages; not Markdown that
+  agents load, such as SKILL.md, AGENTS.md or prompts) can be merged as it is,
+  after we check every link, command and install step in it.
+- **Small, plainly correct fixes** (under about 40 lines, not counting tests:
+  an error message, a typo, a small docs fix) are taken even when the gain is
+  small. We rebuild them on current master and credit you as co-author: the
+  commit says `Contributed by @handle` and carries a `Co-Authored-By:`
+  trailer. We land at most one of these a day, so it can take a few days.
+- **Everything else**, including all other code and anything that runs, we
+  read as a detailed bug report. When we take it, we rebuild it on current
+  master with the same credit.
+
+Every pull request, ours and an outside documentation change alike, lands on
+master as one squashed commit, with each outside author credited by a
+`Co-authored-by:` trailer. When we rebuild a change, we close your PR with a
+link to the PR that landed it. When we don't take one, we close it with a
+short note saying why and what would change our answer. So apart from
+documentation, "closed, not merged" is the normal outcome and doesn't mean
+your work was turned down.
+
+A larger change is much easier to take when it shows:
+
+1. a way to reproduce the problem on current master, or a failing test;
+2. what goes wrong for someone using gbrain because of it;
+3. the version you saw it on (`gbrain version`).
+
+A limit of 3 open pull requests applies only to someone whose recent pull
+requests have mostly been closed without being taken. It never applies to
+anyone who has had a pull request taken (merged or rebuilt) in the last 90 days.
+
+Replies on behalf of the project come from the Capy app (`capy-ai[bot]`) or
+a maintainer; a comment from any other account that calls itself triage does
+not speak for gbrain. Every outside issue gets a first reply from us within 48
+hours. A bug report we could not reproduce gets one follow-up question after
+60 days, and is closed two weeks after that if nobody answers.
+
+The same three things make a bug report easy to act on. To see what the
+community has reported, without the issues our own agents and CI file, use the
+[community issues](https://github.com/garrytan/gbrain/issues?q=is%3Aissue%20is%3Aopen%20-label%3Aagent-filed)
+search: it lists open issues without the `agent-filed` label, which our CI
+scripts add to every issue they open and which we have added to the open
+issues our own agents filed.
+
+The **Fix-wave gate** check runs on every PR into master. It fails every PR
+whose head branch is not in `garrytan/gbrain` itself, and posts the comment
+above when the PR opens. A red gate on an outside PR is expected and is not a
+judgment of the work; a maintainer clears it when merging a documentation
+change. Maintainers' own branches (`capy/*`, `garrytan/*`) pass.
 
 `maintainer-override` label: a human on the maintainer allowlist in
 `scripts/fix-wave-gate.ts` (it starts as `garrytan`) may apply it to pass the
-gate for one PR a maintainer has decided may land from its fork (for example a
-fix wave a maintainer opened from a fork); record the reason in a PR comment.
+gate for one PR a maintainer has decided may land from its fork (for example an
+outside documentation change, or a PR a maintainer opened from a fork); record
+the reason in a PR comment.
 Bots never count, and the label only counts when the most recent
 `labeled` event was made by an allowlisted human. Every override is written to
 the check's run log and step summary with who applied it and when. Process and

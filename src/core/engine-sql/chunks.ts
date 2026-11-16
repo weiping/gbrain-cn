@@ -33,9 +33,9 @@ import {
   COLUMN_NAME_REGEX,
   EmbeddingColumnNotRegisteredError,
 } from '../search/embedding-column.ts';
-import { chunkDocumentOrder, chunkGenerationFilter, chunkManifestJoin, chunkVisibleFilter, chunkWriteInvalidations, currentTextProjectionFilter, movableChunkSql, requiresSafeChunks, safeChunksFilter } from '../search/safe-chunks.ts';
+import { chunkDocumentOrder, chunkGenerationFilter, chunkManifestJoin, chunkVisibleFilter, chunkWriteInvalidations, movableChunkSql, requiresSafeChunks, safeChunksFilter, servedTextProjectionFilter } from '../search/safe-chunks.ts';
 import { privatePagesFilterForCaller } from '../search/private-visibility.ts';
-import { splitEmbeddingSignature, lockEmbeddingSources } from '../embedding-invalidation.ts';
+import { currentSpaceChunkPredicate, splitEmbeddingSignature, lockEmbeddingSources } from '../embedding-invalidation.ts';
 import { EMBED_SKIP_FILTER_FRAGMENT } from '../embed-skip.ts';
 import { QUARANTINE_FILTER_FRAGMENT } from '../quarantine.ts';
 import { pageBudgetLimitedFilter } from '../page-size-policy.ts';
@@ -571,16 +571,12 @@ export async function setPageEmbeddingSignature(exec: SqlExecutor, slug: string,
   }
 
 /**
- * `currentSpaceChunkPredicate` (embedding-invalidation.ts) as a fragment:
- * identical text, values bound in place of its hand-numbered `$model` /
- * `$dims`. `test/engine-sql-chunks.test.ts` pins the two against each other.
+ * `currentSpaceChunkPredicate` (embedding-invalidation.ts) as a fragment: built from its text, with values bound in
+ * place of its `$model` / `$dims` parameters, so the two cannot drift. `test/engine-sql-chunks.test.ts` pins them.
  */
 export function currentSpaceChunkFragment(column: string, model: string, dims: number | null): SqlFragment {
-  const colId = trustedSql(quoteIdentifier(column));
-  return sqlFragment`COALESCE(cc.${colId} IS NOT NULL
-              AND cc.model = ${model}
-              AND cc.embedded_text_hash = md5(cc.chunk_text)
-              AND vector_dims(cc.${colId}) = ${dims}::int, false)`;
+  const strings = currentSpaceChunkPredicate(quoteIdentifier(column), 9001, 9002).split(/\$900[12]/);
+  return sqlFragment(Object.assign([...strings], { raw: [...strings] }), model, dims);
 }
 
 export async function invalidateStaleSignatureEmbeddings(
@@ -1167,7 +1163,7 @@ export async function getChunkWindows(exec: ScopedRead, requests: ChunkWindowReq
         FROM pages p
         JOIN sources s ON s.id = p.source_id
        WHERE p.id = ANY(${[...new Set(requests.map(r => r.page_id))]}::int[]) ${scopeSql}
-         AND p.deleted_at IS NULL AND ${trustedSql(currentTextProjectionFilter('p'))} AND NOT s.archived
+         AND p.deleted_at IS NULL AND ${trustedSql(servedTextProjectionFilter('p'))} AND NOT s.archived
          AND ${trustedSql(QUARANTINE_FILTER_FRAGMENT)} ${privateSql} ${safeSql}
     ), chunk_rows AS (
       SELECT cc.page_id, cc.id AS chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source, cc.projected_byte_start, cc.projected_byte_end, cc.occurrence_id, a.prio
