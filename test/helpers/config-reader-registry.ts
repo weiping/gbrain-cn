@@ -24,12 +24,15 @@ export interface InternalConfigState {
 }
 
 export const INTERNAL_CONFIG_STATE: readonly InternalConfigState[] = [
+  { key: 'dedupe.exa_spent_usd', reason: 'the running total gbrain dedupe --exa has paid Exa (entities/evidence/exa.ts); the total cap dedupe.exa_total_cap_usd is checked against it' },
+  { key: 'dedupe.exa_cache.', prefix: true, reason: 'one cached Exa answer per query hash (entities/evidence/exa.ts), so a query is never paid for twice' },
   { key: 'version', reason: 'schema version stamp written by migrate.ts' },
   { key: 'transcripts.archive.pinned_timezone.', prefix: true, reason: 'the timezone the conversation archive pinned for a source on its first run (transcripts/archive.ts); a hand edit would re-slice every archived day' },
   { key: 'transcripts.archive.audience.', prefix: true, reason: 'the audience (personal or shared) the conversation archive last ran under per source (transcripts/archive.ts); it decides when earlier pages are kept to the owner' },
   { key: 'transcripts.archive.rescope_capped.', prefix: true, reason: 'the number of archive folders when the owner-only re-scope passed the per-source rule limit and kept the whole conversations/ folder to the owner instead (transcripts/archive.ts); status and doctor report it' },
   { key: 'transcripts.archive.last_maintenance', reason: 'the conversation archive\'s maintenance-pass record (transcripts/archive-maintenance.ts); doctor transcript_archive_freshness reads it, so a hand edit would misreport the archive' },
   { key: 'transcripts.archive.backfill_state', reason: 'whether the maintenance pass has finished backfilling older conversation days (transcripts/archive-maintenance.ts); a hand edit would stop or restart the backfill' },
+  { key: 'transcripts.archive.last_read.', prefix: true, reason: 'what the last conversation archive run read from each reader per source (transcripts/archive.ts): status and doctor report it as of that run instead of reading every session again' },
   { key: 'transcripts.archive.index_pending.', prefix: true, reason: 'days whose conversation archive day index still has to be written (transcripts/archive.ts); the next run retries them' },
   { key: 'maintenance.last_run', reason: 'the free-upkeep run record (steps, cursor, parked items, next due time) that maintenance/run.ts writes after each gbrain maintain --unattended run; maintain --status and doctor read it, so a hand edit would misreport upkeep' },
   { key: 'maintenance.embed_spend', reason: 'the per-day dollar total the capped upkeep embed step has spent (maintenance/run.ts); the daily cap reads it, so a hand edit would let upkeep spend past maintenance.embed_daily_usd' },
@@ -109,6 +112,7 @@ export const UNRESOLVED_CONFIG_READS: readonly UnresolvedConfigRead[] = [
   { file: 'src/core/consent-cli.ts', expr: 'key', why: P },
   { file: 'src/core/content-repair/llm.ts', expr: 'key', why: P },
   { file: 'src/core/cycle/auto-think.ts', expr: 'key', why: P },
+  { file: 'src/core/cycle/base-phase.ts', expr: 'this.budgetUsdKey', why: 'the subclass budget key: cycle.propose_takes.budget_usd, cycle.grade_takes.budget_usd, cycle.calibration_profile.budget_usd (registered in config-runtime-keys.ts)' },
   { file: 'src/core/cycle/extract-atoms-cost-gate.ts', expr: 'key', why: 'listConfigKeys walk over ATOMS_NO_PRICING_KEY_PREFIX (cycle. prefix)' },
   { file: 'src/core/cycle/nightly-probe-routes.ts', expr: 'key', why: 'Object.entries walk over NIGHTLY_PROBE_SLOT_KEYS' },
   { file: 'src/core/cycle/nightly-probe-search-config.ts', expr: 'key', why: 'walk over NIGHTLY_PROBE_SEARCH_CONFIG_KEYS (search. prefix)' },
@@ -155,6 +159,9 @@ export const UNRESOLVED_CONFIG_READS: readonly UnresolvedConfigRead[] = [
   { file: 'src/core/questions/auto-think-migration.ts', expr: 'key', why: P },
   { file: 'src/core/questions/phase.ts', expr: 'key', why: P },
   { file: 'src/core/reindex-consent.ts', expr: 'key', why: P },
+  { file: 'src/core/rust-engine/store-members/config.ts', expr: 'key', why: P },
+  { file: 'src/core/rust-engine/store-members/stats.ts', expr: 'brain', why: P },
+  { file: 'src/core/rust-engine/store-members/stats.ts', expr: 'brain', why: P },
   { file: 'src/core/search/evidence-delivery.ts', expr: 'key', why: P },
   { file: 'src/core/search/evidence-delivery.ts', expr: 'input.configKey ?? RETURN_UNIT_CONFIG_KEY', why: 'per-op return-unit key option (search. prefix), else the registered default' },
   { file: 'src/core/search/mode.ts', expr: 'k', why: P },

@@ -34,11 +34,13 @@ function getConfigDir() { return configDir(); }
 function getConfigPath() { return configPath(); }
 
 export interface GBrainConfig {
-  engine: 'postgres' | 'pglite';
+  engine: 'postgres' | 'pglite' | 'rust';
   /** File-plane hook-lane keys (read by engine-free hook/push children).
    * `gbrain config set` routes these two dotted keys here, not to the DB. */
   push?: { allow_unverified_remote?: boolean };
   hooks?: { stop_push_debounce_min?: number | string };
+  /** GST-2988: what a publish does with secrets in unpushed commits (file plane: engine-free publishers read it); default redact. */
+  secrets?: { on_push?: 'redact' | 'refuse' };
   /** #7242 terminal hook (minions/terminal-hook.ts): file plane only, read by `gbrain jobs work`. */
   minions?: { terminal_hook?: string[] | { argv: string[]; timeout_ms?: number } };
   /** Ambient-writeback MIRROR of the DB-plane `memory.*` keys — `gbrain
@@ -305,6 +307,8 @@ export interface GBrainConfig {
     last_applied_version?: string;
     /** #8776: a launcher outside gbrain's service starts autopilot again when it exits (`gbrain upgrade` hands it over). */
     autopilot_launcher?: 'external';
+    /** #9483: a launcher outside gbrain's serve service starts serve again when it exits (`gbrain upgrade` stops serve and waits for it, or restarts the systemd unit serve runs in). */
+    serve_launcher?: 'external';
   };
 
   /**
@@ -739,8 +743,8 @@ export function loadConfig(): GBrainConfig | null {
   const dbUrl = effectiveEnvDatabaseUrl();
 
   if (!fileConfig && !dbUrl) return null;
-  // GBRA-377: a file holding only skills.resolver settings is no brain; every other file keeps its file-plane reads.
-  if (!dbUrl && fileConfig && Object.keys(fileConfig).every((k) => k === 'skills')) return null;
+  // GBRA-377: a file holding only skills.resolver settings (or GST-2988's secrets.on_push) is no brain; every other file keeps its file-plane reads.
+  if (!dbUrl && fileConfig && Object.keys(fileConfig).every((k) => k === 'skills' || k === 'secrets')) return null;
 
   // Infer engine type. A DATABASE_URL-style env var is always a Postgres
   // connection target and must override a file-backed PGLite engine
@@ -748,7 +752,7 @@ export function loadConfig(): GBrainConfig | null {
   // the local PGLite brain while claiming to use the env URL. The PGLite
   // database_path is also cleared when dbUrl is set so toEngineConfig
   // doesn't pass a stale path through alongside the URL.
-  const inferredEngine: 'postgres' | 'pglite' = dbUrl
+  const inferredEngine: 'postgres' | 'pglite' | 'rust' = dbUrl
     ? 'postgres'
     : fileConfig?.engine || (fileConfig?.database_path ? 'pglite' : 'postgres');
 
@@ -1327,6 +1331,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // `config set` — engine-free hook/push children read loadConfigFileOnly).
   'push.allow_unverified_remote',
   'hooks.stop_push_debounce_min',
+  'secrets.on_push', // GST-2988 file plane: redact (default) or refuse secrets in unpushed commits at publish (git/redact-unpushed.ts)
   // File-plane backup-check keys (routed to ~/.gbrain/config.json by `config
   // set` — the engine-free render sites read loadConfigFileOnly). Default ON /
   // 30 days; interval clamps to >=1 day at read time (backup/status-file.ts).
@@ -1410,7 +1415,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'search.hnsw_iterative_scan',
   'search.cjk_keyword_deadline_ms',
   'search.keyword_statement_timeout_ms',
-  'search.keyword_timeout_negative_cache_seconds', // #6495: seconds, default 600, 0 = off (postgres-engine/keyword-timeout-cache.ts)
+  'search.keyword_timeout_negative_cache_seconds', // #6495: the longest skip in seconds, default 600, 0 = off; #7082: a serve's background re-run ends it sooner (postgres-engine/keyword-timeout-cache.ts)
   'search.adaptive_return',
   'search.adaptive_return_entity_max',
   'search.adaptive_return_other_max',
@@ -1541,7 +1546,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'facts.default_visibility',
   'storage.git_lfs', // G7a: a git-canonical door commit under a Git LFS rule commits the LFS pointer; default off refuses it (persistence/git-declared.ts)
   'visibility.honor_aliases', // remote page reads honor `access`/`confidentiality` aliases on pages without `visibility`; default on, false opts out (search/private-visibility.ts)
-  'facts.entity_inference', // #5836: write-time subject inference kill switch (subject-infer.ts)
+  'facts.entity_inference', 'facts.unbacked_entity_keys', // #5836 subject inference kill switch (subject-infer.ts); GBRA-574 conversation name keys (entities/resolve-on-save.ts)
   'facts.candidate_fusion', // C2: 'rrf_free' (default, cosine arm) | 'interleave' (cosine + keyword; facts/single-prepare.ts)
   'facts.supersession_thresholds', // JSON {"provider:model@dims": number | "off"} (facts/supersession-threshold.ts)
   'facts.page_write_notability_filter', // #6231: tiers page-write extraction keeps (facts/notability-filter.ts)
@@ -1698,6 +1703,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'self_upgrade.last_check_ts',
   'self_upgrade.last_applied_version',
   'self_upgrade.autopilot_launcher',
+  'self_upgrade.serve_launcher',
   // Misc
   'artifacts_sync_mode',
   'cross_project_learnings',

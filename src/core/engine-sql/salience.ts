@@ -109,7 +109,9 @@ export async function getRecentSalience(exec: LegacyUnscopedRead, opts: Salience
     // Compute the boundary in JS so the SQL is identical across engines (eng review D5).
     const boundaryIso = new Date(Date.now() - days * 86400000).toISOString();
     // Escape LIKE meta for the optional prefix match.
-    const prefixCondition = slugPrefix
+    const prefixCondition = slugPrefix && opts.slugPrefixAlso?.length
+      ? sqlFragment`AND p.slug LIKE ANY(${[slugPrefix, ...opts.slugPrefixAlso].map(prefix => prefix.replace(/[\\%_]/g, (c) => '\\' + c) + '%')}::text[])`
+      : slugPrefix
       ? sqlFragment`AND p.slug LIKE ${slugPrefix.replace(/[\\%_]/g, (c) => '\\' + c) + '%'} ESCAPE '\\'`
       : sqlFragment``;
     // TIM-37: exclude briefing pages from their own Brain Pulse. The cron
@@ -150,6 +152,7 @@ export async function getRecentSalience(exec: LegacyUnscopedRead, opts: Salience
     // Scope is already bound above; use the shared live/privacy predicate
     // before ranking and LIMIT, including for holder-unrestricted callers.
     const readCondition = trustedSql(`AND ${pageReadFilter('p', { excludePrivate: opts.excludePrivate }, [], true)}`);
+    // Score ties sort by source_id, then slug, so the order never depends on heap order.
     const rows = (await exec.run(sqlFragment`
       SELECT p.slug, p.source_id, p.title, p.type, p.updated_at, ${trustedSql(emotionalSql)} AS emotional_weight,
              COUNT(DISTINCT t.id) AS take_count,
@@ -165,7 +168,7 @@ export async function getRecentSalience(exec: LegacyUnscopedRead, opts: Salience
          ${excludeBriefings}
          ${sourceCondition} ${readCondition}
        GROUP BY p.id
-       ORDER BY score DESC
+       ORDER BY score DESC, p.source_id ASC, p.slug ASC
        LIMIT ${limit}
     `)).rows;
     return rows.map((r: Record<string, unknown>) => ({

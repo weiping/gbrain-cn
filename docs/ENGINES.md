@@ -438,15 +438,178 @@ segmented chunk (`test/e2e/segmented-switch-off-write-role.test.ts`). With the
 policies above it creates segmented pages and sees only its sources' rows
 (`test/e2e/segmented-rls-scope.test.ts`).
 
+<a id="owner-only-delete-triggers"></a>
+**Owner-only delete triggers.** Rows derived from an owner-only source (an `imessage` source, or
+one with `owner_only: true`) stay owner-only after their origin is gone. Since migration v322
+(GST-3032) a `BEFORE DELETE` trigger on `sources`, `pages`, `facts`, `takes` and
+`timeline_entries` records the deleted row and every row derived from it in `owner_only_marks`,
+and reads treat a marked row, or one derived from a marked row, as owner-only. Nothing derived
+is deleted. A take or timeline row counts as owner-only by its own lineage as well as its page's.
+The first owner-only source (or mark) sets a one-way flag, a comment on `owner_only_marks`;
+from then on the guard stays on even after the last owner-only source is removed. A brain that
+never held owner-only data never reads `owner_only_marks`, so its logins need no new grant.
+The triggers run as the deleting role. A role whose reads row-level security limits (a scoped
+writer, or `FORCE ROW LEVEL SECURITY` on a table it owns) could miss derived rows: its delete
+of a row it sees as owner-only is refused with `owner_only_lineage_unreadable` (delete it as
+the table owner without `FORCE`, or as a `BYPASSRLS` login, and the derived rows are marked),
+and its delete of a row it sees as open goes through but sets the `('*', 'row_security')`
+mark, which closes owner-only lineage the way a missing trigger does. `CREATE TRIGGER` needs the table's owner: a table another role owns gets
+no trigger, the migration run and `gbrain doctor` (`owner_only_marks_triggers`) name it with
+`ALTER TABLE ... OWNER TO`, and `gbrain apply-migrations --force-schema` run by its owner
+creates it. While a trigger is missing or disabled on a brain that holds an owner-only source or
+a mark, owner-only lineage reads closed: every row with a recorded derivation input and every
+synthesized concept or question counts as owner-only. It stays closed after the triggers are
+back (a delete in the gap left no marks) until the owner, having checked what was deleted in
+the gap, deletes the `('*', 'unguarded')` row by hand; the closed mode itself never adds a mark.
+
+A scoped writer that keeps making permanent deletes (the recipe above) keeps owner-only lineage
+closed: while a login whose reads row-level security limits makes permanent deletes on a brain
+that holds owner-only data, every derived row and synthesized concept stays owner-only for
+everyone but the owner. Deleting the `('*', 'row_security')` row does not end it, because that
+login's next permanent delete sets it again. The ways out are to run permanent deletes as the
+table owner (without `FORCE`) or a `BYPASSRLS` login, or to stop holding owner-only data:
+remove the owner-only source and, once the rows derived from it may be read by others again,
+its marks.
+
+<a id="owner-only-marks-privileges"></a>**Privileges on `owner_only_marks`.** The table follows
+the sibling pattern: row-level security on and no policy, so a role with only table privileges
+(Supabase's `anon` and `authenticated`) neither reads nor adds a mark. No migration grants
+anything. On a brain that has held owner-only data, every non-owner login that reads `sources`
+needs `SELECT` (to read owner-only lineage exactly) and, if it makes permanent deletes,
+`INSERT` on `owner_only_marks`, each with a permissive policy in the shape below (`USING (true)`,
+and `WITH CHECK (true)` to add) and no restrictive policy that applies to it; any other policy
+counts as none. Without them the login reads
+owner-only lineage closed, never open and never an error, and its permanent deletes are
+refused with `owner_only_marks_unwritable`, which names the grant. Nobody but the owner
+removes a mark, and only the owner of `owner_only_marks` sets the flag, so the first
+owner-only source is added by that role. `gbrain doctor` (`owner_only_marks_triggers`) names
+each login that still needs the statements and prints them; the owner runs:
+
+<!-- gbrain:owner-only-marks-recipe:begin (applied verbatim by test/e2e/owner-only-marks-scoped-login.test.ts) -->
+```sql
+-- A login that reads and makes permanent deletes (the writer role above):
+GRANT SELECT, INSERT ON owner_only_marks TO <writer-role>;
+CREATE POLICY owner_only_marks_read_<writer-role> ON owner_only_marks FOR SELECT TO <writer-role> USING (true);
+CREATE POLICY owner_only_marks_add_<writer-role> ON owner_only_marks FOR INSERT TO <writer-role> WITH CHECK (true);
+-- A read-only login (the reader role above) needs the read half only:
+GRANT SELECT ON owner_only_marks TO <reader-role>;
+CREATE POLICY owner_only_marks_read_<reader-role> ON owner_only_marks FOR SELECT TO <reader-role> USING (true);
+```
+<!-- gbrain:owner-only-marks-recipe:end -->
+
+Owner-only lineage is read exactly only by a login whose reads of the lineage tables (`sources`,
+`facts`, `derivation_inputs`, `links`, `pages`, `takes`, `timeline_entries`) are complete: the
+table owner without `FORCE`, a `BYPASSRLS` login, or a login with a permissive `USING (true)`
+policy and no restrictive one on each. On a brain that has held owner-only data any other login
+reads it closed, never open and never an error: every row with a recorded derivation input,
+every synthesized concept or question, every row in an owner-only source and every page or
+fact whose source row the login cannot read counts as owner-only for it. So the scoped writer above, whose `pages` and `sources` policies read
+`app.scopes`, sees every derived row as owner-only. A login that cannot read `derivation_inputs`
+in full (the reader role above has no grant on it) sees every row as owner-only, also after the
+last owner-only source is removed.
+
+**Who must act.** Nobody has to: such a login reads closed, so owner-only data stays hidden
+from it and nothing errors. An operator who runs a scoped login (the writer or reader role
+above) on a brain that has held owner-only data, and wants that login to read derived rows
+exactly again, so that a row derived only from open rows reads as open, gives it complete reads
+of each lineage table `gbrain doctor` names for it (`owner_only_marks_triggers`, details
+`closed_logins` and `lineage_sql`). As the table owner, for each named table:
+
+```sql
+GRANT SELECT ON public.<table> TO <login>;
+DROP POLICY IF EXISTS gbrain_lineage_read_<login> ON public.<table>;
+CREATE POLICY gbrain_lineage_read_<login> ON public.<table> FOR SELECT TO <login> USING (true);
+```
+
+Then drop any restrictive policy on those tables that applies to the login. This gives the
+login every row of those tables, so it undoes the source scoping its own policies give it. That
+trade is the operator's to make: no migration grants anything or adds a policy.
+
+<a id="purge-and-withdrawal-guards"></a>
 **Purge and withdrawal guards.** The guards that refuse purged content and keep withdrawn
 facts withdrawn run as the writing role (`SECURITY INVOKER`) and read their ledgers
 (`fact_purges`, `fact_withdrawals`, `take_purges`, `page_purges` and the derivation purge
-tables) under that role's RLS. Every gbrain function that pins a search_path ends it with
+tables) under that role's RLS. Since migration v318 (#7632, #7659) they fail closed: when
+RLS applies to the writing role on a ledger and no permissive policy of the role covers it,
+the guard refuses the write with `writer_coordinator_required: writer state is unreadable to
+this database role` (P0001, relationship `unreadable_state`), whose `HINT` names the table
+and the policy to add, instead of reading the ledger as empty and letting a purged claim,
+take, page or derivation, or a withdrawn fact, through. The refused writes are fact inserts
+and claim updates, fact re-activations, take writes, page content writes, segment derivation
+writes, and page soft-deletes or segment retirements while the derivation purge tables are
+unreadable. The owner (without `FORCE ROW LEVEL SECURITY`), a role that bypasses RLS, a
+ledger without RLS and PGLite are not affected. A scoped write role needs these policies, on
+top of the maintainer recipe below for `pages` and `sources`; they let it read only the
+ledger rows of the sources it writes and change none:
+
+<!-- gbrain:ledger-rls-recipe:begin (applied verbatim by test/guard-ledgers-fail-closed-7632.test.ts) -->
+```sql
+-- The ledgers of the writer's own sources, with the pages_scope_filter predicate.
+CREATE POLICY fact_purges_writer_scope ON fact_purges FOR SELECT TO <writer-role>
+  USING (current_setting('app.scopes', true) = '*'
+         OR source_id = ANY(string_to_array(current_setting('app.scopes', true), ',')));
+CREATE POLICY fact_withdrawals_writer_scope ON fact_withdrawals FOR SELECT TO <writer-role>
+  USING (current_setting('app.scopes', true) = '*'
+         OR source_id = ANY(string_to_array(current_setting('app.scopes', true), ',')));
+CREATE POLICY take_purges_writer_scope ON take_purges FOR SELECT TO <writer-role>
+  USING (current_setting('app.scopes', true) = '*'
+         OR source_id = ANY(string_to_array(current_setting('app.scopes', true), ',')));
+CREATE POLICY page_purges_writer_scope ON page_purges FOR SELECT TO <writer-role>
+  USING (current_setting('app.scopes', true) = '*'
+         OR source_id = ANY(string_to_array(current_setting('app.scopes', true), ',')));
+CREATE POLICY page_segment_derivation_purges_writer_scope ON page_segment_derivation_purges FOR SELECT TO <writer-role>
+  USING (current_setting('app.scopes', true) = '*'
+         OR source_id = ANY(string_to_array(current_setting('app.scopes', true), ',')));
+-- The note a page leaving a running derivation sweep's scope leaves for that sweep.
+CREATE POLICY page_segment_derivation_purge_pages_writer_note ON page_segment_derivation_purge_pages FOR INSERT TO <writer-role>
+  WITH CHECK (EXISTS (SELECT 1 FROM page_segment_derivation_purges r
+                      WHERE r.request_id = page_segment_derivation_purge_pages.request_id));
+```
+<!-- gbrain:ledger-rls-recipe:end -->
+
+A bulk fact insert (the fence import in `src/core/engine-sql/facts.ts`) defers the withdrawal
+stamp to the end of its statement, so when one of its rows matches a withdrawal the guard
+updates that row in `facts`, and the write role then needs a permissive `UPDATE` policy on
+`facts` covering the row, beside its `SELECT` policy, or the guard refuses the insert with the
+same `writer_coordinator_required` error.
+
+**Check that the upgrade replaced every guard.** Migrations v318 and v321 can only replace a guard
+function the role running them owns. A guard owned by another role is left as it was, and each
+migration only names it in one stderr line. Left by v318, it still lets a scoped writer without
+ledger policies through (`guards: N purge or withdrawal guard(s) still read their ledgers as empty ...`).
+Left by v321, a facts guard still lacks the name-tag rule, so a claim forgotten or
+purged under another subject can come back on a name tag (`guards: N purge or withdrawal guard(s)
+keep their body from before name keys ...`). After upgrading, run this as any role that can read
+the catalog. Every one of the seven rows must show `fails_closed = t`:
+
+```sql
+SELECT p.proname, pg_get_userbyid(p.proowner) AS owner,
+       strpos(p.prosrc, 'row_security_active(') > 0 AS fails_closed
+FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'public' AND p.proname IN ('gbrain_guard_inserted_facts',
+  'gbrain_preserve_fact_withdrawal', 'gbrain_refuse_purged_fact', 'gbrain_refuse_purged_take',
+  'gbrain_refuse_purged_page', 'gbrain_refuse_purging_derivation', 'gbrain_mark_derivation_scope_entry')
+ORDER BY 1;
+```
+
+For a row with `fails_closed = f`, connect as the role in its `owner` column and run
+`ALTER FUNCTION public.<proname>() OWNER TO <the role gbrain migrates as>;`. Then run
+`gbrain apply-migrations --yes`, or start gbrain: every migration run re-creates a guard that
+is missing its check or its current body, provided the migrating role owns it. You can also run
+gbrain once as the owning role instead. Run the query again to confirm. The query sees only the
+ledger check, so a facts guard v321 left still shows `fails_closed = t`. On Postgres, `gbrain doctor`
+(`guard_ledger_checks`) runs the same check, also checks the current body of the three facts guards
+(`unbacked_page` in `gbrain_refuse_purged_fact`, `memory/scope` in `gbrain_preserve_fact_withdrawal`
+and `gbrain_guard_inserted_facts`), and names each guard left behind with its owner, and the fix:
+`gbrain apply-migrations --yes` when the doctor's role may re-create it, else the
+`ALTER FUNCTION ... OWNER TO` SQL to run as the owning role first.
+
+The segmented storage recipe above already covers the two derivation purge tables for a
+role it applies to. A policy that filters out ledger rows of a source the role writes hides
+them from the guard, as before. Every gbrain function that pins a search_path ends it with
 `pg_temp` (migration v277, #7632), so a session's temp table or view named like a ledger
 cannot hide it from a guard; before, any session, the owner included, could store purged
-content that way. A write role with no policy on a ledger still reads it empty, so its
-purged or withdrawn writes still go through: give a scoped write role a `SELECT` policy on
-the ledgers of the sources it writes (gbrain#7659 tracks the fix). Each definition outside
+content that way. Each definition outside
 `src/core/schema-migrations/` pins `pg_catalog, public, pg_temp` itself (`bun run check:search-path`
 fails one that does not, or a pinned function missing from `PINNED_FUNCTION_NAMES`), so a schema
 replay keeps it; historical migration bodies still pin the old path, so every migration run ends by
@@ -743,6 +906,36 @@ to connect: it diagnoses the dir from disk, names the repair command, reports
 retained repair backups, and escalates when repairs keep recurring (that
 means the unclean-shutdown genesis is still active — see the ladder's rung 4).
 
+<a id="pglite-live-serve"></a>
+### PGLite while `gbrain serve` runs (`pglite_busy` reason `live_serve`)
+
+One gbrain process opens a PGLite brain at a time. While `gbrain serve` (stdio
+or `--http`) holds it, page and fact writes from the CLI (`gbrain put`,
+`gbrain remember`) and everyday reads (`gbrain find`, `list`, `search`, `query`,
+`get`, `tags`, `links`, `backlinks`, `timeline`, `history`, `graph`, `whois`,
+`entity`, `search-exact` and `gbrain waiting`) go through the
+running server and print what they print with no server running. A read run
+with a read-affecting `GBRAIN_*` variable or provider key the server does not
+share stays with the refusal below. Edits to `config.json` reach the server's
+answers only after the server restarts. Commands
+that need the database to themselves, which includes the admin commands
+(`gbrain access …`, `gbrain sources …`, `gbrain auth …`) and the remaining reads,
+refuse with `pglite_busy` reason `live_serve`. The refusal names the server's
+PID, and its fix is two steps: stop that server, then run the command again.
+Never remove the lock of a server that is still running.
+
+On a brain that serves one person this is a short pause: quit the agent
+session (a stdio serve) or stop `gbrain serve --http`, run the command, and
+start it again. On a brain that serves several people over
+`gbrain serve --http`, every member's connection drops while the server is
+stopped, for every admin step. Move such a brain to Postgres, where the server
+and the admin commands run side by side: preview with the read-only
+`gbrain migrate --to postgres --url-env GBRAIN_TARGET_URL --plan --json`,
+then follow [Move a PGLite brain to Postgres](guides/move-to-postgres.md). The
+move carries members, tokens, `readable_by` and facts across.
+`gbrain setup <harness> --serves several` on PGLite says this in its
+`engine` line.
+
 <a id="legacy-pglite-lock"></a>
 ### Legacy PGLite lock (`pglite_busy` reason `legacy_owner_unverified`)
 
@@ -960,6 +1153,25 @@ holding the single-writer data-dir lock reports `locked_by_serve`
 (healthy-with-note) instead of hanging ~30 seconds and misreporting a healthy
 brain as broken. A failed probe returns a classified diagnosis (reason +
 remediation), not a raw error.
+
+A probe that reaches the brain also prints `brain_ref` (JSON `probe.brain_ref`, human line `Ref:`): a 16-character
+one-way digest of the brain's persistence identity (`persistence_brain.brain_id`), which a reviewed policy uses to
+name one brain, such as the engine swap's dated readiness override. The digest cannot be turned back into the
+identity, and the command never prints the identity itself. While `gbrain serve` holds a PGLite brain, the probe
+reads the reference that serve recorded at start and after each reconnect (`<data dir>.gbrain-brain-ref.json`, 0600, holding the reference and
+a digest of the serve's lock token, never the identity); a file another lock holder wrote is refused
+(`brain_ref_note: serve_brain_ref_stale`). Other notes, with `brain_ref: null`: `no_persistence_identity`,
+`brain_ref_unreadable`, `locked_by_other_process`, `serve_brain_ref_missing` (a serve from before this field).
+
+**Say to your agent:** *"Give me my brain's brain_ref from gbrain engine status, not its id."*
+
+On a Rust brain the report names `rust` as the engine and the probe is typed. It checks the addon first and reports
+`rust_engine_addon_missing`, `rust_engine_addon_mismatch` or `engine_capability_missing` as a `refusal` (code, reason,
+message), not as a database diagnosis. A `database_path` with no `records.redb` (a missing path or an empty directory)
+probes as `data_dir_missing`, and a `records.redb` that is empty or has no `FORMAT` file beside it (a first open
+that stopped early, or a lost `FORMAT`) as `store_incomplete`;
+the probe creates nothing in either case. Otherwise it opens the store and reads one config key, since the Rust
+engine serves no `SELECT 1`.
 
 ### `gbrain db-repair [--yes] [--apply-rewrites] [--json] [--force] [--undo-last-rewrite] [--dry-run]`
 
@@ -1501,6 +1713,352 @@ The real backstop is `test/e2e/op-checkpoint-jsonb-parity.test.ts` +
 `test/e2e/jsonb-roundtrip.test.ts`, which round-trip writes through real Postgres
 and assert `jsonb_typeof` — the assertion PGLite cannot make.
 
+## The Rust engine shell
+
+The opt-in Rust engine (`docs/designs/RUST_ENGINE.md`) is under construction. PGLite and Postgres behave exactly
+as before, and an install needs no Rust toolchain and no addon. `openRustEngine({ addon, databasePath })`
+(`src/core/rust-engine.ts`) is the one seam: the `rust` case of `constructEngine` (`src/core/engine-construct.ts`)
+calls it after the addon loader has loaded and verified the native addon, and gets back the engine: every
+`BrainEngine` member, with `kind` `'rust'`. A `~/.gbrain/config.json` with `"engine": "rust"` and an absolute
+`database_path` (the store directory) selects it; that is a hand edit, because no command writes the value. A missing
+or relative `database_path` refuses `config_error` before the addon loads. Finding, checking and loading the
+addon, and refusing a missing or mismatched one, belong to the loader (below), not the shell.
+
+- **Capabilities.** The engine reports a capability only when it serves every `BrainEngine` member of that
+  capability (`src/core/rust-engine/store-capabilities.ts`). Today that is `schema`, `sources`, `config`, `page_versions`, `tags`, `embeddings`, `keyword_search`, `vector_search`,
+  `links`, `timeline`, `graph`, `facts`, `takes`, `files`, `code_edges`, `salience`, `raw_data`, `eval_capture`,
+  `ingest_log`, `dream_verdicts`, `contradictions` and `ontology`.
+  Each member it does not serve refuses `engine_capability_missing` with the capability as `reason` (`raw_sql`,
+  `pages`, `search`, ...), the member in `detail`, and `written=nothing`, before any work.
+  `src/core/rust-engine/members.ts` maps every member to its capability; the type fails when a new `BrainEngine`
+  member is not classified. What each capability still lacks is under "What a Rust brain serves now".
+- **One owner process per brain.** `connect()` takes the kernel lock `<database_path>.gbrain-owner.lock`; its
+  holder opens the store and serves it on `<database_path>/.gbrain-owner.sock` (`ownerRole` `'owner'`). Any other
+  process is a `'client'` that forwards each call; transactions refuse there. Limits and errors:
+  `docs/designs/RUST_ENGINE.md` ("Process model").
+- **SQL-only paths.** Code that only works through SQL (migrations, cycle locks, engine migration and graduation,
+  embed backfill, page-body staging) takes the kind as `EngineKind`, narrows it with `sqlEngineKind` or
+  `isRustEngineKind` (`src/core/sql-engine-kind.ts`), and refuses a Rust brain with `engine_capability_missing` reason `raw_sql` instead of treating it as Postgres.
+- **On the CLI.** Commands that need raw SQL (`import`, `sources add` and others) refuse `engine_capability_missing`.
+  When the source lookup is refused on a Rust brain and a source was selected (`GBRAIN_SOURCE`, a `.gbrain-source`
+  file, `sources.default`) or the brain holds a source besides `default`, the command stops with that refusal instead
+  of reading every source (`refusedSourceTarget`, `src/core/source-resolver.ts`). `gbrain init` with no engine flag
+  keeps an existing `rust` config: it reports the brain, leaves `config.json` unchanged and never opens the store;
+  `--pglite`, `--supabase`, `--url` and `--prefer-postgres` still choose the engine
+  (`src/commands/init-existing-engine.ts`). The owner makes the store directory mode 0700 when it opens the brain.
+  Pinned by `test/rust-cli-parity.serial.test.ts` (`docs/TESTING.md`, "Rust parity arm").
+- **The addon loader.** `loadRustEngineAddon()` (`src/core/rust-engine/addon-loader.ts`) returns the loaded addon,
+  or the refusal `rust_engine_addon_missing` or `rust_engine_addon_mismatch` with its `reason` (`gbrain errors
+  <code>`), before the brain is touched. It uses `GBRAIN_RUST_ENGINE_ADDON` (an absolute path to a build from `bun run
+  rust:build`; it skips only the release checksum pin) first, then an addon cached at
+  `<gbrain home>/engines/rust/<engine_build>/<target>.node` whose SHA-256 equals the cached manifest of this gbrain
+  version. It never reaches the network and writes nothing: with no cached addon it refuses with reason
+  `not_installed`, and a cached file that fails a check stays as it was. Fetching the release's addon into that cache
+  arrives with the capability gate. Only the Rust engine's open path may import the loader, lazily, so a PGLite or
+  Postgres brain never loads the addon or creates `<gbrain home>/engines/`.
+- **Shared memory.** The addon refuses a typed array whose buffer the runtime (`napi_is_arraybuffer`) does not call a
+  plain `ArrayBuffer`, so a `SharedArrayBuffer` view is refused with `InvalidArg` however JavaScript globals or
+  prototypes have been changed (`rust/README.md`).
+
+### What a Rust brain serves now
+
+`connect()` opens the brain directory through the addon's store (`rust/README.md`, "The brain store") and
+`disconnect()` closes it. A second engine on an open directory becomes the owner's client; a second direct store
+open refuses `rust_store_locked`; a directory the
+store cannot read refuses `rust_store_unreadable` with its reason (`gbrain errors <code>`). A served member on an engine
+that is not connected refuses `engine_closed`. These members run on the store (`src/core/rust-engine/store-members/`):
+
+- Contradictions, dream, raw files and code edges: `writeContradictionsRun`, `loadContradictionsTrend`,
+  `getContradictionCacheEntry`, `putContradictionCacheEntry`, `sweepContradictionCache`, `getDreamVerdict`,
+  `putDreamVerdict`, `sweepDreamVerdicts`, `putRawData`, `getRawData`, `upsertFile`, `getFile`, `listFilesForPage`,
+  `addCodeEdges`, `deleteCodeEdgesForChunks`, `getCallersOf`, `getCalleesOf` and `getEdgesByChunk`. They make the
+  `contradictions`, `dream_verdicts`, `raw_data`, `files` and `code_edges` capabilities complete. `getRawData` and the
+  code-edge reads refuse `excludePrivate: true` with `engine_capability_missing` instead of ignoring it. Each store
+  write is one transaction, so a refusal leaves nothing written. Per-member contracts are in
+  `rust/docs/store/` (`contradictions.md`, `dream.md`, `raw_files.md`, `code_edges.md`).
+- Config, sources and tags: `getConfig`, `setConfig`, `unsetConfig`, `listConfigKeys`, `getAllConfig`,
+  `getConfigValues`, `listAllSources`, `updateSourceConfig`, `getSource`, `listSourceLocalPaths`,
+  `getSourceStrictness`, `addTag`, `removeTag`, `getTags`, `pruneFrontmatterTags`, `addPageTagsById`. These are the
+  members that make the `config`, `sources`, `tags` and `schema` capabilities complete. The store keeps each tag's
+  claim (`added` or `frontmatter`) as PGLite's `tags.tag_source` does, so an import prune removes only the tags the
+  import claimed. `getSource` reads `last_commit`, `contextual_retrieval_mode` and `trust_frontmatter_overrides` as
+  null, null and false: only the sync anchor and source admin SQL write those columns, and neither runs on a Rust brain.
+- Pages: `getPage`, `readPageSnapshot`, `putPage`, `deletePage`, `softDeletePage`, `restorePage`, `listPages`,
+  `resolveSlugs`. A stale `expectedRevision` refuses with `PageRevisionConflictError`, as on PGLite.
+- Versions, chunks and timeline: `createVersion`, `getVersions`, `revertToVersion`, `upsertChunks`, `sealChunks`,
+  `getChunks`, `getChunkPage`, `getChunkWindows`, `countChunklessPagesWithContent`, `listChunklessPagesWithContent`,
+  `deleteChunks`, `addTimelineEntry`, `addTimelineEntriesBatch`, `getTimeline`, `getTimelineForDate`, `getSince`,
+  `getOnThisDay`, `getLastSeen` and `upsertEventProjection`. `page_versions` and `timeline` are reported. `chunks`
+  stays unreported, because `deleteChunksExcept`, `setChunkerVersion`, `writeTextProjectionSeal`, `moveChunkIndexes` and
+  `getChunkReuseRows` still refuse. Reads: `rust/docs/store/chunk_queries.md` and `timeline_queries.md`.
+- Links and graph: `addLink`, `addLinksBatch`, `removeLink`, `getLinks`, `getBacklinks`, `traverseGraph`,
+  `traversePaths`, `traversePathsDetailed`, and the link reads in `rust/docs/store/link_queries.md` (`getBacklinkCounts`,
+  `getAdjacencyBoosts`, `relationalFanout`, `findOrphanPages`, `supersedingPageSlugs`, `pagesLinkingTo`, ...). Every
+  member of `links` and `graph` is served, so both capabilities are reported.
+- Vectors and embeddings: `searchVector` and `searchTakesVector` (an exact scan over the stored vectors, scored as
+  pgvector scores them), the embedding state members (`getEmbeddingsByChunkIds`, `cosinesByChunkIds`, `listStaleChunks`,
+  `setPageEmbeddingSignature`, `updateTakeEmbeddings`, ...) and `upsertChunks` and `sealChunks` with the vector a chunk
+  carries (`rust/docs/store/vectors.md`, `rust/docs/store/embeddings.md`). The `vector_search` and `embeddings`
+  capabilities are reported. The store has one vector column, PGLite's `embedding`.
+- Facts, ontology and eval capture: `insertFact`, `insertFacts`, `deleteFactsForPage`, `expireFact`, `listFactsByEntity`,
+  `listFactsSince`, `listFactsKeyset`, `listFactsBySession`, `listSupersessions`, `countUnconsolidatedFacts`,
+  `findCandidateDuplicates`, `consolidateFact`, `findTrajectory`, `getFactsHealth`, `pageCollapseFacts` and
+  `migrateFactsToCanonical` (the `facts` capability); `mergeOntologyFact`, `getOntology`, `discoverOntologyDimensions`
+  and `findOntologyConflicts` (`ontology`); `logEvalCandidate`, `listEvalCandidates`, `deleteEvalCandidatesBefore`,
+  `logEvalCaptureFailure` and `listEvalCaptureFailures` (`eval_capture`);
+  the four open-loop members `upsertOpenLoop`, `closeOpenLoop`, `listOpenLoops` and `readEntityOpenLoops`
+  (`facts`; `rust/docs/store/facts.md`). A caller policy these members cannot honour
+  refuses `engine_capability_missing`. Contracts: `rust/docs/store/facts.md`, `ontology.md`, `eval_capture.md`.
+- Takes, salience, stats and the ingest log, alias and slug members, and the extraction and page-listing reads:
+  `rust/docs/store/takes.md`, `salience.md`, `stats.md`, `aliases.md`, `extraction.md` and `page_ops.md`. The `takes`,
+  `salience` and `ingest_log` capabilities are reported.
+- Facts and ontology claims, page operations, raw data and files, eval capture, dream verdicts, contradiction runs and
+  the code call graph: `rust/docs/store/facts.md`, `ontology.md`, `page_ops.md`, `raw_files.md`, `eval_capture.md`,
+  `dream.md`, `contradictions.md` and `code_edges.md`. The `facts`, `raw_data`, `files`, `eval_capture`,
+  `dream_verdicts`, `contradictions` and `code_edges` capabilities are reported; `pages` is not (`page_ops.md` says why).
+- Keyword and title search: `searchKeyword`, `searchKeywordChunks`, `countKeywordPages`, `searchKeywordPages`,
+  `searchTitles` and `findByTitleFuzzy`. They rank with a port of PostgreSQL's `ts_rank`, `ts_rank_cd` and
+  `websearch_to_tsquery` (english), so their answers match PGLite's (`rust/docs/store/keyword.md`). Every member of
+  `keyword_search` is served, so the capability is reported.
+- Segmented pages (a page over 1 MiB, stored in segments): `allocateBodyOccurrenceIds`, `stageSegmentTexts`,
+  `readSegmentTexts`, `stageManifestRows`, `readManifest`, `stageSegmentChunks`, `createSegmentedPageShell`,
+  `flipBodyGeneration`, `openBodyStaging`, `setBodyStagingState`, `readSegmentDerivations`, `upsertSegmentDerivations`,
+  `retireSegmentDerivations`, `sealSegmentedPage` and `refreshPageBody`. `sweepSegments` still refuses, and so does
+  a segmented page written inside `transaction` (the store has none), so the `page_body` capability stays unreported.
+  A whole-body `putPage` over a segmented page refuses, as on PGLite (`rust/docs/store/page_body.md`), and so does a
+  plain (unsealed) `upsertChunks`, `invalid_state` before it writes.
+
+A served member never drops what it cannot keep. An option or input the store has no home for, or cannot answer the
+way PGLite does, refuses `engine_capability_missing` and writes nothing. These are refused today:
+
+- a chunk that carries an image vector, and a Rust brain whose config sets `search_embedding_column` or
+  `embedding_columns` to another column (the store keeps PGLite's `embedding` column only; every member that reads the
+  active column refuses, `rust/docs/store/embeddings.md`);
+- a `putPage` with a `source_path` into a source in source-root slug mode whose directory is below its repository root
+  (only the files on disk can say whether another page already holds that file, and the store cannot read them);
+- `listPages` with `listColumnsOnly`;
+- `resolveSlugs` when no live page has exactly that slug, because PGLite goes on to a fuzzy title match the store does
+  not have, so an empty answer would be wrong to give;
+- a `getChunks` or `getChunkPage` over more than one distinct `sourceIds` entry;
+- a vector search with `where`, a date bound, `minTrust` or `suppressFlagged` (`rust/docs/store/vectors.md`);
+- an input of a raw-data, page-operation, salience, facts, ontology, chronicle or code-edge read the store cannot
+  reproduce, including a privacy policy wider than the store's (each `rust/docs/store/*.md` page lists them);
+- a keyword or title search with a CJK query, a text search configuration other than `english`, a truthy
+  `requireSafeChunks`, `minTrust` or `suppressFlagged`, a date bound that is not an ISO date, a malformed `where`, or a
+  truthy `excludePrivate` on `searchKeywordChunks`, `countKeywordPages` or `searchKeywordPages` (`searchKeyword` and
+  `searchTitles` serve it; `rust/docs/store/keyword.md`, "Refusals"), and a link
+  batch that sets a link kind or resolution.
+
+A `putPage` that carries a `source_path` keeps it, and refuses `page_identity_changed` (detail
+`origin_already_claimed`) when another live page of the same source already records that path, as PGLite does.
+
+What the Rust members do the way PGLite does: `putPage` writes the page alone. It does not chunk and does not seal,
+and `upsertChunks` does not seal either; only `sealChunks` replaces the chunks outright and seals them to the page's
+revision, so a page is searchable only after `sealChunks`. `getChunks` returns `[]` for a page that is not sealed at its
+current revision. `deletePage` hard-deletes from the default source. `softDeletePage` and `restorePage` with no
+`sourceId` act on every source. Slugs are matched as written. A cancelled `AbortSignal` stops `upsertChunks`,
+`addLinksBatch` and `addTimelineEntriesBatch` before anything is written, but a write already running in the native
+store cannot be cancelled, which is a difference from PGLite. Overlapping `connect()` calls share one open, and a
+`disconnect()` during a connect wins: the connect rejects `engine_closed` and the store it opened is closed.
+
+A scope that names no source (an empty string `sourceId` or `sourceIds` entry) is never widened: `getChunks` and `getTags` answer it as PGLite does, with nothing, instead of reading every source. A keyword hit always carries `effective_date` and `effective_date_source`, null when the page has no date.
+
+Keyword search hides what PGLite hides: soft-deleted pages, archived sources, pages that carry a `quarantine` or
+`pinned_question` frontmatter key, whatever its value, and the slug prefixes `test/`, `attachments/` and `.raw/` plus any
+that `GBRAIN_SEARCH_EXCLUDE` names (`include_slug_prefixes` opts back in). Keyword and title search rank with a port of `ts_rank` and
+`ts_rank_cd` over a port of PostgreSQL's english text search, and match PGLite's scores and order. No keyword case is
+listed in `test/rust-expected-divergence/` (`search.tsv` is empty).
+
+The parity suite checks this: with `GBRAIN_TEST_RUST_ARM=1` each `test/engine-parity/` file adds a Rust arm. A case that
+reaches a member or an option Rust refuses must end on that typed refusal (a refusal the case caught on the way to
+another outcome does not count); any other case must return what PGLite returns, or differ only as its row in
+`test/rust-expected-divergence/` (one file per family) names with a normaliser, and Rust must still return a value (a thrown error never
+passes, and a row that stops being true fails the run). The suite
+runs on PGLite alone without the flag.
+
+**Transactions and the belief ledger.** Both stay refused on the Rust engine, on purpose.
+
+- `transaction`, `transactionDirect` and `lockPageKeys` refuse `transactions`. The store makes each write atomic on
+  its own, but it has no handle that spans several calls, and `lockPageKeys` throws outside a transaction on PGLite, so
+  there is nothing for it to hold. Code that passes settings into a transaction (the write attribution, trust and
+  maintenance settings in `src/core/persistence/context.ts`) does it with `set_config` and `current_setting` through
+  `tx.executeRaw`, which needs SQL. A Rust transaction would carry those values on a typed context instead.
+- `belief_ledger` is a subsystem, not a `BrainEngine` member: `src/core/belief/` appends and reads belief events through
+  `executeRaw`. The Rust engine never reports `raw_sql` (design D18), so the ledger refuses until its reads and appends
+  have typed members. Nothing in the Rust engine writes belief events today.
+
+## Rust engine shadow mode
+
+Shadow mode checks the Rust engine against your real reads before you switch to it. It is off by default and changes
+nothing about how your brain answers: the primary engine (PGLite or Postgres) always answers first, and a sample of
+reads and searches is then replayed against the Rust engine in a separate, supervised child process. The child
+compares the two answers and records only content-free rows (time, operation, outcome, reason code, row counts, timings) in a local
+ledger. Nothing is written to the brain database, the config table or the brain repo; all shadow state lives in
+`~/.gbrain/shadow/<brain>/` (`$GBRAIN_HOME/.gbrain/shadow/<brain>/` when `GBRAIN_HOME` is set).
+
+**Say to your agent:** *"Turn on Rust engine shadow mode for my brain and show me the report."*
+
+```bash
+gbrain engine shadow seed [--json]                 # copy the brain into the Rust store once (shadow mode off)
+gbrain engine shadow start --plan                  # preview the plan and its plan_hash, writes nothing to the shadow directory or the brain's tables (also reports whether the brain can swap)
+gbrain engine shadow start --yes --expect <hash>   # turn it on (loads the Rust addon first; refuses without it)
+gbrain engine shadow reconcile [--full] [--json]   # compare the whole brain with the Rust store and repair differences
+gbrain engine shadow status [--json]
+gbrain engine shadow report [--json]               # prints the report; writes reports/provisional.{json,md} only once the shadow directory exists
+gbrain engine shadow stop [--delete]               # turn it off; --delete removes the shadow directory
+```
+
+- **Fail-open.** Mirroring never fails a primary call; a sampled read pays only the bounded copy described below. The queue is bounded (`--queue-bound`, default 256)
+  and sheds when full; reads inside a transaction are skipped; `--sample-rate` (default 0.1) picks which reads are
+  mirrored. Only sampled reads are copied, the arguments before the call and the result the moment the primary answers, so a caller that changes a result
+  afterwards cannot cause a false difference. The copy stops as soon as a call's arguments or result pass about
+  1 MiB (every value counts, even a null), so a huge result is counted as too large and never built. A
+  call that stays stuck in the Rust engine holds one of four slots; past that new reads are recorded as `timeout` (stalled) without being replayed and the child goes
+  quiet so it is restarted. When a process closes, reads still queued are handed to the child and the child records them: it drops the CLI's pipe handlers so a closed pipe cannot kill it, drains what it received, writes its ledger and summary, and exits at most 30 seconds after its input ends (the parent's kill timer dies with the parent, so the child carries its own deadline). Finished comparisons are written every 2 seconds. A read still queued when a process is killed, or one the child had not yet written when it is killed, is lost. The child restarts with backoff, and mirroring turns itself off after 5 child exits in 10 minutes, a
+  child silent for 60 seconds is killed, and a privacy divergence pauses comparison.
+- **What a privacy divergence is.** Before any equality check, every row of the Rust result is tested against the call's own
+  arguments, and one hit records `privacy_diverged` and pauses mirroring (a plain `diff` can never hide it). A hit is a row with
+  a source outside the call's scope, read the way the primary applies it: `sourceIds` first, else `sourceId`, else the
+  positional source of `listFactsByEntity` (first argument), `resolveSlugWithAlias` (second) and `findByTitleFuzzy` (fourth); an
+  empty `sourceIds` with no `sourceId` names no scope, so the read is unscoped, as in the primary. The row's `source_id`, and on a link its `from_source_id`, `to_source_id`
+  and `origin_source_id`, must all be in a `sourceIds` scope; a one-source link read checks only the end the primary scopes
+  (`getLinks` the from page, `getBacklinks` the to page). A hit is also a page row (one carrying `frontmatter`) that a call with
+  `excludePrivate` should hide: `visibility: private`, a pinned question, an unmarked atom, question or synthesized concept, or (with `visibility` unset) an
+  `access` or `confidentiality` alias the primary reads as private; an alias row counts only when the primary's own answer left it out,
+  because a brain can turn the aliases off and the child cannot read that setting.
+  Not checked, because the result carries nothing to check: `resolveSlugs`, `resolveSlugWithAlias`, `getTags`, `getTimeline`,
+  `getChunks`, `findByTitleFuzzy`, `getStats`, `countKeywordPages` and `searchTakes` rows have no source column, search rows only
+  when they carry `source_id`, and `excludePrivate` only on rows with `frontmatter` (so not facts, links, finds or search rows).
+  A leak in those shows as `diff`.
+- **Brains and deleting.** Each brain gets its own directory, keyed by its engine and where it lives: the database path for PGLite, or the host, port, database and user name for Postgres
+  (two Supabase projects behind one pooler differ by user name; the password is never part of it). `stop --delete`
+  removes the directory, and a child that is still running cannot write it back. The commands cover the host brain only:
+  with `--brain <id>` or `GBRAIN_BRAIN_ID` naming another brain they refuse and change nothing.
+- **Managed storage: reported, not refused.** Shadow mode gathers evidence on managed brains too; only the swap
+  refuses them (`engine_swap_refused`, reason `managed_storage`, which `gbrain engine swap` still returns and shadow
+  mode never does). `start` (the preview, `--plan` and `--yes`) opens the brain database once, best-effort, and reads one
+  row: `persistence_brain.enabled`. A PGLite brain opens without recording its managed roots and without repairing a
+  damaged log, so the open writes no managed-root ownership marker or registry entry and moves no datastore file aside; like any PGLite open it takes the datastore's process lock and PGLite rewrites its control and log files until `start` closes the brain. A brain with an open repair episode is left unread (`repair_episode_open`), because a healthy open would close the episode and prune its backups. A managed brain prints `storage: this brain cannot swap while it uses managed
+  storage` in the plan and after `--yes`, and `state.json` records `storage: { managed: true, checked_at }` (`false` for
+  an unmanaged brain). A brain whose mode cannot be read (the database is down, another process holds a PGLite brain, a
+  PGLite path holds no brain which `start` never creates, or the row is missing or malformed) does not block `start`: it
+  prints `storage: could not read whether this brain uses managed storage; the swap will check it (<reason>)` and records
+  `{ managed: null, checked_at, reason }`, where `reason` is the error's code (`pglite_busy`, `no_brain`,
+  `storage_error`) or `open_failed` / `read_failed`, never free-form error text. `start` opens the database only for
+  this record, so it is the one place that needs the database reachable, and a failed open never changes the exit code.
+  `status --json` and the report carry the same record as `storage: { managed, checked_at, note, reason? }` (the
+  field a later command reads to know the brain cannot swap), where `note` is `this brain cannot swap while it uses
+  managed storage` for a managed brain, `could not read whether this brain uses managed storage; the swap will check
+  it` when `managed` is null, and null for an unmanaged brain; `storage` is null for a state written before the field
+  existed. `status` and the report print the note as a line. `status` and the report read the recorded value; they do
+  not open the database.
+- **Why this is safe for the primary.** `start` reads one row and writes no table row, source file, managed-root ownership marker or registry entry. Opening a PGLite brain still touches its own files: it takes the datastore's process lock (the `.gbrain-lock` folder and the `<datastore>.gbrain-owner.json` and `.gbrain-owner.lock` files beside it) until `start` closes the brain, and PGLite rewrites its control and log files (`global/pg_control`, `pg_wal/`), as any open of that brain does. The mirror replays sampled reads
+  into the Rust store under the shadow directory. Nothing in shadow mode writes a row to the primary database, or writes its worktrees, its
+  write effects or its writer coordination locks. The residual risk is to the evidence: a write the owner process or an effect worker
+  applies outside the wrapped engine is not seen by shadow mode, so the comparison for it may differ; such a write
+  shows up as a difference or a miss in the counts, never as silent equality.
+- **No network in the background.** gbrain downloads no addon. `start --yes`, the child
+  and `gbrain doctor` only use an addon that is already installed; without one, `start --yes` refuses and stays off, `gbrain doctor` fails
+  the `rust_engine_addon` check, and the child records `addon_unavailable` (`rust_engine_addon_missing`, reason `not_installed`).
+- **Doctor.** `rust_engine_addon` checks the installed addon when shadow mode is on and is not applicable otherwise.
+- **Evals.** `gbrain eval longmemeval` and `gbrain eval brainbench` take `--engine pglite|rust`. With `rust`, a missing
+  or mismatched addon stops the run with its code and reason, and so does a Rust store that cannot yet run the table
+  reset between fixtures (`rust_benchmark_unsupported`), so until the benchmark can reset a Rust store without raw SQL (the Rust engine never reports `raw_sql`) the flag
+  stops before any work. A longmemeval run records the engine in its resume hash, and the memory-trust brainbench
+  suites refuse `--engine rust` because they always build PGLite brains.
+- **Seed.** `seed` copies the brain into the Rust store once, from one read-only snapshot, and writes
+  `seed.json`: what it copied, the values the store could not keep, the unfinished jobs and segmented pages it left
+  behind, and the unseeded gap rows (tables the Rust store cannot serve yet; a swap is refused while any remain).
+  It refuses while shadow mode is on. To seed again, `stop --delete` and seed into the new directory.
+  Rust store layout: [rust/docs/store/seed.md](../rust/docs/store/seed.md).
+- **Managed storage: seeded, not refused.** Shadow mode gathers evidence on managed brains too; only the swap
+  refuses them (`engine_swap_refused`, reason `managed_storage`, which `gbrain engine swap` still returns and shadow mode
+  never does). `seed` and `seed --json` run on a managed brain and copy it like any other. Right before its snapshot, in
+  a statement of its own so a failed read cannot abort the snapshot, `seed` reads one row, `persistence_brain.enabled`,
+  and records `storage: { managed, checked_at, reason? }` in `seed.json`. A managed brain prints `storage: this brain
+  cannot swap while it uses managed storage`; `managed` is `false` for an unmanaged brain (no line). A mode that cannot be
+  read once the brain is open (the row is missing or malformed) does not stop the seed: it prints
+  `storage: could not read whether this brain uses managed storage; the swap will check it (<reason>)` and records
+  `managed: null` with the error's code (`storage_error`) or `read_failed`, never free-form error text. A
+  brain that cannot be opened at all cannot be read, so that is an error, not a mode: `seed` exits 1 with `could not open
+  the brain (<code>)` before it loads the addon or creates anything. This includes a PGLite brain that another process holds
+  (`gbrain serve` or any other open): the seed exits 1 with `could not open the brain (pglite_busy)` and asks you to stop
+  that process and run it again. A PGLite path that holds no brain is never created. `status --json` carries the record as `seed.storage: { managed, checked_at, note, reason? }` (null before a
+  seed, or for a seed written before the field existed), where `note` is `this brain cannot swap while it uses managed
+  storage` for a managed brain, `could not read whether this brain uses managed storage; the swap will check it` when
+  `managed` is null, and null for an unmanaged brain. `status` and the report print the note; the report's `seed.storage`
+  has the same shape. `seed` writes no table row, source file, managed-root ownership marker or registry entry, and it
+  never writes the primary's worktrees, write effects or writer coordination locks, so every `persistence_*` row and the
+  content root are byte-identical across it. Opening a PGLite brain still touches its own files: the open takes the
+  datastore's process lock (the `.gbrain-lock` folder and the `<datastore>.gbrain-owner.json` and `.gbrain-owner.lock`
+  files beside it) until `seed` closes the brain, and PGLite rewrites its control and log files (`global/pg_control`,
+  `pg_wal/`), as any open of that brain does. `seed` opens a PGLite brain without recording its managed roots and without
+  repairing a damaged log, so it moves no datastore file aside. A brain with an open repair episode is not opened
+  (`seed` exits 1 with `could not open the brain (repair_episode_open)`), because a healthy open would close the episode
+  and prune its repair backups. A repair episode recorded while `seed` waits for the datastore lock is left open too, and
+  its backups stay.
+- **Follow.** A seeded brain is followed while shadow mode is on. Each committed write through the wrapped engine is
+  read back from the brain, in its own short read-only `REPEATABLE READ` transaction (on Postgres, a dedicated
+  one-connection pool, so the serving pool is never used), and applied to the Rust store, so stored ids and fact
+  fingerprints stay identical. A rolled-back transaction changes nothing. The coverage watermark says whether every
+  committed write is in the store. It goes invalid on a shed, a gap in the write sequence, a failed read, a relation
+  the follower cannot describe row by row (which then needs a pass for that relation), or rows the store had to
+  displace. **Every session that owns the store starts invalid**, even after a clean stop, and becomes valid again
+  only when a full reconcile pass that started after the session start has proven the store. A relation marked dirty
+  is settled by a pass for that relation that started after the mark. Only the process that owns the Rust store
+  applies writes. A second process cannot apply: its child leaves a line in `follower-invalidations.jsonl` (at most
+  one per second while it sees writes) and the owner reads those lines before it advances the watermark, treating the
+  second after each line as unproven. A write by a second process is therefore unproven for a short moment before its
+  line lands, and a read-only command leaves no line.
+- **Reconcile.** `reconcile` compares every seeded relation with the Rust store in 500-row key intervals and replaces
+  any interval that differs, then checks allocators and the fingerprint probe. Each interval is its own short read of
+  the primary (with a pause between intervals) and nothing is held open while the pass talks to the Rust store, so a
+  pass is not one snapshot: each interval is protected by the generation taken just before its read. `reconcile` and
+  `reconcile --full` both run a full pass. It needs the Rust store to be free (stop the serving process first). A full
+  pass also runs on its own a minute after a serving process starts if the watermark is still invalid, every 24 hours
+  while the follower runs, and again when the watermark is invalid and the last pass is over an hour old. A pass that
+  displaced rows does not restore the watermark; the relation gets another pass and the full restore waits for the
+  next full pass. A displaced page also marks `tags` dirty, because its tags go with it. An interval that already
+  matches is still rewritten, so its generation fence stops a follower read that began before the pass from
+  overwriting what the pass verified; every full pass therefore rewrites rows that were already correct.
+  **A seed written before follow existed has no digest entries**, so nothing is followed and `reconcile` refuses it:
+  `status` says the brain needs a reseed (`follower.state` is `needs_reseed`, with the steps in `follower.action`).
+  Reseed with `gbrain engine shadow stop --delete`, then `gbrain engine shadow seed`, then `gbrain engine shadow start --plan`,
+  then `gbrain engine shadow start --yes --expect <plan_hash>` (a bare `start` only prints the plan).
+- **Status fields.** `status --json` adds: `follower.state` (`not_seeded`, `needs_reseed`, `stopped`, `invalid`, `behind`,
+  `following`), `follower.action` (the reseed steps, or `null`), `lag_ms`, `lag_ms_p99_24h` and `lag_ms_p99_epoch` (a power-of-two bucket upper bound, not an exact
+  value), `queue_depth`, `applied_rows`, `coverage_watermark`; `reconcile.state` (`never_run`, `ok`, `repaired`,
+  `error`), `last_pass` (with `repaired_rows`, `repaired_by_relation` and `follower_misses`: repaired rows found while the
+  watermark claimed coverage), `consecutive_clean_full_passes`, `next_full_pass_due`; `fingerprints` (`checked_rows`,
+  `mismatches`, and a `probe`, described below); `allocators`;
+  `seed`; `primary_refreshes` (`nonterminal_rows`: primary `gbrain sources refresh` rows that are neither completed nor
+  aborted, counted by the last full pass, with its `checked_at`; `null` before one; a swap must drain them first, and
+  this is a reading, not the swap's own check); and `write_comparisons`, which is `capability_missing` until write comparisons are built. The
+  `write_comparisons` and `fingerprints` counts are totals for the current epoch; one epoch is one seed.
+- **Fingerprint probe.** Withdrawals and purge tombstones key on the fact fingerprint, so a primary whose `lower()` or
+  `[[:space:]]` answers differ from PGLite's (and Rust's) for some code point would fingerprint a claim holding it
+  differently, and a withdrawn fact would not match on Rust. At follower start and on each full pass the probe reads, in
+  one read-only set-based query, `lower(chr(cp))` and `chr(cp) ~ '[[:space:]]'` for every Unicode scalar value (surrogates
+  and U+0000 excluded) plus the word-final sigma rule, and compares them with PGLite's tables in
+  `rust/crates/gbrain-store/tests/fixtures/fact_fingerprints.json`. It also runs every hand row and every sixth seeded row of
+  that corpus through `gbrain_fact_fingerprint` and `gbrain_fact_fingerprint_v1` (texts as bind parameters, never logged).
+  If any code point differs it counts the stored `facts` rows whose claim holds one (a count, never the text). The query costs
+  about 0.5 s on Postgres 16 and 17 with a glibc database, 0.7 s with an ICU database and 0.7 s on PGLite, measured on a dev
+  container; it reads only. `probe` carries
+  `state` (`pass`, `fail`, `not_run`), `checked_at`, `server_version`, `mismatches` (the fixed 20-claim corpus against Rust), the
+  database's `collation`, `ctype`, `locale_provider` (`c` libc, `i` ICU, `b` builtin) and `locale` (`datlocale` on Postgres 17,
+  `daticulocale` on 16, `null` where absent), `differing_code_points` (the first 50 as `U+XXXX`) with
+  `differing_code_points_total`, `corpus_mismatches` with `corpus_mismatch_rows` (the first five row names, never text) and
+  `facts_with_differing_code_points`. `state` is `fail` when code points differ and at least one stored fact holds one, or when
+  a corpus row or the fixed corpus differs and no differing code point explains it; otherwise `pass`, and a pass still lists the
+  differing code points so a swap report can name them. A probe that errors is `not_run`. A glibc `en_US.utf8` host differs
+  (U+0085, U+1680, circled letters and more); a C-ctype host differs on every cased non-ASCII letter, so it fails once a fact
+  holds one.
+- **Provisional report.** The verdict is always `NOT READY`: this phase compares reads only, write comparisons
+  are not built yet, and the readiness decision come in later phases of the plan
+  (`docs/designs/RUST_ENGINE.md`, Phase S). Until the Rust engine serves reads, comparisons record
+  `capability_missing`.
+
 ## Adding a new engine
 
 1. Create `src/core/<name>-engine.ts` implementing `BrainEngine`
@@ -1514,7 +2072,9 @@ and assert `jsonb_typeof` — the assertion PGLite cannot make.
    engines do. Declare its capabilities honestly. The binding matrix
    (`test/helpers/executor-binding-matrix.ts`) and the engine-sql contract
    tests tell you whether the adapter binds, counts, fails and cancels like the
-   others. A non-SQL engine implements every method itself.
+   others. A non-SQL engine implements typed methods instead of a `SqlExecutor`:
+   it declares no `raw_sql` capability, and each member it cannot serve yet
+   refuses `engine_capability_missing` (see "The Rust engine shell" above).
 4. Store engine type in `~/.gbrain/config.json`: `{ "engine": "myengine", ... }`
 5. Add tests. The test suite should be engine-agnostic where possible... same test cases, different engine constructor.
 6. Document in this file + add a design doc in `docs/`

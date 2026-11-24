@@ -142,7 +142,6 @@ CREATE INDEX IF NOT EXISTS idx_pages_type ON pages(type);
 CREATE INDEX IF NOT EXISTS idx_pages_frontmatter ON pages USING GIN(frontmatter);
 CREATE INDEX IF NOT EXISTS idx_pages_trgm ON pages USING GIN(title gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_pages_slug_basename ON pages (source_id, (regexp_replace(slug, '^.*/', '')));
-CREATE INDEX IF NOT EXISTS idx_pages_source_title_lower ON pages (source_id, lower(title));
 CREATE INDEX IF NOT EXISTS idx_pages_slug_trgm ON pages USING GIN (slug gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_pages_source_id ON pages(source_id);
 CREATE INDEX IF NOT EXISTS pages_deleted_at_purge_idx
@@ -1555,6 +1554,26 @@ DECLARE
   src TEXT;
   page INTEGER;
 BEGIN
+  IF pg_catalog.row_security_active('page_segment_derivation_purges') THEN
+    IF EXISTS (SELECT 1 FROM pg_catalog.unnest(ARRAY['r']) AS needed(cmd) WHERE NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_policy p WHERE p.polrelid = 'page_segment_derivation_purges'::regclass::oid AND p.polpermissive AND p.polcmd::text IN ('*', needed.cmd)
+          AND EXISTS (SELECT 1 FROM pg_catalog.unnest(p.polroles) AS r(id) WHERE CASE WHEN r.id = 0::oid THEN true ELSE pg_catalog.pg_has_role(r.id, 'USAGE') END))) THEN
+      RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: writer state is unreadable to this database role',
+        TABLE=TG_TABLE_NAME, SCHEMA=TG_TABLE_SCHEMA, CONSTRAINT='managed_writer_guard:unreadable_state',
+        DETAIL=pg_catalog.jsonb_build_object('op',TG_OP,'relationship','unreadable_state','state','page_segment_derivation_purges')::text,
+        HINT='Give this database role a policy on page_segment_derivation_purges allowing SELECT on the rows of the sources it writes (docs/ENGINES.md#purge-and-withdrawal-guards), or connect as the table owner.';
+    END IF;
+  END IF;
+  IF pg_catalog.row_security_active('page_segment_derivation_purge_pages') THEN
+    IF EXISTS (SELECT 1 FROM pg_catalog.unnest(ARRAY['a']) AS needed(cmd) WHERE NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_policy p WHERE p.polrelid = 'page_segment_derivation_purge_pages'::regclass::oid AND p.polpermissive AND p.polcmd::text IN ('*', needed.cmd)
+          AND EXISTS (SELECT 1 FROM pg_catalog.unnest(p.polroles) AS r(id) WHERE CASE WHEN r.id = 0::oid THEN true ELSE pg_catalog.pg_has_role(r.id, 'USAGE') END))) THEN
+      RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: writer state is unreadable to this database role',
+        TABLE=TG_TABLE_NAME, SCHEMA=TG_TABLE_SCHEMA, CONSTRAINT='managed_writer_guard:unreadable_state',
+        DETAIL=pg_catalog.jsonb_build_object('op',TG_OP,'relationship','unreadable_state','state','page_segment_derivation_purge_pages')::text,
+        HINT='Give this database role a policy on page_segment_derivation_purge_pages allowing INSERT on the rows of the sources it writes (docs/ENGINES.md#purge-and-withdrawal-guards), or connect as the table owner.';
+    END IF;
+  END IF;
   IF TG_TABLE_NAME = 'pages' THEN
     src := NEW.source_id;
     page := NEW.id;
@@ -1579,6 +1598,26 @@ CREATE TRIGGER pages_derivation_scope_delete AFTER UPDATE OF deleted_at ON pages
   FOR EACH ROW WHEN (OLD.deleted_at IS NULL AND NEW.deleted_at IS NOT NULL) EXECUTE FUNCTION gbrain_mark_derivation_scope_entry();
 CREATE OR REPLACE FUNCTION gbrain_refuse_purging_derivation() RETURNS trigger SET search_path = pg_catalog, public, pg_temp AS \$func\$
 BEGIN
+  IF pg_catalog.row_security_active('page_segment_derivation_purges') THEN
+    IF EXISTS (SELECT 1 FROM pg_catalog.unnest(ARRAY['r']) AS needed(cmd) WHERE NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_policy p WHERE p.polrelid = 'page_segment_derivation_purges'::regclass::oid AND p.polpermissive AND p.polcmd::text IN ('*', needed.cmd)
+          AND EXISTS (SELECT 1 FROM pg_catalog.unnest(p.polroles) AS r(id) WHERE CASE WHEN r.id = 0::oid THEN true ELSE pg_catalog.pg_has_role(r.id, 'USAGE') END))) THEN
+      RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: writer state is unreadable to this database role',
+        TABLE=TG_TABLE_NAME, SCHEMA=TG_TABLE_SCHEMA, CONSTRAINT='managed_writer_guard:unreadable_state',
+        DETAIL=pg_catalog.jsonb_build_object('op',TG_OP,'relationship','unreadable_state','state','page_segment_derivation_purges')::text,
+        HINT='Give this database role a policy on page_segment_derivation_purges allowing SELECT on the rows of the sources it writes (docs/ENGINES.md#purge-and-withdrawal-guards), or connect as the table owner.';
+    END IF;
+  END IF;
+  IF pg_catalog.row_security_active('pages') THEN
+    IF EXISTS (SELECT 1 FROM pg_catalog.unnest(ARRAY['r']) AS needed(cmd) WHERE NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_policy p WHERE p.polrelid = 'pages'::regclass::oid AND p.polpermissive AND p.polcmd::text IN ('*', needed.cmd)
+          AND EXISTS (SELECT 1 FROM pg_catalog.unnest(p.polroles) AS r(id) WHERE CASE WHEN r.id = 0::oid THEN true ELSE pg_catalog.pg_has_role(r.id, 'USAGE') END))) THEN
+      RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: writer state is unreadable to this database role',
+        TABLE=TG_TABLE_NAME, SCHEMA=TG_TABLE_SCHEMA, CONSTRAINT='managed_writer_guard:unreadable_state',
+        DETAIL=pg_catalog.jsonb_build_object('op',TG_OP,'relationship','unreadable_state','state','pages')::text,
+        HINT='Give this database role a policy on pages allowing SELECT on the rows of the sources it writes (docs/ENGINES.md#purge-and-withdrawal-guards), or connect as the table owner.';
+    END IF;
+  END IF;
   IF EXISTS (SELECT 1 FROM page_segment_derivation_purges x JOIN pages p ON p.source_id = x.source_id
     WHERE p.id = NEW.page_id AND (NEW.page_id = ANY(x.page_ids::int[]) OR p.deleted_at IS NOT NULL OR NOT EXISTS (SELECT 1 FROM page_body_manifest m
     WHERE m.page_id = NEW.page_id AND m.occurrence_id = NEW.occurrence_id AND m.gen_to IS NULL AND m.staging_id IS NULL AND m.sha256 = NEW.segment_sha256))
@@ -2962,7 +3001,7 @@ BEGIN
   FOR f IN SELECT p.oid::regprocedure AS sig, substr(c.setting, 13) AS path
     FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace CROSS JOIN LATERAL unnest(p.proconfig) AS c(setting)
     WHERE n.nspname = 'public' AND p.prokind = 'f' AND c.setting IN ('search_path=pg_catalog, public', 'search_path=pg_catalog')
-      AND p.proname IN ('auto_enable_rls', 'bump_page_generation_clock_fn', 'bump_page_generation_fn', 'enforce_minion_queue_protocol', 'gbrain_access_derive_page_readers', 'gbrain_access_folder_rules', 'gbrain_access_lineage_rules', 'gbrain_access_mark_restricted', 'gbrain_access_norm_readers', 'gbrain_access_origin_closed_for', 'gbrain_access_origin_hidden_for', 'gbrain_access_origin_labelled_for', 'gbrain_access_origin_restricted', 'gbrain_access_pending_covers', 'gbrain_access_readers', 'gbrain_access_refresh_serves', 'gbrain_access_refresh_serves_trigger', 'gbrain_access_stamp_folder_rules', 'gbrain_access_state_unreadable', 'gbrain_advance_page_revision', 'gbrain_advance_tag_revision', 'gbrain_bump_trust_generation', 'gbrain_clear_atom_page_state', 'gbrain_concept_inputs_private', 'gbrain_count_git_canonical_sources', 'gbrain_count_modifications', 'gbrain_forget_page_retrievals', 'gbrain_fts_input', 'gbrain_graduation_fence', 'gbrain_guard_deferred_request', 'gbrain_guard_effect_protocol', 'gbrain_guard_guest_records', 'gbrain_guard_inserted_facts', 'gbrain_guard_protocol_activation', 'gbrain_guard_request_protocol', 'gbrain_guard_skill_publication', 'gbrain_lease_shared_skill_delivery', 'gbrain_mark_derivation_scope_entry', 'gbrain_preserve_fact_withdrawal', 'gbrain_queue_page_projection', 'gbrain_refuse_purged_fact', 'gbrain_refuse_purged_page', 'gbrain_refuse_purged_take', 'gbrain_refuse_purging_derivation', 'gbrain_release_refresh_barrier', 'gbrain_require_managed_writer', 'gbrain_require_persistence_protocol', 'gbrain_snapshot_version_trust', 'gbrain_stamp_revision_attribution', 'gbrain_stamp_trust_tier', 'gbrain_stamp_version_attribution', 'gbrain_stamp_write_attribution', 'gbrain_try_jsonb', 'notify_minion_job_change', 'update_chunk_search_vector', 'update_page_search_vector')
+      AND p.proname IN ('auto_enable_rls', 'bump_page_generation_clock_fn', 'bump_page_generation_fn', 'enforce_minion_queue_protocol', 'gbrain_access_derive_page_readers', 'gbrain_access_folder_rules', 'gbrain_access_lineage_rules', 'gbrain_access_mark_restricted', 'gbrain_access_norm_readers', 'gbrain_access_origin_closed_for', 'gbrain_access_origin_hidden_for', 'gbrain_access_origin_labelled_for', 'gbrain_access_origin_restricted', 'gbrain_access_pending_covers', 'gbrain_access_readers', 'gbrain_access_refresh_serves', 'gbrain_access_refresh_serves_trigger', 'gbrain_access_stamp_folder_rules', 'gbrain_access_state_unreadable', 'gbrain_advance_page_revision', 'gbrain_advance_tag_revision', 'gbrain_bump_trust_generation', 'gbrain_clear_atom_page_state', 'gbrain_concept_inputs_private', 'gbrain_count_git_canonical_sources', 'gbrain_count_modifications', 'gbrain_forget_page_retrievals', 'gbrain_fts_input', 'gbrain_graduation_fence', 'gbrain_guard_deferred_request', 'gbrain_guard_effect_protocol', 'gbrain_guard_guest_records', 'gbrain_guard_inserted_facts', 'gbrain_guard_protocol_activation', 'gbrain_guard_request_protocol', 'gbrain_guard_skill_publication', 'gbrain_lease_shared_skill_delivery', 'gbrain_mark_derivation_scope_entry', 'gbrain_owner_only_held', 'gbrain_owner_only_hold', 'gbrain_owner_only_lineage', 'gbrain_owner_only_lineage_strict', 'gbrain_owner_only_mark_derived', 'gbrain_owner_only_marks_denied', 'gbrain_owner_only_read_mode', 'gbrain_owner_only_reads_complete', 'gbrain_owner_only_row_deleted', 'gbrain_owner_only_source_changed', 'gbrain_preserve_fact_withdrawal', 'gbrain_queue_page_projection', 'gbrain_refuse_purged_fact', 'gbrain_refuse_purged_page', 'gbrain_refuse_purged_take', 'gbrain_refuse_purging_derivation', 'gbrain_release_refresh_barrier', 'gbrain_require_managed_writer', 'gbrain_require_persistence_protocol', 'gbrain_snapshot_version_trust', 'gbrain_stamp_revision_attribution', 'gbrain_stamp_trust_tier', 'gbrain_stamp_version_attribution', 'gbrain_stamp_write_attribution', 'gbrain_try_jsonb', 'notify_minion_job_change', 'update_chunk_search_vector', 'update_page_search_vector')
       AND pg_has_role(current_user, p.proowner, 'USAGE')
     ORDER BY 1
   LOOP

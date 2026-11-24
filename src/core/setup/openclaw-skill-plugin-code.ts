@@ -8,7 +8,7 @@
  * changes the plugin code itself.
  */
 
-export const OPENCLAW_SKILL_PLUGIN_CODE_VERSION = 1;
+export const OPENCLAW_SKILL_PLUGIN_CODE_VERSION = 3;
 
 export interface LoaderConstants { home: string; libDir: string; statePath: string; logDir: string; gbrainBin: string; gbrainHomeEnv: string | null }
 
@@ -92,7 +92,7 @@ const LOADER_JS = String.raw`// Managed by gbrain setup openclaw; a re-run rewri
 import { Worker } from 'node:worker_threads';
 import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { mkdirSync, readdirSync, readFileSync, statSync, unlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync } from 'node:fs';
 import { appendFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
@@ -105,6 +105,8 @@ const GBRAIN_HOME_ENV = __GBRAIN_HOME_ENV__;
 const PLUGIN_VERSION = __PLUGIN_VERSION__;
 const ID = 'gbrain-skill-resolver';
 const DEADLINE_MS = Number(process.env.GBRAIN_TEST_OPENCLAW_SKILL_DEADLINE_MS) || 50;
+// The setup self-test checks that the plugin resolves a turn at all, so it waits this long, not a live turn's deadline.
+const SELF_TEST_MS = 10_000;
 const STUCK_AFTER = 3;
 const KEEP_DAYS = 14;
 const MEMO_MAX = 1000;
@@ -213,6 +215,7 @@ function textOf(content) {
 }
 
 function turnText(event) {
+  if (event && typeof event.prompt === 'string' && event.prompt.trim()) return event.prompt.trim();
   if (event && typeof event.currentUserMessage === 'string') return event.currentUserMessage.trim();
   const msgs = event && Array.isArray(event.messages) ? event.messages : [];
   for (let i = msgs.length - 1; i >= 0; i--) if (msgs[i] && msgs[i].role === 'user') return textOf(msgs[i].content).trim();
@@ -245,10 +248,10 @@ function armFor(a, sessionKey) {
   return bucket(sessionKey) < f ? 'live' : 'control';
 }
 
-function ask(w, msg) {
+function ask(w, msg, ms = DEADLINE_MS) {
   const id = ++seq;
   return new Promise((resolve) => {
-    const t = setTimeout(() => { waiters.delete(id); resolve({ id, late: true }); }, DEADLINE_MS);
+    const t = setTimeout(() => { waiters.delete(id); resolve({ id, late: true }); }, ms);
     waiters.set(id, (m) => { clearTimeout(t); resolve(m ? { ...m, id } : { id, late: true }); });
     w.postMessage({ ...msg, id });
   });
@@ -304,9 +307,14 @@ async function resolveTurn(event, ctx, opts) {
     const sender = senderOf(event, ctx);
     if (sender === null || !a.owner_sender_ids.includes(sender)) return finish({ outcome: 'skipped_sender' });
   }
-  const turnId = (event && (event.currentUserMessageId || event.messageId)) || createHash('sha256').update(text).digest('hex').slice(0, 16);
+  const runId = ctx && typeof ctx.runId === 'string' && ctx.runId ? ctx.runId : null;
+  const turnId = (event && (event.currentUserMessageId || event.messageId)) || (runId ? 'run:' + runId : createHash('sha256').update(text).digest('hex').slice(0, 16));
   const memoKey = agentId + '\0' + sessionKey + '\0' + turnId;
-  if (memo.has(memoKey)) return finish({ outcome: 'retry' }, arm === 'live' ? memo.get(memoKey) : '');
+  if (memo.has(memoKey)) {
+    const prior = memo.get(memoKey);
+    const carried = !!prior.block && (prior.text !== text || (Array.isArray(event && event.messages) && event.messages.some((m) => m && textOf(m.content).includes(prior.block))));
+    return finish({ outcome: 'retry' }, arm === 'live' && !carried ? prior.block : '');
+  }
   const w = ensureWorker(s);
   if (!w) return finish({ outcome: 'error', code: 'skill_resolver_worker_unavailable' });
   const reset = resetNext.delete(sessionKey);
@@ -326,9 +334,10 @@ async function resolveTurn(event, ctx, opts) {
   const outcome = names.length ? 'suggested' : reply.no_skill_reason || (reply.budget_exhausted ? 'budget' : reply.deduped ? 'deduped' : 'no_match');
   const deliver = arm === 'live' && reply.block ? reply.block : '';
   let active = true;
-  try { if (ctx && typeof ctx.assertActive === 'function') ctx.assertActive(); } catch { active = false; }
+  const invocation = ctx && typeof ctx.assertActive === 'function' ? ctx : ctx && ctx.hookInvocation;
+  try { if (invocation && typeof invocation.assertActive === 'function') invocation.assertActive(); } catch { active = false; }
   if (active && !opts.selfTest) w.postMessage({ type: 'commit', id: reply.id }); else w.postMessage({ type: 'discard', id: reply.id });
-  if (deliver) remember(memo, memoKey, deliver, MEMO_MAX);
+  if (deliver || active) remember(memo, memoKey, { block: deliver, text }, MEMO_MAX);
   return finish({ outcome: arm === 'live' || !names.length ? outcome : 'would_suggest', suggested: names, strengths: reply.strengths, code: reply.code || null }, deliver);
 }
 
@@ -383,7 +392,7 @@ export default {
     on('after_compaction', onCompaction);
     on('skill_changed', onSkillChanged);
     const s = readState();
-    if (s) ensureWorker(s);
+    if (s && existsSync(WORKER_URL)) ensureWorker(s);
   },
   async selfTest(agentId, message) {
     const s = readState();
@@ -391,7 +400,7 @@ export default {
     const w = ensureWorker(s);
     if (!w) return { ok: false, code: 'skill_resolver_worker_unavailable' };
     const warm = await new Promise((resolve) => {
-      const t = setTimeout(() => resolve({ code: 'skill_resolve_timeout' }), 10_000);
+      const t = setTimeout(() => resolve({ code: 'skill_resolve_timeout' }), SELF_TEST_MS);
       const onMsg = (m) => { if (m && m.type === 'warm') { clearTimeout(t); w.off('message', onMsg); resolve(m); } };
       w.on('message', onMsg);
       w.postMessage({ type: 'warm' });
@@ -399,7 +408,7 @@ export default {
     if (warm.code) { dropWorker(); return { ok: false, code: warm.code }; }
     const a = s.agents[agentId];
     const t0 = Date.now();
-    const reply = await ask(w, { type: 'resolve', input: { message, harness: 'openclaw', top_k: Number.isInteger(a.top_k) ? a.top_k : 3, shadow: true, ...(typeof a.top_gate === 'number' ? { top_gate: a.top_gate } : {}) }, catalog: a.catalog, deadlineMs: DEADLINE_MS - 5, floor: a.min_match || null, dirs: [] });
+    const reply = await ask(w, { type: 'resolve', input: { message, harness: 'openclaw', top_k: Number.isInteger(a.top_k) ? a.top_k : 3, shadow: true, ...(typeof a.top_gate === 'number' ? { top_gate: a.top_gate } : {}) }, catalog: a.catalog, deadlineMs: SELF_TEST_MS - 5, floor: a.min_match || null, dirs: [] }, SELF_TEST_MS);
     dropWorker();
     if (reply.late) return { ok: false, code: 'skill_resolve_timeout', ms: Date.now() - t0 };
     if (reply.code && !reply.block) return { ok: false, code: reply.code, ms: Date.now() - t0 };

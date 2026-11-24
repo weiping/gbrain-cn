@@ -51,6 +51,17 @@ token at a terminal on the brain host. `--yes` never confirms.
   `gbrain trust review` lists flagged items; confirming one clears its flag.
 - **Flagged items still reach proactive context, labeled**
   (`trust.agent_activation` is `allow`).
+- **A restated private fact stays private.** When a remote `remember`, or
+  a `## Facts` row of a page write, repeats the exact claim of a
+  private fact that a more trusted writer saved about the same entity (on
+  that page or on another one), the new fact is stored private and a
+  proposal waits in `gbrain trust review`; `gbrain trust confirm tp<N>`
+  makes it world. Until then, remote callers who can't read the private fact
+  don't see the restatement in page reads, search or `think`, and the
+  writer's reply reads like an ordinary save, with no proposal reference.
+  A reworded claim, a claim about another entity, captured prose and
+  extracted facts aren't matched, and the page file in the brain repository
+  still holds the restated text.
 
 These defaults come from a preregistered paid eval with Opus 5.5, Sonnet 5.5
 and GPT-6.1 Sol (gbrain-evals
@@ -384,3 +395,25 @@ Claim your own sources first, so your notes are not treated as unverified.
   without showing them. Review each listed fact (`gbrain trust explain f<id>`)
   and edit the row or forget the fact if a field is wrong. The check is
   read-only and never lowers a tier.
+- `write_gate_holds_stranded` finds held writes (quarantined facts and takes)
+  whose page no longer has the name the hold records. A hold names its page
+  only by slug, so renaming a page (a sync Git rename, `gbrain repair
+  rename-identity`) leaves the hold on the old name, and the page at the new
+  name is no longer protected by it: its held text can reach readers. The
+  check warns when the rename record leads from a hold's name to a live page
+  (a suspected strand, since the history can name more than one page). Holds
+  whose page was soft-deleted, or that name a page that never existed (for
+  example a write held before its page was created), are listed as
+  informational only. A scan that stops at its 5000-row limit or its time
+  limit warns that the count is unknown instead of reporting ok. So does a
+  database role with row-level security active on the holds, the aliases,
+  the rename history or the pages (a hidden table reads as empty, not as an
+  error, and gbrain does not judge policies; run it as the table owner or a
+  role that bypasses row security), and so does an engine that refuses the read.
+  This check detects; it does not fix the leak. Neither releasing nor dropping
+  a hold restores the quarantine on the renamed page or takes back text
+  already delivered: drop only disposes of the hold, release publishes the held
+  text at the hold's old name, and a held take cannot be released. Read the
+  current page and edit it if it shows text that should stay hidden. The next
+  step is the read-only `gbrain trust review`. The real fix, holds that follow
+  a page id, is pending.
